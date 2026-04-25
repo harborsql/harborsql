@@ -2,8 +2,10 @@ use std::sync::Arc;
 
 use axum::{
     Json, Router,
-    extract::State,
-    http::{HeaderMap, StatusCode},
+    body::Bytes,
+    extract::{Path, State},
+    http::{HeaderMap, StatusCode, header},
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
@@ -13,22 +15,35 @@ use crate::{
     config::Config,
     engine::{QueryEngine, QueryResult},
     error::{HarborError, Result},
+    thrift::{DatabricksThriftService, QueryHistory},
 };
 
 #[derive(Clone)]
 struct AppState {
     config: Config,
     engine: QueryEngine,
+    thrift: DatabricksThriftService,
 }
 
 pub async fn serve(config: Config, engine: QueryEngine) -> Result<()> {
+    let thrift = DatabricksThriftService::new(config.clone(), engine.clone());
     let state = Arc::new(AppState {
         config: config.clone(),
         engine,
+        thrift,
     });
     let app = Router::new()
         .route("/healthz", get(healthz))
         .route("/api/v1/query", post(query))
+        .route(
+            "/api/2.0/connector-service/feature-flags/PYTHON/{version}",
+            get(feature_flags),
+        )
+        .route(
+            "/api/2.0/sql/history/queries/{query_id}",
+            get(query_history),
+        )
+        .route("/{*path}", post(thrift_rpc))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(config.bind_addr).await?;
@@ -62,6 +77,37 @@ async fn query(
     Ok(Json(QueryResponse { result }))
 }
 
+async fn thrift_rpc(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response> {
+    let token = bearer_token(&headers)?;
+    let body = state.thrift.handle(token, &body).await?;
+    Ok(([(header::CONTENT_TYPE, "application/x-thrift")], body).into_response())
+}
+
+async fn query_history(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(query_id): Path<String>,
+) -> Result<Json<QueryHistory>> {
+    let _token = bearer_token(&headers)?;
+    state
+        .thrift
+        .query_history(&query_id)
+        .await
+        .map(Json)
+        .ok_or_else(|| HarborError::Query(format!("unknown query id `{query_id}`")))
+}
+
+async fn feature_flags(Path(_version): Path<String>) -> Json<FeatureFlagsResponse> {
+    Json(FeatureFlagsResponse {
+        flags: Vec::new(),
+        ttl_seconds: 900,
+    })
+}
+
 fn bearer_token(headers: &HeaderMap) -> Result<&str> {
     let value = headers
         .get(axum::http::header::AUTHORIZATION)
@@ -83,4 +129,16 @@ struct QueryRequest {
 #[derive(Debug, Serialize)]
 struct QueryResponse {
     result: QueryResult,
+}
+
+#[derive(Debug, Serialize)]
+struct FeatureFlagsResponse {
+    flags: Vec<FeatureFlag>,
+    ttl_seconds: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct FeatureFlag {
+    name: String,
+    value: String,
 }

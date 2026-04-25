@@ -272,14 +272,24 @@ impl ResolvedTableRef {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct QueryResult {
     pub columns: Vec<Column>,
     pub rows: serde_json::Value,
     pub row_count: usize,
 }
 
-#[derive(Debug, Serialize)]
+impl QueryResult {
+    pub fn empty() -> Self {
+        Self {
+            columns: Vec::new(),
+            rows: serde_json::Value::Array(Vec::new()),
+            row_count: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct Column {
     pub name: String,
     pub data_type: String,
