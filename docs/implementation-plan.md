@@ -65,6 +65,18 @@ Implement the minimal Databricks SQL connector surface:
 The protocol should initially return inline columnar/row results and can defer
 Cloud Fetch.
 
+Current status:
+
+- Implemented a minimal Thrift-over-HTTP `TCLIService` endpoint on Databricks
+  warehouse-style paths such as `/sql/1.0/warehouses/<id>`.
+- Implemented `SET ...` as a no-op so benchmark clients can disable result
+  caching before the real query.
+- Implemented inline columnar result sets. This avoids Databricks Cloud Fetch
+  and keeps the first compatibility slice local.
+- Implemented query-history duration responses for completed local operations.
+- Implemented the connector feature-flags endpoint with an empty flag set so
+  local connector startup does not wait on Databricks-only service endpoints.
+
 ### Phase 3: Local Client Workaround
 
 Because the stock Python connector forces HTTPS for normal hostname settings,
@@ -75,6 +87,27 @@ support local development in two ways:
 - optional TLS reverse proxy documentation for `localhost:443`
 
 Production remains standard HTTPS on port 443.
+
+Verified local Python connector shape:
+
+```python
+from databricks import sql
+
+connection = sql.connect(
+    server_hostname="http://127.0.0.1:1992",
+    http_path="/sql/1.0/warehouses/<warehouse-id>",
+    access_token=token,
+    catalog="workspace",
+    schema="<schema>",
+    _connection_uri="http://127.0.0.1:1992/sql/1.0/warehouses/<warehouse-id>",
+    use_cloud_fetch=False,
+)
+```
+
+The `_connection_uri` override is required for local HTTP. Without it, the
+connector constructs an HTTPS URL for the Thrift transport. In production,
+HarborSQL should be served over HTTPS on port 443 so standard
+`server_hostname`/`http_path` settings can be used.
 
 ### Phase 4: SQL Coverage
 

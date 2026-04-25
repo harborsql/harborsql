@@ -19,6 +19,8 @@ pub enum HarborError {
     Unity(String),
     #[error("query execution error: {0}")]
     Query(String),
+    #[error("Databricks Thrift protocol error: {0}")]
+    Thrift(String),
     #[error("HTTP client error: {0}")]
     Http(#[from] reqwest::Error),
     #[error("URL error: {0}")]
@@ -41,7 +43,7 @@ impl HarborError {
     pub fn status_code(&self) -> StatusCode {
         match self {
             Self::MissingBearerToken => StatusCode::UNAUTHORIZED,
-            Self::Config(_) | Self::UnsupportedSql(_) => StatusCode::BAD_REQUEST,
+            Self::Config(_) | Self::UnsupportedSql(_) | Self::Thrift(_) => StatusCode::BAD_REQUEST,
             Self::Unity(_) => StatusCode::BAD_GATEWAY,
             Self::Query(_) | Self::Delta(_) | Self::DataFusion(_) | Self::ArrowJson(_) => {
                 StatusCode::UNPROCESSABLE_ENTITY

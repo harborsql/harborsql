@@ -2,6 +2,7 @@ mod config;
 mod engine;
 mod error;
 mod server;
+mod thrift;
 mod unity;
 
 use std::env;
