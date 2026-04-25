@@ -11,9 +11,12 @@ use datafusion::{
     prelude::{SessionConfig, SessionContext},
 };
 use deltalake::open_table_with_storage_options;
-use regex::Regex;
 use serde::Serialize;
-use sqlparser::{dialect::GenericDialect, parser::Parser};
+use sqlparser::{
+    ast::{ObjectName, ObjectNamePart, Query, Select, SetExpr, Statement, TableFactor},
+    dialect::GenericDialect,
+    parser::Parser,
+};
 use url::Url;
 
 use crate::{
@@ -51,8 +54,9 @@ impl QueryEngine {
             ));
         }
 
-        let session_config =
-            SessionConfig::new().with_default_catalog_and_schema(default_catalog, default_schema);
+        let session_config = SessionConfig::new()
+            .with_default_catalog_and_schema(default_catalog, default_schema)
+            .set_bool("datafusion.sql_parser.enable_ident_normalization", false);
         let ctx = SessionContext::new_with_config(session_config);
 
         let mut catalogs: HashMap<String, Arc<MemoryCatalogProvider>> = HashMap::new();
@@ -189,10 +193,7 @@ fn validate_select_only(sql: &str) -> Result<()> {
         ));
     }
 
-    if matches!(
-        statements.first(),
-        Some(sqlparser::ast::Statement::Query(_))
-    ) {
+    if matches!(statements.first(), Some(Statement::Query(_))) {
         Ok(())
     } else {
         Err(HarborError::UnsupportedSql(
@@ -206,30 +207,190 @@ fn extract_table_refs(
     default_catalog: &str,
     default_schema: &str,
 ) -> Result<Vec<ResolvedTableRef>> {
-    let re = Regex::new(r#"(?i)\b(?:from|join)\s+([`"]?[A-Za-z_][A-Za-z0-9_\-]*[`"]?(?:\.[`"]?[A-Za-z_][A-Za-z0-9_\-]*[`"]?){0,2})"#)
-        .map_err(|err| HarborError::Query(err.to_string()))?;
+    let dialect = GenericDialect {};
+    let statements = Parser::parse_sql(&dialect, sql)
+        .map_err(|err| HarborError::UnsupportedSql(err.to_string()))?;
+    if statements.len() != 1 {
+        return Err(HarborError::UnsupportedSql(
+            "only one SQL statement is supported".into(),
+        ));
+    }
+
     let mut refs = BTreeSet::new();
-    for capture in re.captures_iter(sql) {
-        let raw = capture
-            .get(1)
-            .ok_or_else(|| HarborError::UnsupportedSql("malformed table reference".into()))?
-            .as_str();
-        refs.insert(resolve_table_ref(raw, default_catalog, default_schema)?);
+    match statements.first() {
+        Some(Statement::Query(query)) => {
+            collect_query_table_refs(query, default_catalog, default_schema, &mut refs)?;
+        }
+        _ => {
+            return Err(HarborError::UnsupportedSql(
+                "only read-only SELECT queries are supported".into(),
+            ));
+        }
     }
 
     Ok(refs.into_iter().collect())
 }
 
-fn resolve_table_ref(
-    raw: &str,
+fn collect_query_table_refs(
+    query: &Query,
+    default_catalog: &str,
+    default_schema: &str,
+    refs: &mut BTreeSet<ResolvedTableRef>,
+) -> Result<()> {
+    let mut cte_names = BTreeSet::new();
+    if let Some(with) = &query.with {
+        for cte in &with.cte_tables {
+            collect_query_table_refs(&cte.query, default_catalog, default_schema, refs)?;
+            cte_names.insert(cte.alias.name.value.to_ascii_lowercase());
+        }
+    }
+    collect_set_expr_table_refs(
+        &query.body,
+        default_catalog,
+        default_schema,
+        refs,
+        &cte_names,
+    )
+}
+
+fn collect_set_expr_table_refs(
+    set_expr: &SetExpr,
+    default_catalog: &str,
+    default_schema: &str,
+    refs: &mut BTreeSet<ResolvedTableRef>,
+    cte_names: &BTreeSet<String>,
+) -> Result<()> {
+    match set_expr {
+        SetExpr::Select(select) => {
+            collect_select_table_refs(select, default_catalog, default_schema, refs, cte_names)
+        }
+        SetExpr::Query(query) => {
+            collect_query_table_refs(query, default_catalog, default_schema, refs)
+        }
+        SetExpr::SetOperation { left, right, .. } => {
+            collect_set_expr_table_refs(left, default_catalog, default_schema, refs, cte_names)?;
+            collect_set_expr_table_refs(right, default_catalog, default_schema, refs, cte_names)
+        }
+        SetExpr::Table(table) => {
+            let table_name = table
+                .table_name
+                .as_deref()
+                .ok_or_else(|| HarborError::UnsupportedSql("TABLE query needs a name".into()))?;
+            let parts = if let Some(schema_name) = table.schema_name.as_deref() {
+                vec![schema_name.to_string(), table_name.to_string()]
+            } else {
+                vec![table_name.to_string()]
+            };
+            refs.insert(resolve_parts_ref(&parts, default_catalog, default_schema)?);
+            Ok(())
+        }
+        SetExpr::Values(_) => Ok(()),
+        SetExpr::Insert(_) | SetExpr::Update(_) | SetExpr::Delete(_) | SetExpr::Merge(_) => Err(
+            HarborError::UnsupportedSql("only read-only SELECT queries are supported".into()),
+        ),
+    }
+}
+
+fn collect_select_table_refs(
+    select: &Select,
+    default_catalog: &str,
+    default_schema: &str,
+    refs: &mut BTreeSet<ResolvedTableRef>,
+    cte_names: &BTreeSet<String>,
+) -> Result<()> {
+    for table_with_joins in &select.from {
+        collect_table_factor_refs(
+            &table_with_joins.relation,
+            default_catalog,
+            default_schema,
+            refs,
+            cte_names,
+        )?;
+        for join in &table_with_joins.joins {
+            collect_table_factor_refs(
+                &join.relation,
+                default_catalog,
+                default_schema,
+                refs,
+                cte_names,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn collect_table_factor_refs(
+    table_factor: &TableFactor,
+    default_catalog: &str,
+    default_schema: &str,
+    refs: &mut BTreeSet<ResolvedTableRef>,
+    cte_names: &BTreeSet<String>,
+) -> Result<()> {
+    match table_factor {
+        TableFactor::Table { name, args, .. } => {
+            if args.is_some() {
+                return Err(HarborError::UnsupportedSql(format!(
+                    "table-valued functions are not supported: {name}"
+                )));
+            }
+            let parts = object_name_parts(name)?;
+            if parts.len() == 1 && cte_names.contains(&parts[0].to_ascii_lowercase()) {
+                return Ok(());
+            }
+            refs.insert(resolve_parts_ref(&parts, default_catalog, default_schema)?);
+            Ok(())
+        }
+        TableFactor::Derived { subquery, .. } => {
+            collect_query_table_refs(subquery, default_catalog, default_schema, refs)
+        }
+        TableFactor::NestedJoin {
+            table_with_joins, ..
+        } => {
+            collect_table_factor_refs(
+                &table_with_joins.relation,
+                default_catalog,
+                default_schema,
+                refs,
+                cte_names,
+            )?;
+            for join in &table_with_joins.joins {
+                collect_table_factor_refs(
+                    &join.relation,
+                    default_catalog,
+                    default_schema,
+                    refs,
+                    cte_names,
+                )?;
+            }
+            Ok(())
+        }
+        TableFactor::Pivot { table, .. } | TableFactor::Unpivot { table, .. } => {
+            collect_table_factor_refs(table, default_catalog, default_schema, refs, cte_names)
+        }
+        other => Err(HarborError::UnsupportedSql(format!(
+            "unsupported table factor `{other}`"
+        ))),
+    }
+}
+
+fn object_name_parts(name: &ObjectName) -> Result<Vec<String>> {
+    name.0
+        .iter()
+        .map(|part| match part {
+            ObjectNamePart::Identifier(identifier) => Ok(identifier.value.clone()),
+            ObjectNamePart::Function(_) => Err(HarborError::UnsupportedSql(format!(
+                "dynamic object names are not supported: {name}"
+            ))),
+        })
+        .collect()
+}
+
+fn resolve_parts_ref(
+    parts: &[String],
     default_catalog: &str,
     default_schema: &str,
 ) -> Result<ResolvedTableRef> {
-    let parts = raw
-        .split('.')
-        .map(strip_identifier_quotes)
-        .collect::<Vec<_>>();
-    match parts.as_slice() {
+    match parts {
         [table] => Ok(ResolvedTableRef::new(
             default_catalog,
             default_schema,
@@ -238,17 +399,10 @@ fn resolve_table_ref(
         [schema, table] => Ok(ResolvedTableRef::new(default_catalog, schema, table)),
         [catalog, schema, table] => Ok(ResolvedTableRef::new(catalog, schema, table)),
         _ => Err(HarborError::UnsupportedSql(format!(
-            "unsupported table reference `{raw}`"
+            "unsupported table reference `{}`",
+            parts.join(".")
         ))),
     }
-}
-
-fn strip_identifier_quotes(value: &str) -> &str {
-    value
-        .strip_prefix('`')
-        .and_then(|v| v.strip_suffix('`'))
-        .or_else(|| value.strip_prefix('"').and_then(|v| v.strip_suffix('"')))
-        .unwrap_or(value)
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
@@ -314,6 +468,20 @@ mod tests {
                 ResolvedTableRef::new("workspace", "analytics", "events"),
                 ResolvedTableRef::new("workspace", "default", "users"),
             ]
+        );
+    }
+
+    #[test]
+    fn ignores_from_inside_extract_expression() {
+        let refs = extract_table_refs(
+            "SELECT extract(minute FROM EventTime) AS m, COUNT(*) FROM hits GROUP BY m",
+            "workspace",
+            "default",
+        )
+        .unwrap();
+        assert_eq!(
+            refs,
+            vec![ResolvedTableRef::new("workspace", "default", "hits")]
         );
     }
 }
