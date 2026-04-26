@@ -127,6 +127,41 @@ The GitHub Actions workflow expects these repository secrets:
 - `TEST_CI_DATABRICKS_CLIENT_SECRET`
 - `TEST_CI_DATABRICKS_PAT`
 
+## Release Publishing
+
+Publishing a GitHub release runs the release workflow and publishes:
+
+- `ghcr.io/<owner>/harborsql:<tag>` as a Linux x86_64 Docker image
+- `ghcr.io/<owner>/harborsql-binaries:<tag>` as an OCI package containing the Linux x86_64 and macOS Apple Silicon binary archives
+- the same binary archives as GitHub release assets
+
+For non-prerelease GitHub releases, the workflow also updates the `latest` tags.
+The Docker image is built from the already-compiled Linux binary, so the
+release build does not compile the Rust code again inside Docker.
+
+```bash
+docker pull ghcr.io/<owner>/harborsql:<tag>
+oras pull ghcr.io/<owner>/harborsql-binaries:<tag>
+```
+
+To run the pre-release benchmark gate without publishing, use the `Release`
+workflow's manual `workflow_dispatch` trigger with `publish` disabled. The
+default benchmark command is:
+
+```bash
+cargo test --release --locked --all-targets
+```
+
+Override `benchmark_command` in the manual workflow run if the benchmark suite
+lives in another repository or needs a different command.
+
+GitHub Packages may create the first GHCR package as private. If this repository
+is public and the images should be public, change the package visibility in the
+GitHub package settings after the first publish.
+
+The release workflow does not require Databricks secrets. Publishing to GHCR and
+uploading release assets use the built-in `GITHUB_TOKEN`.
+
 ## Benchmarks
 
 Benchmark setup, Unity Catalog runbooks, topology notes, and result artifacts live outside this public engine repository in the separate benchmark repository:

@@ -1,0 +1,295 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      run_benchmarks:
+        description: Run the pre-release benchmark command before building artifacts.
+        required: true
+        type: boolean
+        default: true
+      benchmark_command:
+        description: Command to run when benchmarks are enabled.
+        required: false
+        type: string
+        default: cargo test --release --locked --all-targets
+      publish:
+        description: Push packages when running manually.
+        required: true
+        type: boolean
+        default: false
+      package_tag:
+        description: Tag to use when manually publishing. Defaults to sha-<commit>.
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  prepare:
+    name: Prepare release metadata
+    runs-on: ubuntu-24.04
+    outputs:
+      image_ref: ${{ steps.meta.outputs.image_ref }}
+      binaries_ref: ${{ steps.meta.outputs.binaries_ref }}
+      package_tag: ${{ steps.meta.outputs.package_tag }}
+      image_tags: ${{ steps.meta.outputs.image_tags }}
+      publish: ${{ steps.meta.outputs.publish }}
+      publish_latest: ${{ steps.meta.outputs.publish_latest }}
+    steps:
+      - name: Resolve package metadata
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          image_ref="ghcr.io/${GITHUB_REPOSITORY,,}"
+          binaries_ref="${image_ref}-binaries"
+          publish="false"
+          publish_latest="false"
+
+          if [[ "${{ github.event_name }}" == "release" ]]; then
+            package_tag="${GITHUB_REF_NAME}"
+            publish="true"
+            if [[ "${{ github.event.release.prerelease }}" != "true" ]]; then
+              publish_latest="true"
+            fi
+          else
+            package_tag="${{ inputs.package_tag }}"
+            if [[ -z "${package_tag}" ]]; then
+              package_tag="sha-${GITHUB_SHA::12}"
+            fi
+            if [[ "${{ inputs.publish }}" == "true" ]]; then
+              publish="true"
+            fi
+          fi
+
+          if [[ ! "${package_tag}" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
+            echo "::error::Package tag '${package_tag}' is not a valid Docker/OCI tag."
+            exit 1
+          fi
+
+          {
+            echo "image_ref=${image_ref}"
+            echo "binaries_ref=${binaries_ref}"
+            echo "package_tag=${package_tag}"
+            echo "image_tags<<EOF"
+            echo "${image_ref}:${package_tag}"
+            if [[ "${publish_latest}" == "true" ]]; then
+              echo "${image_ref}:latest"
+            fi
+            echo "EOF"
+            echo "publish=${publish}"
+            echo "publish_latest=${publish_latest}"
+          } >> "${GITHUB_OUTPUT}"
+
+  pre-release-checks:
+    name: Pre-release benchmark gate
+    runs-on: ubuntu-24.04
+    if: github.event_name == 'workflow_dispatch' && inputs.run_benchmarks
+    timeout-minutes: 90
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: pre-release
+
+      - name: Run benchmark command
+        shell: bash
+        env:
+          BENCHMARK_COMMAND: ${{ inputs.benchmark_command }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${BENCHMARK_COMMAND}" ]]; then
+            echo "::error::benchmark_command is required when run_benchmarks is enabled."
+            exit 1
+          fi
+          bash -euxo pipefail -c "${BENCHMARK_COMMAND}"
+
+  build-binaries:
+    name: Build ${{ matrix.label }}
+    runs-on: ${{ matrix.runner }}
+    needs:
+      - prepare
+      - pre-release-checks
+    if: always() && needs.prepare.result == 'success' && (needs.pre-release-checks.result == 'success' || needs.pre-release-checks.result == 'skipped')
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: Linux x86_64
+            runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            artifact: harborsql-linux-x86_64
+            binary: harborsql
+          - label: macOS Apple Silicon
+            runner: macos-15
+            target: aarch64-apple-darwin
+            artifact: harborsql-macos-arm64
+            binary: harborsql
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_dir="dist/${{ matrix.artifact }}"
+          binary_path="target/${{ matrix.target }}/release/${{ matrix.binary }}"
+
+          mkdir -p "${package_dir}"
+          cp "${binary_path}" "${package_dir}/harborsql"
+          chmod 0755 "${package_dir}/harborsql"
+
+          tar -C "${package_dir}" -czf "dist/${{ matrix.artifact }}.tar.gz" harborsql
+          shasum -a 256 "dist/${{ matrix.artifact }}.tar.gz" > "dist/${{ matrix.artifact }}.tar.gz.sha256"
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            dist/${{ matrix.artifact }}.tar.gz
+            dist/${{ matrix.artifact }}.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+  publish-image:
+    name: Build and publish Docker image
+    runs-on: ubuntu-24.04
+    needs:
+      - prepare
+      - build-binaries
+    permissions:
+      contents: read
+      packages: write
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Download Linux binary
+        uses: actions/download-artifact@v4
+        with:
+          name: harborsql-linux-x86_64
+          path: dist/linux-x86_64
+
+      - name: Prepare Docker context
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/docker
+          tar -xzf dist/linux-x86_64/harborsql-linux-x86_64.tar.gz -C dist/docker
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        if: needs.prepare.outputs.publish == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: dist/docker
+          file: ./Dockerfile
+          platforms: linux/amd64
+          push: ${{ needs.prepare.outputs.publish == 'true' }}
+          tags: ${{ needs.prepare.outputs.image_tags }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ needs.prepare.outputs.package_tag }}
+            org.opencontainers.image.description=HarborSQL external SQL query engine
+
+  publish-binaries:
+    name: Publish native binary packages
+    runs-on: ubuntu-24.04
+    needs:
+      - prepare
+      - build-binaries
+    if: needs.prepare.outputs.publish == 'true'
+    permissions:
+      contents: write
+      packages: write
+    timeout-minutes: 30
+    steps:
+      - name: Download binary artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/artifacts
+          merge-multiple: true
+
+      - name: Install ORAS
+        uses: oras-project/setup-oras@v1
+
+      - name: Log in to GitHub Container Registry
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "${GITHUB_TOKEN}" | oras login ghcr.io --username "${GITHUB_ACTOR}" --password-stdin
+
+      - name: Push binary archive package
+        shell: bash
+        run: |
+          set -euo pipefail
+          oras push "${{ needs.prepare.outputs.binaries_ref }}:${{ needs.prepare.outputs.package_tag }}" \
+            --artifact-type application/vnd.harborsql.binaries.v1+tar \
+            --annotation "org.opencontainers.image.source=https://github.com/${{ github.repository }}" \
+            --annotation "org.opencontainers.image.version=${{ needs.prepare.outputs.package_tag }}" \
+            dist/artifacts/harborsql-linux-x86_64.tar.gz:application/gzip \
+            dist/artifacts/harborsql-linux-x86_64.tar.gz.sha256:text/plain \
+            dist/artifacts/harborsql-macos-arm64.tar.gz:application/gzip \
+            dist/artifacts/harborsql-macos-arm64.tar.gz.sha256:text/plain
+
+      - name: Push latest binary archive package
+        if: needs.prepare.outputs.publish_latest == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          oras push "${{ needs.prepare.outputs.binaries_ref }}:latest" \
+            --artifact-type application/vnd.harborsql.binaries.v1+tar \
+            --annotation "org.opencontainers.image.source=https://github.com/${{ github.repository }}" \
+            --annotation "org.opencontainers.image.version=${{ needs.prepare.outputs.package_tag }}" \
+            dist/artifacts/harborsql-linux-x86_64.tar.gz:application/gzip \
+            dist/artifacts/harborsql-linux-x86_64.tar.gz.sha256:text/plain \
+            dist/artifacts/harborsql-macos-arm64.tar.gz:application/gzip \
+            dist/artifacts/harborsql-macos-arm64.tar.gz.sha256:text/plain
+
+      - name: Upload binaries to GitHub release
+        if: github.event_name == 'release'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${{ needs.prepare.outputs.package_tag }}" dist/artifacts/* --clobber
