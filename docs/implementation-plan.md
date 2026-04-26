@@ -27,8 +27,8 @@ The first implementation is intentionally read-only and narrow:
 - AWS S3 credentials first.
 - One Databricks workspace configured by `HARBORSQL_DATABRICKS_HOST`.
 - Per-session client token forwarding; no persistent token storage.
-- Use the known-good probe table for the first smoke test:
-  `<catalog>.<schema>.<probe_table>`
+- Use a dedicated Unity Catalog Delta probe table for the first smoke test.
+  Keep concrete workspace/schema/table names in the benchmark/runbook repo.
 
 ## Phases
 
