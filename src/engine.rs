@@ -11,6 +11,7 @@ use datafusion::{
     prelude::{SessionConfig, SessionContext},
 };
 use deltalake::open_table_with_storage_options;
+use futures::StreamExt;
 use serde::Serialize;
 use sqlparser::{
     ast::{ObjectName, ObjectNamePart, Query, Select, SetExpr, Statement, TableFactor},
@@ -106,39 +107,42 @@ impl QueryEngine {
         }
 
         let dataframe = ctx.sql(sql).await?;
-        let batches = dataframe.collect().await?;
-        let row_count = batches.iter().map(|batch| batch.num_rows()).sum();
-        if let Some(max_rows) = self.config.max_result_rows {
-            if row_count > max_rows {
-                return Err(HarborError::Query(format!(
-                    "query returned {row_count} rows, exceeding HARBORSQL_MAX_RESULT_ROWS={max_rows}",
-                )));
-            }
-        }
-        let schema = batches
-            .first()
-            .map(|batch| {
-                batch
-                    .schema()
-                    .fields()
-                    .iter()
-                    .map(|field| Column {
-                        name: field.name().clone(),
-                        data_type: field.data_type().to_string(),
-                        nullable: field.is_nullable(),
-                    })
-                    .collect()
+        let mut stream = dataframe.execute_stream().await?;
+        let schema = stream
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| Column {
+                name: field.name().clone(),
+                data_type: field.data_type().to_string(),
+                nullable: field.is_nullable(),
             })
-            .unwrap_or_default();
+            .collect();
 
-        let mut buffer = Vec::new();
-        {
-            let mut writer = ArrayWriter::new(&mut buffer);
-            for batch in &batches {
-                writer.write(batch)?;
+        let mut row_count = 0;
+        let mut writer = ArrayWriter::new(Vec::new());
+        while let Some(batch) = stream.next().await {
+            let batch = batch?;
+            row_count += batch.num_rows();
+            if let Some(max_rows) = self.config.max_result_rows {
+                if row_count > max_rows {
+                    return Err(HarborError::Query(format!(
+                        "query returned more than HARBORSQL_MAX_RESULT_ROWS={max_rows}",
+                    )));
+                }
             }
-            writer.finish()?;
+
+            writer.write(&batch)?;
+            if let Some(max_bytes) = self.config.max_result_bytes {
+                if writer.get_ref().len() > max_bytes {
+                    return Err(HarborError::Query(format!(
+                        "query result JSON exceeded HARBORSQL_MAX_RESULT_BYTES={max_bytes}",
+                    )));
+                }
+            }
         }
+        writer.finish()?;
+        let buffer = writer.into_inner();
         if let Some(max_bytes) = self.config.max_result_bytes {
             if buffer.len() > max_bytes {
                 return Err(HarborError::Query(format!(
