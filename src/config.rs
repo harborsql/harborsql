@@ -9,6 +9,8 @@ pub struct Config {
     pub default_catalog: String,
     pub default_schema: String,
     pub aws_region: String,
+    pub max_result_rows: Option<usize>,
+    pub max_result_bytes: Option<usize>,
 }
 
 impl Config {
@@ -36,7 +38,20 @@ impl Config {
                 .or_else(|_| env::var("DATABRICKS_SCHEMA"))
                 .unwrap_or_else(|_| "default".into()),
             aws_region: env::var("HARBORSQL_AWS_REGION").unwrap_or_else(|_| "us-west-2".into()),
+            max_result_rows: parse_optional_usize_env("HARBORSQL_MAX_RESULT_ROWS")?,
+            max_result_bytes: parse_optional_usize_env("HARBORSQL_MAX_RESULT_BYTES")?,
         })
+    }
+}
+
+fn parse_optional_usize_env(name: &str) -> Result<Option<usize>> {
+    match env::var(name) {
+        Ok(value) if value.trim().is_empty() => Ok(None),
+        Ok(value) => value
+            .parse()
+            .map(Some)
+            .map_err(|err| HarborError::Config(format!("invalid {name}: {err}"))),
+        Err(_) => Ok(None),
     }
 }
 

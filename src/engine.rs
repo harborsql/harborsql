@@ -108,6 +108,13 @@ impl QueryEngine {
         let dataframe = ctx.sql(sql).await?;
         let batches = dataframe.collect().await?;
         let row_count = batches.iter().map(|batch| batch.num_rows()).sum();
+        if let Some(max_rows) = self.config.max_result_rows {
+            if row_count > max_rows {
+                return Err(HarborError::Query(format!(
+                    "query returned {row_count} rows, exceeding HARBORSQL_MAX_RESULT_ROWS={max_rows}",
+                )));
+            }
+        }
         let schema = batches
             .first()
             .map(|batch| {
@@ -131,6 +138,14 @@ impl QueryEngine {
                 writer.write(batch)?;
             }
             writer.finish()?;
+        }
+        if let Some(max_bytes) = self.config.max_result_bytes {
+            if buffer.len() > max_bytes {
+                return Err(HarborError::Query(format!(
+                    "query result JSON is {} bytes, exceeding HARBORSQL_MAX_RESULT_BYTES={max_bytes}",
+                    buffer.len(),
+                )));
+            }
         }
         let rows = serde_json::from_slice(&buffer)?;
 

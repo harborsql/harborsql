@@ -6,6 +6,7 @@ use std::{
 
 use serde::Serialize;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
@@ -40,6 +41,8 @@ const INVALID_HANDLE_STATUS: i32 = 4;
 const FINISHED_STATE: i32 = 2;
 const EXECUTE_STATEMENT: i32 = 0;
 const COLUMN_BASED_SET: i32 = 1;
+const DEFAULT_FETCH_ROWS: usize = 1_000;
+const MAX_FETCH_ROWS: usize = 10_000;
 
 const BOOLEAN_TYPE: i32 = 0;
 const INT_TYPE: i32 = 3;
@@ -82,6 +85,7 @@ impl DatabricksThriftService {
                 let request = read_args(&message.payload, read_open_session_req)?;
                 let session_id = Uuid::new_v4();
                 let secret = Uuid::new_v4();
+                let session_id_string = session_id.to_string();
                 let catalog = request
                     .catalog
                     .unwrap_or_else(|| self.config.default_catalog.clone());
@@ -90,8 +94,11 @@ impl DatabricksThriftService {
                     .unwrap_or_else(|| self.config.default_schema.clone());
 
                 self.sessions.write().await.insert(
-                    session_id.to_string(),
+                    session_id_string.clone(),
                     SessionState {
+                        id: session_id_string,
+                        secret: *secret.as_bytes(),
+                        token_fingerprint: token_fingerprint(bearer_token),
                         catalog: catalog.clone(),
                         schema: schema.clone(),
                     },
@@ -107,14 +114,22 @@ impl DatabricksThriftService {
             }
             "CloseSession" => {
                 let request = read_args(&message.payload, read_close_session_req)?;
-                if let Some(session_id) = request.session_id {
-                    self.sessions.write().await.remove(&session_id);
-                }
-                Ok(write_close_session_response(message.seqid))
+                let removed = self
+                    .remove_session(request.session_handle.as_ref(), bearer_token)
+                    .await;
+                Ok(write_close_session_response(message.seqid, removed))
             }
             "ExecuteStatement" => {
                 let request = read_args(&message.payload, read_execute_statement_req)?;
-                let session = self.session_for(request.session_id.as_deref()).await;
+                let Some(session) = self
+                    .session_for(request.session_handle.as_ref(), bearer_token)
+                    .await
+                else {
+                    return Ok(write_execute_statement_invalid(
+                        message.seqid,
+                        "invalid session handle",
+                    ));
+                };
                 let operation_id = Uuid::new_v4();
                 let secret = Uuid::new_v4();
                 let statement = request.statement.trim().to_string();
@@ -131,21 +146,24 @@ impl DatabricksThriftService {
 
                 match result {
                     Ok(result) => {
+                        let result = Arc::new(result);
                         let query_id = operation_id.to_string();
                         self.operations.write().await.insert(
                             query_id.clone(),
                             OperationState {
+                                secret: *secret.as_bytes(),
+                                session_id: session.id.clone(),
+                                token_fingerprint: token_fingerprint(bearer_token),
                                 result: result.clone(),
                                 duration_ms,
                                 has_result_set: true,
-                                closed: false,
                             },
                         );
                         Ok(write_execute_statement_response(
                             message.seqid,
                             operation_id.as_bytes(),
                             secret.as_bytes(),
-                            &result,
+                            result.as_ref(),
                         ))
                     }
                     Err(err) => Ok(write_execute_statement_error(
@@ -158,53 +176,68 @@ impl DatabricksThriftService {
             }
             "GetOperationStatus" => {
                 let request = read_args(&message.payload, read_operation_req)?;
-                let operation = self.operation_for(request.operation_id.as_deref()).await;
-                Ok(write_get_operation_status_response(
-                    message.seqid,
-                    operation.as_ref().map(|op| op.has_result_set),
-                    operation.is_some(),
-                ))
+                Ok(self
+                    .with_operation(
+                        request.operation_handle.as_ref(),
+                        bearer_token,
+                        |operation| {
+                            write_get_operation_status_response(
+                                message.seqid,
+                                Some(operation.has_result_set),
+                                true,
+                            )
+                        },
+                    )
+                    .await
+                    .unwrap_or_else(|| {
+                        write_get_operation_status_response(message.seqid, None, false)
+                    }))
             }
             "GetResultSetMetadata" => {
                 let request = read_args(&message.payload, read_operation_req)?;
-                let operation = self.operation_for(request.operation_id.as_deref()).await;
-                Ok(match operation {
-                    Some(operation) => {
-                        write_get_result_set_metadata_response(message.seqid, &operation.result)
-                    }
-                    None => write_get_result_set_metadata_invalid(message.seqid),
-                })
+                Ok(self
+                    .with_operation(
+                        request.operation_handle.as_ref(),
+                        bearer_token,
+                        |operation| {
+                            write_get_result_set_metadata_response(message.seqid, &operation.result)
+                        },
+                    )
+                    .await
+                    .unwrap_or_else(|| write_get_result_set_metadata_invalid(message.seqid)))
             }
             "FetchResults" => {
                 let request = read_args(&message.payload, read_fetch_results_req)?;
-                let operation = self.operation_for(request.operation_id.as_deref()).await;
-                Ok(match operation {
-                    Some(operation) => write_fetch_results_response(
-                        message.seqid,
-                        &operation.result,
-                        true,
-                        request.start_row_offset.unwrap_or(0),
-                    ),
-                    None => write_fetch_results_invalid(message.seqid),
-                })
+                Ok(self
+                    .with_operation(
+                        request.operation_handle.as_ref(),
+                        bearer_token,
+                        |operation| {
+                            write_fetch_results_response(
+                                message.seqid,
+                                &operation.result,
+                                true,
+                                request.start_row_offset.unwrap_or(0),
+                                request.max_rows,
+                            )
+                        },
+                    )
+                    .await
+                    .unwrap_or_else(|| write_fetch_results_invalid(message.seqid)))
             }
             "CloseOperation" => {
                 let request = read_args(&message.payload, read_operation_req)?;
-                if let Some(operation_id) = request.operation_id {
-                    if let Some(operation) = self.operations.write().await.get_mut(&operation_id) {
-                        operation.closed = true;
-                    }
-                }
-                Ok(write_close_operation_response(message.seqid))
+                let removed = self
+                    .remove_operation(request.operation_handle.as_ref(), bearer_token)
+                    .await;
+                Ok(write_close_operation_response(message.seqid, removed))
             }
             "CancelOperation" => {
                 let request = read_args(&message.payload, read_operation_req)?;
-                if let Some(operation_id) = request.operation_id {
-                    if let Some(operation) = self.operations.write().await.get_mut(&operation_id) {
-                        operation.closed = true;
-                    }
-                }
-                Ok(write_cancel_operation_response(message.seqid))
+                let removed = self
+                    .remove_operation(request.operation_handle.as_ref(), bearer_token)
+                    .await;
+                Ok(write_cancel_operation_response(message.seqid, removed))
             }
             other => Ok(write_application_exception(
                 other,
@@ -214,37 +247,89 @@ impl DatabricksThriftService {
         }
     }
 
-    pub async fn query_history(&self, query_id: &str) -> Option<QueryHistory> {
+    pub async fn query_history(&self, bearer_token: &str, query_id: &str) -> Option<QueryHistory> {
+        let token_fingerprint = token_fingerprint(bearer_token);
         self.operations
             .read()
             .await
             .get(query_id)
+            .filter(|operation| operation.token_fingerprint == token_fingerprint)
             .map(|operation| QueryHistory {
                 query_id: query_id.to_string(),
-                status: if operation.closed {
-                    "CLOSED".to_string()
-                } else {
-                    "FINISHED".to_string()
-                },
+                status: "FINISHED".to_string(),
                 duration: operation.duration_ms,
             })
     }
 
-    async fn session_for(&self, session_id: Option<&str>) -> SessionState {
-        if let Some(session_id) = session_id {
-            if let Some(session) = self.sessions.read().await.get(session_id) {
-                return session.clone();
-            }
+    async fn session_for(
+        &self,
+        handle: Option<&Handle>,
+        bearer_token: &str,
+    ) -> Option<SessionState> {
+        let handle = handle?;
+        let token_fingerprint = token_fingerprint(bearer_token);
+        self.sessions
+            .read()
+            .await
+            .get(&handle.id)
+            .filter(|session| {
+                session.secret == handle.secret && session.token_fingerprint == token_fingerprint
+            })
+            .cloned()
+    }
+
+    async fn remove_session(&self, handle: Option<&Handle>, bearer_token: &str) -> bool {
+        let Some(handle) = handle else {
+            return false;
+        };
+        let token_fingerprint = token_fingerprint(bearer_token);
+        let mut sessions = self.sessions.write().await;
+        let valid = sessions.get(&handle.id).is_some_and(|session| {
+            session.secret == handle.secret && session.token_fingerprint == token_fingerprint
+        });
+        if !valid {
+            return false;
         }
-        SessionState {
-            catalog: self.config.default_catalog.clone(),
-            schema: self.config.default_schema.clone(),
+        sessions.remove(&handle.id);
+        drop(sessions);
+
+        self.operations
+            .write()
+            .await
+            .retain(|_, operation| operation.session_id != handle.id);
+        true
+    }
+
+    async fn with_operation<R>(
+        &self,
+        handle: Option<&Handle>,
+        bearer_token: &str,
+        write: impl FnOnce(&OperationState) -> R,
+    ) -> Option<R> {
+        let handle = handle?;
+        let token_fingerprint = token_fingerprint(bearer_token);
+        let operations = self.operations.read().await;
+        let operation = operations.get(&handle.id)?;
+        if operation.secret == handle.secret && operation.token_fingerprint == token_fingerprint {
+            Some(write(operation))
+        } else {
+            None
         }
     }
 
-    async fn operation_for(&self, operation_id: Option<&str>) -> Option<OperationState> {
-        let operation_id = operation_id?;
-        self.operations.read().await.get(operation_id).cloned()
+    async fn remove_operation(&self, handle: Option<&Handle>, bearer_token: &str) -> bool {
+        let Some(handle) = handle else {
+            return false;
+        };
+        let token_fingerprint = token_fingerprint(bearer_token);
+        let mut operations = self.operations.write().await;
+        let valid = operations.get(&handle.id).is_some_and(|operation| {
+            operation.secret == handle.secret && operation.token_fingerprint == token_fingerprint
+        });
+        if valid {
+            operations.remove(&handle.id);
+        }
+        valid
     }
 }
 
@@ -257,16 +342,27 @@ pub struct QueryHistory {
 
 #[derive(Debug, Clone)]
 struct SessionState {
+    id: String,
+    secret: [u8; 16],
+    token_fingerprint: [u8; 32],
     catalog: String,
     schema: String,
 }
 
 #[derive(Debug, Clone)]
 struct OperationState {
-    result: QueryResult,
+    secret: [u8; 16],
+    session_id: String,
+    token_fingerprint: [u8; 32],
+    result: Arc<QueryResult>,
     duration_ms: u64,
     has_result_set: bool,
-    closed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Handle {
+    id: String,
+    secret: [u8; 16],
 }
 
 #[derive(Debug)]
@@ -285,24 +381,25 @@ struct OpenSessionReq {
 
 #[derive(Debug)]
 struct CloseSessionReq {
-    session_id: Option<String>,
+    session_handle: Option<Handle>,
 }
 
 #[derive(Debug)]
 struct ExecuteStatementReq {
-    session_id: Option<String>,
+    session_handle: Option<Handle>,
     statement: String,
 }
 
 #[derive(Debug)]
 struct OperationReq {
-    operation_id: Option<String>,
+    operation_handle: Option<Handle>,
 }
 
 #[derive(Debug)]
 struct FetchResultsReq {
-    operation_id: Option<String>,
+    operation_handle: Option<Handle>,
     start_row_offset: Option<i64>,
+    max_rows: Option<i64>,
 }
 
 fn decode_message(body: &[u8]) -> Result<Message<'_>> {
@@ -382,23 +479,23 @@ fn read_namespace(reader: &mut Reader<'_>) -> Result<(Option<String>, Option<Str
 }
 
 fn read_close_session_req(reader: &mut Reader<'_>) -> Result<CloseSessionReq> {
-    let mut session_id = None;
+    let mut session_handle = None;
     loop {
         let (field_type, field_id) = reader.read_field_begin()?;
         if field_type == T_STOP {
             break;
         }
         if field_id == 1 && field_type == T_STRUCT {
-            session_id = read_session_handle(reader)?;
+            session_handle = read_session_handle(reader)?;
         } else {
             reader.skip(field_type)?;
         }
     }
-    Ok(CloseSessionReq { session_id })
+    Ok(CloseSessionReq { session_handle })
 }
 
 fn read_execute_statement_req(reader: &mut Reader<'_>) -> Result<ExecuteStatementReq> {
-    let mut session_id = None;
+    let mut session_handle = None;
     let mut statement = None;
     loop {
         let (field_type, field_id) = reader.read_field_begin()?;
@@ -406,7 +503,7 @@ fn read_execute_statement_req(reader: &mut Reader<'_>) -> Result<ExecuteStatemen
             break;
         }
         match (field_id, field_type) {
-            (1, T_STRUCT) => session_id = read_session_handle(reader)?,
+            (1, T_STRUCT) => session_handle = read_session_handle(reader)?,
             (2, T_STRING) => statement = Some(reader.read_string()?),
             _ => reader.skip(field_type)?,
         }
@@ -414,94 +511,106 @@ fn read_execute_statement_req(reader: &mut Reader<'_>) -> Result<ExecuteStatemen
     let statement =
         statement.ok_or_else(|| HarborError::Thrift("ExecuteStatement missing SQL".into()))?;
     Ok(ExecuteStatementReq {
-        session_id,
+        session_handle,
         statement,
     })
 }
 
 fn read_operation_req(reader: &mut Reader<'_>) -> Result<OperationReq> {
-    let mut operation_id = None;
+    let mut operation_handle = None;
     loop {
         let (field_type, field_id) = reader.read_field_begin()?;
         if field_type == T_STOP {
             break;
         }
         if field_id == 1 && field_type == T_STRUCT {
-            operation_id = read_operation_handle(reader)?;
+            operation_handle = read_operation_handle(reader)?;
         } else {
             reader.skip(field_type)?;
         }
     }
-    Ok(OperationReq { operation_id })
+    Ok(OperationReq { operation_handle })
 }
 
 fn read_fetch_results_req(reader: &mut Reader<'_>) -> Result<FetchResultsReq> {
-    let mut operation_id = None;
+    let mut operation_handle = None;
     let mut start_row_offset = None;
+    let mut max_rows = None;
     loop {
         let (field_type, field_id) = reader.read_field_begin()?;
         if field_type == T_STOP {
             break;
         }
         match (field_id, field_type) {
-            (1, T_STRUCT) => operation_id = read_operation_handle(reader)?,
+            (1, T_STRUCT) => operation_handle = read_operation_handle(reader)?,
+            (3, T_I64) => max_rows = Some(reader.read_i64()?),
             (1282, T_I64) => start_row_offset = Some(reader.read_i64()?),
             _ => reader.skip(field_type)?,
         }
     }
     Ok(FetchResultsReq {
-        operation_id,
+        operation_handle,
         start_row_offset,
+        max_rows,
     })
 }
 
-fn read_session_handle(reader: &mut Reader<'_>) -> Result<Option<String>> {
-    let mut session_id = None;
+fn read_session_handle(reader: &mut Reader<'_>) -> Result<Option<Handle>> {
+    let mut session_handle = None;
     loop {
         let (field_type, field_id) = reader.read_field_begin()?;
         if field_type == T_STOP {
             break;
         }
         if field_id == 1 && field_type == T_STRUCT {
-            session_id = read_handle_identifier(reader)?;
+            session_handle = read_handle_identifier(reader)?;
         } else {
             reader.skip(field_type)?;
         }
     }
-    Ok(session_id)
+    Ok(session_handle)
 }
 
-fn read_operation_handle(reader: &mut Reader<'_>) -> Result<Option<String>> {
-    let mut operation_id = None;
+fn read_operation_handle(reader: &mut Reader<'_>) -> Result<Option<Handle>> {
+    let mut operation_handle = None;
     loop {
         let (field_type, field_id) = reader.read_field_begin()?;
         if field_type == T_STOP {
             break;
         }
         if field_id == 1 && field_type == T_STRUCT {
-            operation_id = read_handle_identifier(reader)?;
+            operation_handle = read_handle_identifier(reader)?;
         } else {
             reader.skip(field_type)?;
         }
     }
-    Ok(operation_id)
+    Ok(operation_handle)
 }
 
-fn read_handle_identifier(reader: &mut Reader<'_>) -> Result<Option<String>> {
+fn read_handle_identifier(reader: &mut Reader<'_>) -> Result<Option<Handle>> {
     let mut guid = None;
+    let mut secret = None;
     loop {
         let (field_type, field_id) = reader.read_field_begin()?;
         if field_type == T_STOP {
             break;
         }
-        if field_id == 1 && field_type == T_STRING {
-            let bytes = reader.read_binary()?;
-            guid = Uuid::from_slice(&bytes).ok().map(|id| id.to_string());
-        } else {
-            reader.skip(field_type)?;
+        match (field_id, field_type) {
+            (1, T_STRING) => {
+                let bytes = reader.read_binary()?;
+                guid = Uuid::from_slice(&bytes).ok().map(|id| id.to_string());
+            }
+            (2, T_STRING) => {
+                let bytes = reader.read_binary()?;
+                secret = bytes.as_slice().try_into().ok();
+            }
+            _ => reader.skip(field_type)?,
         }
     }
-    Ok(guid)
+    Ok(match (guid, secret) {
+        (Some(id), Some(secret)) => Some(Handle { id, secret }),
+        _ => None,
+    })
 }
 
 fn write_open_session_response(
@@ -529,10 +638,22 @@ fn write_open_session_response(
     })
 }
 
-fn write_close_session_response(seqid: i32) -> Vec<u8> {
+fn write_close_session_response(seqid: i32, valid: bool) -> Vec<u8> {
     write_success_response("CloseSession", seqid, |writer| {
         writer.write_field(T_STRUCT, 1, |writer| {
-            write_status(writer, SUCCESS_STATUS, None)
+            write_status(
+                writer,
+                if valid {
+                    SUCCESS_STATUS
+                } else {
+                    INVALID_HANDLE_STATUS
+                },
+                if valid {
+                    None
+                } else {
+                    Some("invalid session handle")
+                },
+            )
         });
         writer.write_stop();
     })
@@ -575,6 +696,15 @@ fn write_execute_statement_error(
     })
 }
 
+fn write_execute_statement_invalid(seqid: i32, message: &str) -> Vec<u8> {
+    write_success_response("ExecuteStatement", seqid, |writer| {
+        writer.write_field(T_STRUCT, 1, |writer| {
+            write_status(writer, INVALID_HANDLE_STATUS, Some(message))
+        });
+        writer.write_stop();
+    })
+}
+
 fn write_get_operation_status_response(
     seqid: i32,
     has_result_set: Option<bool>,
@@ -602,9 +732,16 @@ fn write_fetch_results_response(
     result: &QueryResult,
     include_metadata: bool,
     start_row_offset: i64,
+    max_rows: Option<i64>,
 ) -> Vec<u8> {
     write_success_response("FetchResults", seqid, |writer| {
-        write_fetch_results_response_struct(writer, result, include_metadata, start_row_offset);
+        write_fetch_results_response_struct(
+            writer,
+            result,
+            include_metadata,
+            start_row_offset,
+            max_rows,
+        );
     })
 }
 
@@ -622,19 +759,43 @@ fn write_fetch_results_invalid(seqid: i32) -> Vec<u8> {
     })
 }
 
-fn write_close_operation_response(seqid: i32) -> Vec<u8> {
+fn write_close_operation_response(seqid: i32, valid: bool) -> Vec<u8> {
     write_success_response("CloseOperation", seqid, |writer| {
         writer.write_field(T_STRUCT, 1, |writer| {
-            write_status(writer, SUCCESS_STATUS, None)
+            write_status(
+                writer,
+                if valid {
+                    SUCCESS_STATUS
+                } else {
+                    INVALID_HANDLE_STATUS
+                },
+                if valid {
+                    None
+                } else {
+                    Some("unknown operation handle")
+                },
+            )
         });
         writer.write_stop();
     })
 }
 
-fn write_cancel_operation_response(seqid: i32) -> Vec<u8> {
+fn write_cancel_operation_response(seqid: i32, valid: bool) -> Vec<u8> {
     write_success_response("CancelOperation", seqid, |writer| {
         writer.write_field(T_STRUCT, 1, |writer| {
-            write_status(writer, SUCCESS_STATUS, None)
+            write_status(
+                writer,
+                if valid {
+                    SUCCESS_STATUS
+                } else {
+                    INVALID_HANDLE_STATUS
+                },
+                if valid {
+                    None
+                } else {
+                    Some("unknown operation handle")
+                },
+            )
         });
         writer.write_stop();
     })
@@ -670,7 +831,13 @@ fn write_direct_results(writer: &mut Writer, result: &QueryResult) {
         write_result_set_metadata_response(writer, result, SUCCESS_STATUS);
     });
     writer.write_field(T_STRUCT, 3, |writer| {
-        write_fetch_results_response_struct(writer, result, false, 0);
+        write_fetch_results_response_struct(
+            writer,
+            result,
+            false,
+            0,
+            Some(DEFAULT_FETCH_ROWS as i64),
+        );
     });
     writer.write_field(T_STRUCT, 4, |writer| {
         writer.write_field(T_STRUCT, 1, |writer| {
@@ -728,13 +895,15 @@ fn write_fetch_results_response_struct(
     result: &QueryResult,
     include_metadata: bool,
     start_row_offset: i64,
+    max_rows: Option<i64>,
 ) {
+    let page = row_page(result, start_row_offset, max_rows);
     writer.write_field(T_STRUCT, 1, |writer| {
         write_status(writer, SUCCESS_STATUS, None)
     });
-    writer.write_field(T_BOOL, 2, |writer| writer.write_bool(false));
+    writer.write_field(T_BOOL, 2, |writer| writer.write_bool(page.has_more_rows));
     writer.write_field(T_STRUCT, 3, |writer| {
-        write_row_set(writer, result, start_row_offset);
+        write_row_set(writer, result, &page);
     });
     if include_metadata {
         writer.write_field(T_STRUCT, 1281, |writer| {
@@ -820,19 +989,48 @@ fn write_type_desc(writer: &mut Writer, type_id: i32) {
     writer.write_stop();
 }
 
-fn write_row_set(writer: &mut Writer, result: &QueryResult, start_row_offset: i64) {
-    let rows = result.rows.as_array().cloned().unwrap_or_default();
-    writer.write_field(T_I64, 1, |writer| writer.write_i64(start_row_offset));
+fn write_row_set(writer: &mut Writer, result: &QueryResult, page: &RowPage<'_>) {
+    writer.write_field(T_I64, 1, |writer| writer.write_i64(page.start_row_offset));
     writer.write_field(T_LIST, 3, |writer| {
         writer.write_list_begin(T_STRUCT, result.columns.len());
         for column in &result.columns {
-            write_column(writer, column, &rows);
+            write_column(writer, column, page.rows);
         }
     });
     writer.write_field(T_I32, 5, |writer| {
         writer.write_i32(result.columns.len() as i32)
     });
     writer.write_stop();
+}
+
+struct RowPage<'a> {
+    rows: &'a [Value],
+    start_row_offset: i64,
+    has_more_rows: bool,
+}
+
+fn row_page(result: &QueryResult, start_row_offset: i64, max_rows: Option<i64>) -> RowPage<'_> {
+    let rows = result.rows.as_array().map(Vec::as_slice).unwrap_or(&[]);
+    let start = usize::try_from(start_row_offset.max(0)).unwrap_or(usize::MAX);
+    let start = start.min(rows.len());
+    let limit = requested_row_limit(max_rows);
+    let end = start.saturating_add(limit).min(rows.len());
+
+    RowPage {
+        rows: &rows[start..end],
+        start_row_offset: start as i64,
+        has_more_rows: end < rows.len(),
+    }
+}
+
+fn requested_row_limit(max_rows: Option<i64>) -> usize {
+    match max_rows {
+        Some(value) if value <= 0 => 0,
+        Some(value) => usize::try_from(value)
+            .unwrap_or(MAX_FETCH_ROWS)
+            .min(MAX_FETCH_ROWS),
+        None => DEFAULT_FETCH_ROWS,
+    }
 }
 
 fn write_column(writer: &mut Writer, column: &Column, rows: &[Value]) {
@@ -984,6 +1182,10 @@ fn is_noop_statement(statement: &str) -> bool {
     let normalized = statement.trim().trim_end_matches(';').trim();
     let upper = normalized.to_ascii_uppercase();
     upper == "SET" || upper.starts_with("SET ")
+}
+
+fn token_fingerprint(token: &str) -> [u8; 32] {
+    Sha256::digest(token.as_bytes()).into()
 }
 
 struct Reader<'a> {
@@ -1204,4 +1406,74 @@ impl Writer {
 #[allow(dead_code)]
 fn _duration_to_ms(duration: Duration) -> u64 {
     duration.as_millis() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn row_page_respects_offset_and_limit() {
+        let result = QueryResult {
+            columns: Vec::new(),
+            rows: json!([
+                {"id": 1},
+                {"id": 2},
+                {"id": 3}
+            ]),
+            row_count: 3,
+        };
+
+        let page = row_page(&result, 1, Some(1));
+
+        assert_eq!(page.start_row_offset, 1);
+        assert_eq!(page.rows, &[json!({"id": 2})]);
+        assert!(page.has_more_rows);
+    }
+
+    #[test]
+    fn row_page_clamps_negative_offset_and_large_limit() {
+        let result = QueryResult {
+            columns: Vec::new(),
+            rows: json!([{"id": 1}, {"id": 2}]),
+            row_count: 2,
+        };
+
+        let page = row_page(&result, -10, Some((MAX_FETCH_ROWS + 100) as i64));
+
+        assert_eq!(page.start_row_offset, 0);
+        assert_eq!(page.rows.len(), 2);
+        assert!(!page.has_more_rows);
+    }
+
+    #[test]
+    fn handle_identifier_reads_guid_and_secret() {
+        let guid = Uuid::new_v4();
+        let secret = Uuid::new_v4();
+        let mut writer = Writer::new();
+        write_handle_identifier(&mut writer, guid.as_bytes(), secret.as_bytes());
+
+        let bytes = writer.into_inner();
+        let mut reader = Reader::new(&bytes);
+        let handle = read_handle_identifier(&mut reader).unwrap().unwrap();
+
+        assert_eq!(handle.id, guid.to_string());
+        assert_eq!(handle.secret, *secret.as_bytes());
+    }
+
+    #[test]
+    fn handle_identifier_without_secret_is_invalid() {
+        let guid = Uuid::new_v4();
+        let mut writer = Writer::new();
+        writer.write_field(T_STRING, 1, |writer| writer.write_binary(guid.as_bytes()));
+        writer.write_stop();
+
+        let bytes = writer.into_inner();
+        let mut reader = Reader::new(&bytes);
+        let handle = read_handle_identifier(&mut reader).unwrap();
+
+        assert!(handle.is_none());
+    }
 }
