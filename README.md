@@ -48,6 +48,8 @@ HarborSQL reads configuration from environment variables:
 | `HARBORSQL_DEFAULT_CATALOG` or `DATABRICKS_CATALOG` | no | `workspace` | Default catalog for unqualified queries |
 | `HARBORSQL_DEFAULT_SCHEMA` or `DATABRICKS_SCHEMA` | no | `default` | Default schema for unqualified queries |
 | `HARBORSQL_AWS_REGION` | no | `us-west-2` | AWS region passed to Delta object-store access |
+| `HARBORSQL_MAX_RESULT_ROWS` | no | unlimited | Optional maximum rows HarborSQL will materialize for one query |
+| `HARBORSQL_MAX_RESULT_BYTES` | no | unlimited | Optional maximum JSON result bytes HarborSQL will materialize for one query |
 | `DATABRICKS_TOKEN` | query mode only | none | Token used by `harborsql query --sql ...` |
 
 ## Run The Server

@@ -92,10 +92,10 @@ async fn query_history(
     headers: HeaderMap,
     Path(query_id): Path<String>,
 ) -> Result<Json<QueryHistory>> {
-    let _token = bearer_token(&headers)?;
+    let token = bearer_token(&headers)?;
     state
         .thrift
-        .query_history(&query_id)
+        .query_history(token, &query_id)
         .await
         .map(Json)
         .ok_or_else(|| HarborError::Query(format!("unknown query id `{query_id}`")))
@@ -113,10 +113,15 @@ fn bearer_token(headers: &HeaderMap) -> Result<&str> {
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .ok_or(HarborError::MissingBearerToken)?;
-    value
-        .strip_prefix("Bearer ")
-        .filter(|token| !token.trim().is_empty())
-        .ok_or(HarborError::MissingBearerToken)
+    let (scheme, token) = value
+        .trim()
+        .split_once(' ')
+        .ok_or(HarborError::MissingBearerToken)?;
+    if scheme.eq_ignore_ascii_case("bearer") && !token.trim().is_empty() {
+        Ok(token.trim())
+    } else {
+        Err(HarborError::MissingBearerToken)
+    }
 }
 
 #[derive(Debug, Deserialize)]
