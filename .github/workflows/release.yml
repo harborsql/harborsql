@@ -188,6 +188,7 @@ jobs:
     needs:
       - prepare
       - build-binaries
+    if: always() && needs.prepare.result == 'success' && needs.build-binaries.result == 'success'
     permissions:
       contents: read
       packages: write
@@ -239,7 +240,7 @@ jobs:
     needs:
       - prepare
       - build-binaries
-    if: needs.prepare.outputs.publish == 'true'
+    if: always() && needs.prepare.result == 'success' && needs.build-binaries.result == 'success' && needs.prepare.outputs.publish == 'true'
     permissions:
       contents: write
       packages: write
