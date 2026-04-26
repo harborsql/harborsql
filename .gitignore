@@ -4,9 +4,5 @@ target/
 *.env
 
 .venv/
-databricks/.venv/
 __pycache__/
 *.py[cod]
-
-databricks/results/*.log
-databricks/results/*.raw
