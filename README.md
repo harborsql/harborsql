@@ -108,6 +108,25 @@ HARBORSQL_CONNECTOR_SMOKE_PYTHON=/path/to/python \
   cargo test --test databricks_connector_smoke -- --ignored
 ```
 
+Set `HARBORSQL_CONNECTOR_SMOKE_AUTH` to choose the connector authentication path:
+
+- `local` uses a synthetic local bearer token.
+- `pat` uses `DATABRICKS_TOKEN` or `TEST_CI_DATABRICKS_PAT`.
+- `oauth` uses the Databricks SQL connector OAuth machine-to-machine path.
+- `auto` uses OAuth when client credentials are present, then PAT when a token
+  is present, otherwise local mode.
+
+OAuth mode reads the workspace host from `HARBORSQL_DATABRICKS_HOST`,
+`DATABRICKS_HOST`, or `BENCH_US_DATABRICKS_HOSTNAME`.
+
+The GitHub Actions workflow expects these repository secrets:
+
+- `BENCH_US_DATABRICKS_HOSTNAME`
+- `DATABRICKS_ACCOUNT_ID`
+- `TEST_CI_DATABRICKS_CLIENT_ID`
+- `TEST_CI_DATABRICKS_CLIENT_SECRET`
+- `TEST_CI_DATABRICKS_PAT`
+
 ## Benchmarks
 
 Benchmark setup, Unity Catalog runbooks, topology notes, and result artifacts live outside this public engine repository in the separate benchmark repository:
