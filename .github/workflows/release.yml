@@ -293,4 +293,4 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "${{ needs.prepare.outputs.package_tag }}" dist/artifacts/* --clobber
+        run: gh release upload "${{ needs.prepare.outputs.package_tag }}" dist/artifacts/* --repo "${{ github.repository }}" --clobber
