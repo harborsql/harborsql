@@ -14,7 +14,7 @@ This repository is an early proof of concept. The current implementation is inte
 - Databricks SQL connector compatibility for a minimal Thrift-over-HTTP surface
 - inline result sets, without Databricks Cloud Fetch
 
-It is not production-ready. Important missing pieces include result pagination limits, async operation lifecycle, cancellation, stronger protocol tests, broader SQL compatibility, and hardened operational controls.
+It is not production-ready. Important missing pieces include Cloud Fetch, durable or streaming result storage beyond in-memory materialized results, stronger protocol tests, broader SQL compatibility, and hardened operational controls.
 
 ## How It Works
 
@@ -98,6 +98,14 @@ Production deployments should serve HarborSQL over HTTPS and use normal connecto
 
 ```bash
 cargo test
+```
+
+The local Databricks SQL connector smoke test is ignored by default because it
+requires Python with `databricks-sql-connector` installed:
+
+```bash
+HARBORSQL_CONNECTOR_SMOKE_PYTHON=/path/to/python \
+  cargo test --test databricks_connector_smoke -- --ignored
 ```
 
 ## Benchmarks

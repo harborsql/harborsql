@@ -9,6 +9,7 @@ arrow-json = "58.0.0"
 axum = "0.8.9"
 datafusion = "53.1.0"
 deltalake = { version = "0.32.0", features = ["datafusion", "s3"] }
+futures = "0.3"
 regex = "1.12.2"
 reqwest = { version = "0.13.2", default-features = false, features = ["json", "rustls"] }
 serde = { version = "1.0.228", features = ["derive"] }

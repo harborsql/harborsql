@@ -7,7 +7,7 @@ use std::{
 use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use tokio::sync::RwLock;
+use tokio::{sync::RwLock, task::JoinHandle};
 use uuid::Uuid;
 
 use crate::{
@@ -38,7 +38,10 @@ const SPARK_CLI_SERVICE_PROTOCOL_V7: i32 = 42247;
 const SUCCESS_STATUS: i32 = 0;
 const ERROR_STATUS: i32 = 3;
 const INVALID_HANDLE_STATUS: i32 = 4;
+const RUNNING_STATE: i32 = 1;
 const FINISHED_STATE: i32 = 2;
+const CANCELED_STATE: i32 = 3;
+const ERROR_STATE: i32 = 5;
 const EXECUTE_STATEMENT: i32 = 0;
 const COLUMN_BASED_SET: i32 = 1;
 const DEFAULT_FETCH_ROWS: usize = 1_000;
@@ -132,47 +135,42 @@ impl DatabricksThriftService {
                 };
                 let operation_id = Uuid::new_v4();
                 let secret = Uuid::new_v4();
+                let query_id = operation_id.to_string();
                 let statement = request.statement.trim().to_string();
-
-                let started = Instant::now();
-                let result = if is_noop_statement(&statement) {
-                    Ok(QueryResult::empty())
-                } else {
-                    self.engine
-                        .execute(bearer_token, &statement, &session.catalog, &session.schema)
-                        .await
-                };
-                let duration_ms = started.elapsed().as_millis() as u64;
-
-                match result {
-                    Ok(result) => {
-                        let result = Arc::new(result);
-                        let query_id = operation_id.to_string();
-                        self.operations.write().await.insert(
-                            query_id.clone(),
-                            OperationState {
-                                secret: *secret.as_bytes(),
-                                session_id: session.id.clone(),
-                                token_fingerprint: token_fingerprint(bearer_token),
-                                result: result.clone(),
-                                duration_ms,
-                                has_result_set: true,
-                            },
-                        );
-                        Ok(write_execute_statement_response(
-                            message.seqid,
-                            operation_id.as_bytes(),
-                            secret.as_bytes(),
-                            result.as_ref(),
-                        ))
+                let engine = self.engine.clone();
+                let token = bearer_token.to_string();
+                let catalog = session.catalog.clone();
+                let schema = session.schema.clone();
+                let task = tokio::spawn(async move {
+                    let started = Instant::now();
+                    let result = if is_noop_statement(&statement) {
+                        Ok(QueryResult::empty())
+                    } else {
+                        engine.execute(&token, &statement, &catalog, &schema).await
+                    };
+                    OperationCompletion {
+                        duration_ms: started.elapsed().as_millis() as u64,
+                        result: result.map_err(|err| err.to_string()),
                     }
-                    Err(err) => Ok(write_execute_statement_error(
-                        message.seqid,
-                        operation_id.as_bytes(),
-                        secret.as_bytes(),
-                        &err.to_string(),
-                    )),
-                }
+                });
+
+                self.operations.write().await.insert(
+                    query_id,
+                    OperationState {
+                        secret: *secret.as_bytes(),
+                        session_id: session.id.clone(),
+                        token_fingerprint: token_fingerprint(bearer_token),
+                        state: OperationExecution::Running {
+                            started: Instant::now(),
+                            task,
+                        },
+                    },
+                );
+                Ok(write_execute_statement_response(
+                    message.seqid,
+                    operation_id.as_bytes(),
+                    secret.as_bytes(),
+                ))
             }
             "GetOperationStatus" => {
                 let request = read_args(&message.payload, read_operation_req)?;
@@ -180,18 +178,10 @@ impl DatabricksThriftService {
                     .with_operation(
                         request.operation_handle.as_ref(),
                         bearer_token,
-                        |operation| {
-                            write_get_operation_status_response(
-                                message.seqid,
-                                Some(operation.has_result_set),
-                                true,
-                            )
-                        },
+                        |operation| write_get_operation_status_response(message.seqid, operation),
                     )
                     .await
-                    .unwrap_or_else(|| {
-                        write_get_operation_status_response(message.seqid, None, false)
-                    }))
+                    .unwrap_or_else(|| write_get_operation_status_invalid(message.seqid)))
             }
             "GetResultSetMetadata" => {
                 let request = read_args(&message.payload, read_operation_req)?;
@@ -199,8 +189,14 @@ impl DatabricksThriftService {
                     .with_operation(
                         request.operation_handle.as_ref(),
                         bearer_token,
-                        |operation| {
-                            write_get_result_set_metadata_response(message.seqid, &operation.result)
+                        |operation| match operation.state.result() {
+                            Some(result) => {
+                                write_get_result_set_metadata_response(message.seqid, result)
+                            }
+                            None => write_get_result_set_metadata_not_ready(
+                                message.seqid,
+                                operation.state.error_message(),
+                            ),
                         },
                     )
                     .await
@@ -212,14 +208,18 @@ impl DatabricksThriftService {
                     .with_operation(
                         request.operation_handle.as_ref(),
                         bearer_token,
-                        |operation| {
-                            write_fetch_results_response(
+                        |operation| match operation.state.result() {
+                            Some(result) => write_fetch_results_response(
                                 message.seqid,
-                                &operation.result,
+                                result,
                                 true,
                                 request.start_row_offset.unwrap_or(0),
                                 request.max_rows,
-                            )
+                            ),
+                            None => write_fetch_results_not_ready(
+                                message.seqid,
+                                operation.state.error_message(),
+                            ),
                         },
                     )
                     .await
@@ -234,10 +234,10 @@ impl DatabricksThriftService {
             }
             "CancelOperation" => {
                 let request = read_args(&message.payload, read_operation_req)?;
-                let removed = self
-                    .remove_operation(request.operation_handle.as_ref(), bearer_token)
+                let canceled = self
+                    .cancel_operation(request.operation_handle.as_ref(), bearer_token)
                     .await;
-                Ok(write_cancel_operation_response(message.seqid, removed))
+                Ok(write_cancel_operation_response(message.seqid, canceled))
             }
             other => Ok(write_application_exception(
                 other,
@@ -246,8 +246,8 @@ impl DatabricksThriftService {
             )),
         }
     }
-
     pub async fn query_history(&self, bearer_token: &str, query_id: &str) -> Option<QueryHistory> {
+        self.refresh_operation(query_id).await;
         let token_fingerprint = token_fingerprint(bearer_token);
         self.operations
             .read()
@@ -256,8 +256,8 @@ impl DatabricksThriftService {
             .filter(|operation| operation.token_fingerprint == token_fingerprint)
             .map(|operation| QueryHistory {
                 query_id: query_id.to_string(),
-                status: "FINISHED".to_string(),
-                duration: operation.duration_ms,
+                status: operation.state.history_status().to_string(),
+                duration: operation.state.duration_ms(),
             })
     }
 
@@ -293,10 +293,14 @@ impl DatabricksThriftService {
         sessions.remove(&handle.id);
         drop(sessions);
 
-        self.operations
-            .write()
-            .await
-            .retain(|_, operation| operation.session_id != handle.id);
+        self.operations.write().await.retain(|_, operation| {
+            if operation.session_id == handle.id {
+                operation.abort();
+                false
+            } else {
+                true
+            }
+        });
         true
     }
 
@@ -308,6 +312,7 @@ impl DatabricksThriftService {
     ) -> Option<R> {
         let handle = handle?;
         let token_fingerprint = token_fingerprint(bearer_token);
+        self.refresh_operation(&handle.id).await;
         let operations = self.operations.read().await;
         let operation = operations.get(&handle.id)?;
         if operation.secret == handle.secret && operation.token_fingerprint == token_fingerprint {
@@ -327,9 +332,35 @@ impl DatabricksThriftService {
             operation.secret == handle.secret && operation.token_fingerprint == token_fingerprint
         });
         if valid {
-            operations.remove(&handle.id);
+            if let Some(operation) = operations.remove(&handle.id) {
+                operation.abort();
+            }
         }
         valid
+    }
+
+    async fn cancel_operation(&self, handle: Option<&Handle>, bearer_token: &str) -> bool {
+        let Some(handle) = handle else {
+            return false;
+        };
+        let token_fingerprint = token_fingerprint(bearer_token);
+        let mut operations = self.operations.write().await;
+        let Some(operation) = operations.get_mut(&handle.id) else {
+            return false;
+        };
+        if operation.secret != handle.secret || operation.token_fingerprint != token_fingerprint {
+            return false;
+        }
+        operation.cancel();
+        true
+    }
+
+    async fn refresh_operation(&self, operation_id: &str) {
+        let mut operations = self.operations.write().await;
+        let Some(operation) = operations.get_mut(operation_id) else {
+            return;
+        };
+        operation.refresh_if_finished().await;
     }
 }
 
@@ -349,14 +380,141 @@ struct SessionState {
     schema: String,
 }
 
-#[derive(Debug, Clone)]
 struct OperationState {
     secret: [u8; 16],
     session_id: String,
     token_fingerprint: [u8; 32],
-    result: Arc<QueryResult>,
+    state: OperationExecution,
+}
+
+impl OperationState {
+    async fn refresh_if_finished(&mut self) {
+        if !matches!(&self.state, OperationExecution::Running { task, .. } if task.is_finished()) {
+            return;
+        }
+
+        let temporary = OperationExecution::Canceled {
+            duration_ms: self.state.duration_ms(),
+        };
+        let state = std::mem::replace(&mut self.state, temporary);
+        let OperationExecution::Running { started, task } = state else {
+            self.state = state;
+            return;
+        };
+        self.state = match task.await {
+            Ok(completion) => OperationExecution::from_completion(completion),
+            Err(err) if err.is_cancelled() => OperationExecution::Canceled {
+                duration_ms: started.elapsed().as_millis() as u64,
+            },
+            Err(err) => OperationExecution::Failed {
+                error: err.to_string(),
+                duration_ms: started.elapsed().as_millis() as u64,
+            },
+        };
+    }
+
+    fn abort(&self) {
+        if let OperationExecution::Running { task, .. } = &self.state {
+            task.abort();
+        }
+    }
+
+    fn cancel(&mut self) {
+        if !matches!(self.state, OperationExecution::Running { .. }) {
+            return;
+        }
+        let duration_ms = self.state.duration_ms();
+        self.abort();
+        self.state = OperationExecution::Canceled { duration_ms };
+    }
+}
+
+enum OperationExecution {
+    Running {
+        started: Instant,
+        task: JoinHandle<OperationCompletion>,
+    },
+    Finished {
+        result: Arc<QueryResult>,
+        duration_ms: u64,
+    },
+    Failed {
+        error: String,
+        duration_ms: u64,
+    },
+    Canceled {
+        duration_ms: u64,
+    },
+}
+
+impl OperationExecution {
+    fn from_completion(completion: OperationCompletion) -> Self {
+        match completion.result {
+            Ok(result) => Self::Finished {
+                result: Arc::new(result),
+                duration_ms: completion.duration_ms,
+            },
+            Err(error) => Self::Failed {
+                error,
+                duration_ms: completion.duration_ms,
+            },
+        }
+    }
+
+    fn result(&self) -> Option<&QueryResult> {
+        match self {
+            Self::Finished { result, .. } => Some(result.as_ref()),
+            _ => None,
+        }
+    }
+
+    fn status_code(&self) -> i32 {
+        match self {
+            Self::Failed { .. } => ERROR_STATUS,
+            _ => SUCCESS_STATUS,
+        }
+    }
+
+    fn operation_state(&self) -> i32 {
+        match self {
+            Self::Running { .. } => RUNNING_STATE,
+            Self::Finished { .. } => FINISHED_STATE,
+            Self::Failed { .. } => ERROR_STATE,
+            Self::Canceled { .. } => CANCELED_STATE,
+        }
+    }
+
+    fn duration_ms(&self) -> u64 {
+        match self {
+            Self::Running { started, .. } => started.elapsed().as_millis() as u64,
+            Self::Finished { duration_ms, .. }
+            | Self::Failed { duration_ms, .. }
+            | Self::Canceled { duration_ms } => *duration_ms,
+        }
+    }
+
+    fn history_status(&self) -> &'static str {
+        match self {
+            Self::Running { .. } => "RUNNING",
+            Self::Finished { .. } => "FINISHED",
+            Self::Failed { .. } => "FAILED",
+            Self::Canceled { .. } => "CANCELED",
+        }
+    }
+
+    fn error_message(&self) -> Option<&str> {
+        match self {
+            Self::Running { .. } => Some("operation is still running"),
+            Self::Failed { error, .. } => Some(error),
+            Self::Canceled { .. } => Some("operation was canceled"),
+            Self::Finished { .. } => None,
+        }
+    }
+}
+
+struct OperationCompletion {
     duration_ms: u64,
-    has_result_set: bool,
+    result: std::result::Result<QueryResult, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -659,38 +817,13 @@ fn write_close_session_response(seqid: i32, valid: bool) -> Vec<u8> {
     })
 }
 
-fn write_execute_statement_response(
-    seqid: i32,
-    guid: &[u8; 16],
-    secret: &[u8; 16],
-    result: &QueryResult,
-) -> Vec<u8> {
+fn write_execute_statement_response(seqid: i32, guid: &[u8; 16], secret: &[u8; 16]) -> Vec<u8> {
     write_success_response("ExecuteStatement", seqid, |writer| {
         writer.write_field(T_STRUCT, 1, |writer| {
             write_status(writer, SUCCESS_STATUS, None)
         });
         writer.write_field(T_STRUCT, 2, |writer| {
             write_operation_handle(writer, guid, secret, true);
-        });
-        writer.write_field(T_STRUCT, 1281, |writer| {
-            write_direct_results(writer, result);
-        });
-        writer.write_stop();
-    })
-}
-
-fn write_execute_statement_error(
-    seqid: i32,
-    guid: &[u8; 16],
-    secret: &[u8; 16],
-    error: &str,
-) -> Vec<u8> {
-    write_success_response("ExecuteStatement", seqid, |writer| {
-        writer.write_field(T_STRUCT, 1, |writer| {
-            write_status(writer, ERROR_STATUS, Some(error))
-        });
-        writer.write_field(T_STRUCT, 2, |writer| {
-            write_operation_handle(writer, guid, secret, false);
         });
         writer.write_stop();
     })
@@ -705,13 +838,27 @@ fn write_execute_statement_invalid(seqid: i32, message: &str) -> Vec<u8> {
     })
 }
 
-fn write_get_operation_status_response(
-    seqid: i32,
-    has_result_set: Option<bool>,
-    valid: bool,
-) -> Vec<u8> {
+fn write_get_operation_status_response(seqid: i32, operation: &OperationState) -> Vec<u8> {
     write_success_response("GetOperationStatus", seqid, |writer| {
-        write_operation_status_response(writer, has_result_set.unwrap_or(false), valid);
+        write_operation_status_response(
+            writer,
+            operation.state.status_code(),
+            operation.state.operation_state(),
+            operation.state.result().is_some(),
+            operation.state.error_message(),
+        );
+    })
+}
+
+fn write_get_operation_status_invalid(seqid: i32) -> Vec<u8> {
+    write_success_response("GetOperationStatus", seqid, |writer| {
+        write_operation_status_response(
+            writer,
+            INVALID_HANDLE_STATUS,
+            ERROR_STATE,
+            false,
+            Some("unknown operation handle"),
+        );
     })
 }
 
@@ -723,7 +870,21 @@ fn write_get_result_set_metadata_response(seqid: i32, result: &QueryResult) -> V
 
 fn write_get_result_set_metadata_invalid(seqid: i32) -> Vec<u8> {
     write_success_response("GetResultSetMetadata", seqid, |writer| {
-        write_result_set_metadata_response_with_error(writer, INVALID_HANDLE_STATUS);
+        write_result_set_metadata_response_with_error(
+            writer,
+            INVALID_HANDLE_STATUS,
+            "unknown operation handle",
+        );
+    })
+}
+
+fn write_get_result_set_metadata_not_ready(seqid: i32, message: Option<&str>) -> Vec<u8> {
+    write_success_response("GetResultSetMetadata", seqid, |writer| {
+        write_result_set_metadata_response_with_error(
+            writer,
+            ERROR_STATUS,
+            message.unwrap_or("operation is not finished"),
+        );
     })
 }
 
@@ -752,6 +913,20 @@ fn write_fetch_results_invalid(seqid: i32) -> Vec<u8> {
                 writer,
                 INVALID_HANDLE_STATUS,
                 Some("unknown operation handle"),
+            );
+        });
+        writer.write_field(T_BOOL, 2, |writer| writer.write_bool(false));
+        writer.write_stop();
+    })
+}
+
+fn write_fetch_results_not_ready(seqid: i32, message: Option<&str>) -> Vec<u8> {
+    write_success_response("FetchResults", seqid, |writer| {
+        writer.write_field(T_STRUCT, 1, |writer| {
+            write_status(
+                writer,
+                ERROR_STATUS,
+                Some(message.unwrap_or("operation is not finished")),
             );
         });
         writer.write_field(T_BOOL, 2, |writer| writer.write_bool(false));
@@ -823,49 +998,18 @@ fn write_application_exception(method: &str, seqid: i32, message: &str) -> Vec<u
     writer.into_inner()
 }
 
-fn write_direct_results(writer: &mut Writer, result: &QueryResult) {
+fn write_operation_status_response(
+    writer: &mut Writer,
+    status_code: i32,
+    operation_state: i32,
+    has_result_set: bool,
+    message: Option<&str>,
+) {
     writer.write_field(T_STRUCT, 1, |writer| {
-        write_operation_status_response(writer, true, true);
+        write_status(writer, status_code, message)
     });
-    writer.write_field(T_STRUCT, 2, |writer| {
-        write_result_set_metadata_response(writer, result, SUCCESS_STATUS);
-    });
-    writer.write_field(T_STRUCT, 3, |writer| {
-        write_fetch_results_response_struct(
-            writer,
-            result,
-            false,
-            0,
-            Some(DEFAULT_FETCH_ROWS as i64),
-        );
-    });
-    writer.write_field(T_STRUCT, 4, |writer| {
-        writer.write_field(T_STRUCT, 1, |writer| {
-            write_status(writer, SUCCESS_STATUS, None)
-        });
-        writer.write_stop();
-    });
-    writer.write_stop();
-}
-
-fn write_operation_status_response(writer: &mut Writer, has_result_set: bool, valid: bool) {
-    if valid {
-        writer.write_field(T_STRUCT, 1, |writer| {
-            write_status(writer, SUCCESS_STATUS, None)
-        });
-        writer.write_field(T_I32, 2, |writer| writer.write_i32(FINISHED_STATE));
-        writer.write_field(T_BOOL, 9, |writer| writer.write_bool(has_result_set));
-    } else {
-        writer.write_field(T_STRUCT, 1, |writer| {
-            write_status(
-                writer,
-                INVALID_HANDLE_STATUS,
-                Some("unknown operation handle"),
-            );
-        });
-        writer.write_field(T_I32, 2, |writer| writer.write_i32(FINISHED_STATE));
-        writer.write_field(T_BOOL, 9, |writer| writer.write_bool(false));
-    }
+    writer.write_field(T_I32, 2, |writer| writer.write_i32(operation_state));
+    writer.write_field(T_BOOL, 9, |writer| writer.write_bool(has_result_set));
     writer.write_stop();
 }
 
@@ -880,9 +1024,9 @@ fn write_result_set_metadata_response(writer: &mut Writer, result: &QueryResult,
     writer.write_stop();
 }
 
-fn write_result_set_metadata_response_with_error(writer: &mut Writer, status: i32) {
+fn write_result_set_metadata_response_with_error(writer: &mut Writer, status: i32, message: &str) {
     writer.write_field(T_STRUCT, 1, |writer| {
-        write_status(writer, status, Some("unknown operation handle"));
+        write_status(writer, status, Some(message));
     });
     writer.write_field(T_STRUCT, 2, |writer| write_table_schema(writer, &[]));
     writer.write_field(T_I32, 1281, |writer| writer.write_i32(COLUMN_BASED_SET));
@@ -1475,5 +1619,42 @@ mod tests {
         let handle = read_handle_identifier(&mut reader).unwrap();
 
         assert!(handle.is_none());
+    }
+
+    #[tokio::test]
+    async fn cancel_marks_running_operation_canceled() {
+        let task = tokio::spawn(futures::future::pending::<OperationCompletion>());
+        let mut operation = OperationState {
+            secret: [0; 16],
+            session_id: "session".to_string(),
+            token_fingerprint: [0; 32],
+            state: OperationExecution::Running {
+                started: Instant::now(),
+                task,
+            },
+        };
+
+        operation.cancel();
+
+        assert_eq!(operation.state.operation_state(), CANCELED_STATE);
+        assert_eq!(operation.state.history_status(), "CANCELED");
+    }
+
+    #[test]
+    fn cancel_keeps_finished_operation_finished() {
+        let mut operation = OperationState {
+            secret: [0; 16],
+            session_id: "session".to_string(),
+            token_fingerprint: [0; 32],
+            state: OperationExecution::Finished {
+                result: Arc::new(QueryResult::empty()),
+                duration_ms: 5,
+            },
+        };
+
+        operation.cancel();
+
+        assert_eq!(operation.state.operation_state(), FINISHED_STATE);
+        assert_eq!(operation.state.history_status(), "FINISHED");
     }
 }
