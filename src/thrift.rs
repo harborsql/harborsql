@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -7,7 +7,10 @@ use std::{
 use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use tokio::{sync::RwLock, task::JoinHandle};
+use tokio::{
+    sync::RwLock,
+    task::{JoinError, JoinHandle},
+};
 use uuid::Uuid;
 
 use crate::{
@@ -73,6 +76,17 @@ impl DatabricksThriftService {
         }
     }
 
+    pub fn spawn_cleanup_task(&self) -> JoinHandle<()> {
+        let service = self.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(service.config.cleanup_interval);
+            loop {
+                interval.tick().await;
+                service.cleanup_expired().await;
+            }
+        })
+    }
+
     pub async fn handle(&self, bearer_token: &str, body: &[u8]) -> Result<Vec<u8>> {
         let message = decode_message(body)?;
         if message.message_type != T_MESSAGE_CALL {
@@ -85,7 +99,8 @@ impl DatabricksThriftService {
 
         match message.name.as_str() {
             "OpenSession" => {
-                let request = read_args(&message.payload, read_open_session_req)?;
+                let request = read_args(message.payload, read_open_session_req)?;
+                self.cleanup_expired().await;
                 let session_id = Uuid::new_v4();
                 let secret = Uuid::new_v4();
                 let session_id_string = session_id.to_string();
@@ -96,7 +111,14 @@ impl DatabricksThriftService {
                     .schema
                     .unwrap_or_else(|| self.config.default_schema.clone());
 
-                self.sessions.write().await.insert(
+                let mut sessions = self.sessions.write().await;
+                if sessions.len() >= self.config.max_sessions {
+                    return Ok(write_open_session_error(
+                        message.seqid,
+                        "maximum session count exceeded",
+                    ));
+                }
+                sessions.insert(
                     session_id_string.clone(),
                     SessionState {
                         id: session_id_string,
@@ -104,6 +126,7 @@ impl DatabricksThriftService {
                         token_fingerprint: token_fingerprint(bearer_token),
                         catalog: catalog.clone(),
                         schema: schema.clone(),
+                        last_access: Instant::now(),
                     },
                 );
 
@@ -116,14 +139,15 @@ impl DatabricksThriftService {
                 ))
             }
             "CloseSession" => {
-                let request = read_args(&message.payload, read_close_session_req)?;
+                let request = read_args(message.payload, read_close_session_req)?;
                 let removed = self
                     .remove_session(request.session_handle.as_ref(), bearer_token)
                     .await;
                 Ok(write_close_session_response(message.seqid, removed))
             }
             "ExecuteStatement" => {
-                let request = read_args(&message.payload, read_execute_statement_req)?;
+                let request = read_args(message.payload, read_execute_statement_req)?;
+                self.cleanup_expired().await;
                 let Some(session) = self
                     .session_for(request.session_handle.as_ref(), bearer_token)
                     .await
@@ -141,6 +165,13 @@ impl DatabricksThriftService {
                 let token = bearer_token.to_string();
                 let catalog = session.catalog.clone();
                 let schema = session.schema.clone();
+                let mut operations = self.operations.write().await;
+                if operations.len() >= self.config.max_operations {
+                    return Ok(write_execute_statement_error(
+                        message.seqid,
+                        "maximum operation count exceeded",
+                    ));
+                }
                 let task = tokio::spawn(async move {
                     let started = Instant::now();
                     let result = if is_noop_statement(&statement) {
@@ -154,7 +185,7 @@ impl DatabricksThriftService {
                     }
                 });
 
-                self.operations.write().await.insert(
+                operations.insert(
                     query_id,
                     OperationState {
                         secret: *secret.as_bytes(),
@@ -173,7 +204,7 @@ impl DatabricksThriftService {
                 ))
             }
             "GetOperationStatus" => {
-                let request = read_args(&message.payload, read_operation_req)?;
+                let request = read_args(message.payload, read_operation_req)?;
                 Ok(self
                     .with_operation(
                         request.operation_handle.as_ref(),
@@ -184,7 +215,7 @@ impl DatabricksThriftService {
                     .unwrap_or_else(|| write_get_operation_status_invalid(message.seqid)))
             }
             "GetResultSetMetadata" => {
-                let request = read_args(&message.payload, read_operation_req)?;
+                let request = read_args(message.payload, read_operation_req)?;
                 Ok(self
                     .with_operation(
                         request.operation_handle.as_ref(),
@@ -203,7 +234,7 @@ impl DatabricksThriftService {
                     .unwrap_or_else(|| write_get_result_set_metadata_invalid(message.seqid)))
             }
             "FetchResults" => {
-                let request = read_args(&message.payload, read_fetch_results_req)?;
+                let request = read_args(message.payload, read_fetch_results_req)?;
                 Ok(self
                     .with_operation(
                         request.operation_handle.as_ref(),
@@ -226,14 +257,14 @@ impl DatabricksThriftService {
                     .unwrap_or_else(|| write_fetch_results_invalid(message.seqid)))
             }
             "CloseOperation" => {
-                let request = read_args(&message.payload, read_operation_req)?;
+                let request = read_args(message.payload, read_operation_req)?;
                 let removed = self
                     .remove_operation(request.operation_handle.as_ref(), bearer_token)
                     .await;
                 Ok(write_close_operation_response(message.seqid, removed))
             }
             "CancelOperation" => {
-                let request = read_args(&message.payload, read_operation_req)?;
+                let request = read_args(message.payload, read_operation_req)?;
                 let canceled = self
                     .cancel_operation(request.operation_handle.as_ref(), bearer_token)
                     .await;
@@ -247,18 +278,22 @@ impl DatabricksThriftService {
         }
     }
     pub async fn query_history(&self, bearer_token: &str, query_id: &str) -> Option<QueryHistory> {
+        self.cleanup_expired().await;
         self.refresh_operation(query_id).await;
         let token_fingerprint = token_fingerprint(bearer_token);
-        self.operations
-            .read()
-            .await
+        let operations = self.operations.read().await;
+        let operation = operations
             .get(query_id)
-            .filter(|operation| operation.token_fingerprint == token_fingerprint)
-            .map(|operation| QueryHistory {
-                query_id: query_id.to_string(),
-                status: operation.state.history_status().to_string(),
-                duration: operation.state.duration_ms(),
-            })
+            .filter(|operation| operation.token_fingerprint == token_fingerprint)?;
+        let session_id = operation.session_id.clone();
+        let history = QueryHistory {
+            query_id: query_id.to_string(),
+            status: operation.state.history_status().to_string(),
+            duration: operation.state.duration_ms(),
+        };
+        drop(operations);
+        self.touch_session(&session_id).await;
+        Some(history)
     }
 
     async fn session_for(
@@ -267,15 +302,22 @@ impl DatabricksThriftService {
         bearer_token: &str,
     ) -> Option<SessionState> {
         let handle = handle?;
+        let now = Instant::now();
         let token_fingerprint = token_fingerprint(bearer_token);
-        self.sessions
-            .read()
-            .await
-            .get(&handle.id)
-            .filter(|session| {
-                session.secret == handle.secret && session.token_fingerprint == token_fingerprint
-            })
-            .cloned()
+        let mut sessions = self.sessions.write().await;
+        let session = sessions.get_mut(&handle.id)?;
+        if session.is_expired(now, self.config.idle_session_timeout) {
+            sessions.remove(&handle.id);
+            drop(sessions);
+            self.remove_operations_for_session(&handle.id).await;
+            return None;
+        }
+        if session.secret == handle.secret && session.token_fingerprint == token_fingerprint {
+            session.last_access = now;
+            Some(session.clone())
+        } else {
+            None
+        }
     }
 
     async fn remove_session(&self, handle: Option<&Handle>, bearer_token: &str) -> bool {
@@ -293,15 +335,25 @@ impl DatabricksThriftService {
         sessions.remove(&handle.id);
         drop(sessions);
 
+        self.remove_operations_for_session(&handle.id).await;
+        true
+    }
+
+    async fn remove_operations_for_session(&self, session_id: &str) {
         self.operations.write().await.retain(|_, operation| {
-            if operation.session_id == handle.id {
+            if operation.session_id == session_id {
                 operation.abort();
                 false
             } else {
                 true
             }
         });
-        true
+    }
+
+    async fn touch_session(&self, session_id: &str) {
+        if let Some(session) = self.sessions.write().await.get_mut(session_id) {
+            session.last_access = Instant::now();
+        }
     }
 
     async fn with_operation<R>(
@@ -312,11 +364,16 @@ impl DatabricksThriftService {
     ) -> Option<R> {
         let handle = handle?;
         let token_fingerprint = token_fingerprint(bearer_token);
+        self.cleanup_expired().await;
         self.refresh_operation(&handle.id).await;
         let operations = self.operations.read().await;
         let operation = operations.get(&handle.id)?;
         if operation.secret == handle.secret && operation.token_fingerprint == token_fingerprint {
-            Some(write(operation))
+            let session_id = operation.session_id.clone();
+            let response = write(operation);
+            drop(operations);
+            self.touch_session(&session_id).await;
+            Some(response)
         } else {
             None
         }
@@ -327,14 +384,13 @@ impl DatabricksThriftService {
             return false;
         };
         let token_fingerprint = token_fingerprint(bearer_token);
+        self.cleanup_expired().await;
         let mut operations = self.operations.write().await;
         let valid = operations.get(&handle.id).is_some_and(|operation| {
             operation.secret == handle.secret && operation.token_fingerprint == token_fingerprint
         });
-        if valid {
-            if let Some(operation) = operations.remove(&handle.id) {
-                operation.abort();
-            }
+        if valid && let Some(operation) = operations.remove(&handle.id) {
+            operation.abort();
         }
         valid
     }
@@ -344,6 +400,7 @@ impl DatabricksThriftService {
             return false;
         };
         let token_fingerprint = token_fingerprint(bearer_token);
+        self.cleanup_expired().await;
         let mut operations = self.operations.write().await;
         let Some(operation) = operations.get_mut(&handle.id) else {
             return false;
@@ -356,11 +413,62 @@ impl DatabricksThriftService {
     }
 
     async fn refresh_operation(&self, operation_id: &str) {
-        let mut operations = self.operations.write().await;
-        let Some(operation) = operations.get_mut(operation_id) else {
-            return;
+        let finished_task = {
+            let mut operations = self.operations.write().await;
+            operations
+                .get_mut(operation_id)
+                .and_then(OperationState::take_finished_task)
         };
-        operation.refresh_if_finished().await;
+        if let Some((started, task)) = finished_task {
+            let result = task.await;
+            let mut operations = self.operations.write().await;
+            if let Some(operation) = operations.get_mut(operation_id) {
+                operation.finish_refresh(started, result);
+            }
+        };
+    }
+
+    async fn refresh_finished_operations(&self) {
+        let operation_ids = {
+            let operations = self.operations.read().await;
+            operations
+                .iter()
+                .filter(|(_, operation)| operation.has_finished_task())
+                .map(|(id, _)| id.clone())
+                .collect::<Vec<_>>()
+        };
+        for operation_id in operation_ids {
+            self.refresh_operation(&operation_id).await;
+        }
+    }
+
+    async fn cleanup_expired(&self) {
+        self.refresh_finished_operations().await;
+
+        let now = Instant::now();
+        let expired_sessions = {
+            let mut sessions = self.sessions.write().await;
+            let expired_sessions = sessions
+                .iter()
+                .filter(|(_, session)| session.is_expired(now, self.config.idle_session_timeout))
+                .map(|(id, _)| id.clone())
+                .collect::<HashSet<_>>();
+            for session_id in &expired_sessions {
+                sessions.remove(session_id);
+            }
+            expired_sessions
+        };
+
+        self.operations.write().await.retain(|_, operation| {
+            if expired_sessions.contains(&operation.session_id)
+                || operation.is_expired(now, self.config.completed_operation_ttl)
+            {
+                operation.abort();
+                false
+            } else {
+                true
+            }
+        });
     }
 }
 
@@ -378,6 +486,13 @@ struct SessionState {
     token_fingerprint: [u8; 32],
     catalog: String,
     schema: String,
+    last_access: Instant,
+}
+
+impl SessionState {
+    fn is_expired(&self, now: Instant, idle_timeout: Duration) -> bool {
+        now.saturating_duration_since(self.last_access) >= idle_timeout
+    }
 }
 
 struct OperationState {
@@ -388,29 +503,37 @@ struct OperationState {
 }
 
 impl OperationState {
-    async fn refresh_if_finished(&mut self) {
-        if !matches!(&self.state, OperationExecution::Running { task, .. } if task.is_finished()) {
-            return;
+    fn has_finished_task(&self) -> bool {
+        matches!(&self.state, OperationExecution::Running { task, .. } if task.is_finished())
+    }
+
+    fn take_finished_task(&mut self) -> Option<(Instant, JoinHandle<OperationCompletion>)> {
+        if !self.has_finished_task() {
+            return None;
         }
 
-        let temporary = OperationExecution::Canceled {
-            duration_ms: self.state.duration_ms(),
-        };
-        let state = std::mem::replace(&mut self.state, temporary);
+        let state = std::mem::replace(
+            &mut self.state,
+            OperationExecution::Refreshing {
+                started: Instant::now(),
+            },
+        );
         let OperationExecution::Running { started, task } = state else {
             self.state = state;
-            return;
+            return None;
         };
-        self.state = match task.await {
-            Ok(completion) => OperationExecution::from_completion(completion),
-            Err(err) if err.is_cancelled() => OperationExecution::Canceled {
-                duration_ms: started.elapsed().as_millis() as u64,
-            },
-            Err(err) => OperationExecution::Failed {
-                error: err.to_string(),
-                duration_ms: started.elapsed().as_millis() as u64,
-            },
-        };
+        self.state = OperationExecution::Refreshing { started };
+        Some((started, task))
+    }
+
+    fn finish_refresh(
+        &mut self,
+        started: Instant,
+        result: std::result::Result<OperationCompletion, JoinError>,
+    ) {
+        if matches!(self.state, OperationExecution::Refreshing { .. }) {
+            self.state = OperationExecution::from_join_result(started, result);
+        }
     }
 
     fn abort(&self) {
@@ -425,7 +548,14 @@ impl OperationState {
         }
         let duration_ms = self.state.duration_ms();
         self.abort();
-        self.state = OperationExecution::Canceled { duration_ms };
+        self.state = OperationExecution::Canceled {
+            duration_ms,
+            completed_at: Instant::now(),
+        };
+    }
+
+    fn is_expired(&self, now: Instant, completed_operation_ttl: Duration) -> bool {
+        self.state.is_expired(now, completed_operation_ttl)
     }
 }
 
@@ -434,29 +564,56 @@ enum OperationExecution {
         started: Instant,
         task: JoinHandle<OperationCompletion>,
     },
+    Refreshing {
+        started: Instant,
+    },
     Finished {
         result: Arc<QueryResult>,
         duration_ms: u64,
+        completed_at: Instant,
     },
     Failed {
         error: String,
         duration_ms: u64,
+        completed_at: Instant,
     },
     Canceled {
         duration_ms: u64,
+        completed_at: Instant,
     },
 }
 
 impl OperationExecution {
     fn from_completion(completion: OperationCompletion) -> Self {
+        let completed_at = Instant::now();
         match completion.result {
             Ok(result) => Self::Finished {
                 result: Arc::new(result),
                 duration_ms: completion.duration_ms,
+                completed_at,
             },
             Err(error) => Self::Failed {
                 error,
                 duration_ms: completion.duration_ms,
+                completed_at,
+            },
+        }
+    }
+
+    fn from_join_result(
+        started: Instant,
+        result: std::result::Result<OperationCompletion, JoinError>,
+    ) -> Self {
+        match result {
+            Ok(completion) => Self::from_completion(completion),
+            Err(err) if err.is_cancelled() => Self::Canceled {
+                duration_ms: started.elapsed().as_millis() as u64,
+                completed_at: Instant::now(),
+            },
+            Err(err) => Self::Failed {
+                error: err.to_string(),
+                duration_ms: started.elapsed().as_millis() as u64,
+                completed_at: Instant::now(),
             },
         }
     }
@@ -477,7 +634,7 @@ impl OperationExecution {
 
     fn operation_state(&self) -> i32 {
         match self {
-            Self::Running { .. } => RUNNING_STATE,
+            Self::Running { .. } | Self::Refreshing { .. } => RUNNING_STATE,
             Self::Finished { .. } => FINISHED_STATE,
             Self::Failed { .. } => ERROR_STATE,
             Self::Canceled { .. } => CANCELED_STATE,
@@ -486,16 +643,18 @@ impl OperationExecution {
 
     fn duration_ms(&self) -> u64 {
         match self {
-            Self::Running { started, .. } => started.elapsed().as_millis() as u64,
+            Self::Running { started, .. } | Self::Refreshing { started } => {
+                started.elapsed().as_millis() as u64
+            }
             Self::Finished { duration_ms, .. }
             | Self::Failed { duration_ms, .. }
-            | Self::Canceled { duration_ms } => *duration_ms,
+            | Self::Canceled { duration_ms, .. } => *duration_ms,
         }
     }
 
     fn history_status(&self) -> &'static str {
         match self {
-            Self::Running { .. } => "RUNNING",
+            Self::Running { .. } | Self::Refreshing { .. } => "RUNNING",
             Self::Finished { .. } => "FINISHED",
             Self::Failed { .. } => "FAILED",
             Self::Canceled { .. } => "CANCELED",
@@ -504,11 +663,21 @@ impl OperationExecution {
 
     fn error_message(&self) -> Option<&str> {
         match self {
-            Self::Running { .. } => Some("operation is still running"),
+            Self::Running { .. } | Self::Refreshing { .. } => Some("operation is still running"),
             Self::Failed { error, .. } => Some(error),
             Self::Canceled { .. } => Some("operation was canceled"),
             Self::Finished { .. } => None,
         }
+    }
+
+    fn is_expired(&self, now: Instant, completed_operation_ttl: Duration) -> bool {
+        let completed_at = match self {
+            Self::Finished { completed_at, .. }
+            | Self::Failed { completed_at, .. }
+            | Self::Canceled { completed_at, .. } => completed_at,
+            Self::Running { .. } | Self::Refreshing { .. } => return false,
+        };
+        now.saturating_duration_since(*completed_at) >= completed_operation_ttl
     }
 }
 
@@ -796,6 +965,15 @@ fn write_open_session_response(
     })
 }
 
+fn write_open_session_error(seqid: i32, message: &str) -> Vec<u8> {
+    write_success_response("OpenSession", seqid, |writer| {
+        writer.write_field(T_STRUCT, 1, |writer| {
+            write_status(writer, ERROR_STATUS, Some(message))
+        });
+        writer.write_stop();
+    })
+}
+
 fn write_close_session_response(seqid: i32, valid: bool) -> Vec<u8> {
     write_success_response("CloseSession", seqid, |writer| {
         writer.write_field(T_STRUCT, 1, |writer| {
@@ -824,6 +1002,15 @@ fn write_execute_statement_response(seqid: i32, guid: &[u8; 16], secret: &[u8; 1
         });
         writer.write_field(T_STRUCT, 2, |writer| {
             write_operation_handle(writer, guid, secret, true);
+        });
+        writer.write_stop();
+    })
+}
+
+fn write_execute_statement_error(seqid: i32, message: &str) -> Vec<u8> {
+    write_success_response("ExecuteStatement", seqid, |writer| {
+        writer.write_field(T_STRUCT, 1, |writer| {
+            write_status(writer, ERROR_STATUS, Some(message))
         });
         writer.write_stop();
     })
@@ -1649,6 +1836,7 @@ mod tests {
             state: OperationExecution::Finished {
                 result: Arc::new(QueryResult::empty()),
                 duration_ms: 5,
+                completed_at: Instant::now(),
             },
         };
 
@@ -1656,5 +1844,38 @@ mod tests {
 
         assert_eq!(operation.state.operation_state(), FINISHED_STATE);
         assert_eq!(operation.state.history_status(), "FINISHED");
+    }
+
+    #[test]
+    fn completed_operation_expires_after_ttl() {
+        let operation = OperationState {
+            secret: [0; 16],
+            session_id: "session".to_string(),
+            token_fingerprint: [0; 32],
+            state: OperationExecution::Finished {
+                result: Arc::new(QueryResult::empty()),
+                duration_ms: 5,
+                completed_at: Instant::now() - Duration::from_secs(30),
+            },
+        };
+
+        assert!(operation.is_expired(Instant::now(), Duration::from_secs(10)));
+    }
+
+    #[tokio::test]
+    async fn running_operation_does_not_expire_by_completed_ttl() {
+        let task = tokio::spawn(futures::future::pending::<OperationCompletion>());
+        let operation = OperationState {
+            secret: [0; 16],
+            session_id: "session".to_string(),
+            token_fingerprint: [0; 32],
+            state: OperationExecution::Running {
+                started: Instant::now() - Duration::from_secs(30),
+                task,
+            },
+        };
+
+        assert!(!operation.is_expired(Instant::now(), Duration::from_secs(10)));
+        operation.abort();
     }
 }

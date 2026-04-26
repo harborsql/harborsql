@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 
@@ -10,9 +12,13 @@ pub struct UnityCatalogClient {
 }
 
 impl UnityCatalogClient {
-    pub fn new(host: String) -> Self {
+    pub fn new(host: String, request_timeout: Duration) -> Self {
         Self {
-            http: Client::new(),
+            http: Client::builder()
+                .timeout(request_timeout)
+                .connect_timeout(request_timeout.min(Duration::from_secs(10)))
+                .build()
+                .expect("Unity Catalog HTTP client configuration should be valid"),
             host,
         }
     }
@@ -112,10 +118,8 @@ struct DatabricksError {
 pub struct TableInfo {
     pub table_id: String,
     pub full_name: String,
-    pub table_type: Option<String>,
     pub data_source_format: Option<String>,
     pub storage_location: Option<String>,
-    pub securable_kind: Option<String>,
 }
 
 #[derive(Serialize)]

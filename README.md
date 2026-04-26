@@ -14,7 +14,7 @@ This repository is an early proof of concept. The current implementation is inte
 - Databricks SQL connector compatibility for a minimal Thrift-over-HTTP surface
 - inline result sets, without Databricks Cloud Fetch
 
-It is not production-ready. Important missing pieces include Cloud Fetch, durable or streaming result storage beyond in-memory materialized results, stronger protocol tests, broader SQL compatibility, and hardened operational controls.
+It is not production-ready. Important missing pieces include Cloud Fetch, durable or streaming result storage beyond in-memory materialized results, stronger protocol tests, broader SQL compatibility, and production-grade operational controls.
 
 ## How It Works
 
@@ -48,8 +48,16 @@ HarborSQL reads configuration from environment variables:
 | `HARBORSQL_DEFAULT_CATALOG` or `DATABRICKS_CATALOG` | no | `workspace` | Default catalog for unqualified queries |
 | `HARBORSQL_DEFAULT_SCHEMA` or `DATABRICKS_SCHEMA` | no | `default` | Default schema for unqualified queries |
 | `HARBORSQL_AWS_REGION` | no | `us-west-2` | AWS region passed to Delta object-store access |
-| `HARBORSQL_MAX_RESULT_ROWS` | no | unlimited | Optional maximum rows HarborSQL will materialize for one query |
-| `HARBORSQL_MAX_RESULT_BYTES` | no | unlimited | Optional maximum JSON result bytes HarborSQL will materialize for one query |
+| `HARBORSQL_MAX_RESULT_ROWS` | no | `100000` | Maximum rows HarborSQL will materialize for one query; set to an empty value to disable |
+| `HARBORSQL_MAX_RESULT_BYTES` | no | `67108864` | Maximum JSON result bytes HarborSQL will materialize for one query; set to an empty value to disable |
+| `HARBORSQL_UNITY_TIMEOUT_SECONDS` | no | `30` | Timeout for Unity Catalog HTTP requests |
+| `HARBORSQL_QUERY_TIMEOUT_SECONDS` | no | `300` | Timeout for each query execution |
+| `HARBORSQL_IDLE_SESSION_TIMEOUT_SECONDS` | no | `1800` | Idle timeout for Thrift sessions |
+| `HARBORSQL_COMPLETED_OPERATION_TTL_SECONDS` | no | `600` | Retention time for completed Thrift operations and their materialized results |
+| `HARBORSQL_CLEANUP_INTERVAL_SECONDS` | no | `60` | Background cleanup interval for expired sessions and operations |
+| `HARBORSQL_MAX_SESSIONS` | no | `256` | Maximum concurrent Thrift sessions |
+| `HARBORSQL_MAX_OPERATIONS` | no | `512` | Maximum retained Thrift operations |
+| `HARBORSQL_REQUEST_BODY_LIMIT_BYTES` | no | `1048576` | Maximum HTTP request body size |
 | `DATABRICKS_TOKEN` | query mode only | none | Token used by `harborsql query --sql ...` |
 
 ## Run The Server

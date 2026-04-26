@@ -3,7 +3,7 @@ use std::sync::Arc;
 use axum::{
     Json, Router,
     body::Bytes,
-    extract::{Path, State},
+    extract::{DefaultBodyLimit, Path, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -27,6 +27,7 @@ struct AppState {
 
 pub async fn serve(config: Config, engine: QueryEngine) -> Result<()> {
     let thrift = DatabricksThriftService::new(config.clone(), engine.clone());
+    let _cleanup_task = thrift.spawn_cleanup_task();
     let state = Arc::new(AppState {
         config: config.clone(),
         engine,
@@ -44,7 +45,8 @@ pub async fn serve(config: Config, engine: QueryEngine) -> Result<()> {
             get(query_history),
         )
         .route("/{*path}", post(thrift_rpc))
-        .with_state(state);
+        .with_state(state)
+        .layer(DefaultBodyLimit::max(config.request_body_limit_bytes));
 
     let listener = tokio::net::TcpListener::bind(config.bind_addr).await?;
     info!("listening on http://{}", config.bind_addr);

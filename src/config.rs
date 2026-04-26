@@ -1,6 +1,17 @@
-use std::{env, net::SocketAddr};
+use std::{env, net::SocketAddr, time::Duration};
 
 use crate::error::{HarborError, Result};
+
+pub const DEFAULT_MAX_RESULT_ROWS: usize = 100_000;
+pub const DEFAULT_MAX_RESULT_BYTES: usize = 64 * 1024 * 1024;
+pub const DEFAULT_UNITY_TIMEOUT_SECONDS: u64 = 30;
+pub const DEFAULT_QUERY_TIMEOUT_SECONDS: u64 = 300;
+pub const DEFAULT_IDLE_SESSION_TIMEOUT_SECONDS: u64 = 30 * 60;
+pub const DEFAULT_COMPLETED_OPERATION_TTL_SECONDS: u64 = 10 * 60;
+pub const DEFAULT_CLEANUP_INTERVAL_SECONDS: u64 = 60;
+pub const DEFAULT_MAX_SESSIONS: usize = 256;
+pub const DEFAULT_MAX_OPERATIONS: usize = 512;
+pub const DEFAULT_REQUEST_BODY_LIMIT_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -11,6 +22,14 @@ pub struct Config {
     pub aws_region: String,
     pub max_result_rows: Option<usize>,
     pub max_result_bytes: Option<usize>,
+    pub unity_request_timeout: Duration,
+    pub query_timeout: Duration,
+    pub idle_session_timeout: Duration,
+    pub completed_operation_ttl: Duration,
+    pub cleanup_interval: Duration,
+    pub max_sessions: usize,
+    pub max_operations: usize,
+    pub request_body_limit_bytes: usize,
 }
 
 impl Config {
@@ -38,20 +57,86 @@ impl Config {
                 .or_else(|_| env::var("DATABRICKS_SCHEMA"))
                 .unwrap_or_else(|_| "default".into()),
             aws_region: env::var("HARBORSQL_AWS_REGION").unwrap_or_else(|_| "us-west-2".into()),
-            max_result_rows: parse_optional_usize_env("HARBORSQL_MAX_RESULT_ROWS")?,
-            max_result_bytes: parse_optional_usize_env("HARBORSQL_MAX_RESULT_BYTES")?,
+            max_result_rows: parse_optional_usize_env(
+                "HARBORSQL_MAX_RESULT_ROWS",
+                Some(DEFAULT_MAX_RESULT_ROWS),
+            )?,
+            max_result_bytes: parse_optional_usize_env(
+                "HARBORSQL_MAX_RESULT_BYTES",
+                Some(DEFAULT_MAX_RESULT_BYTES),
+            )?,
+            unity_request_timeout: parse_duration_seconds_env(
+                "HARBORSQL_UNITY_TIMEOUT_SECONDS",
+                DEFAULT_UNITY_TIMEOUT_SECONDS,
+            )?,
+            query_timeout: parse_duration_seconds_env(
+                "HARBORSQL_QUERY_TIMEOUT_SECONDS",
+                DEFAULT_QUERY_TIMEOUT_SECONDS,
+            )?,
+            idle_session_timeout: parse_duration_seconds_env(
+                "HARBORSQL_IDLE_SESSION_TIMEOUT_SECONDS",
+                DEFAULT_IDLE_SESSION_TIMEOUT_SECONDS,
+            )?,
+            completed_operation_ttl: parse_duration_seconds_env(
+                "HARBORSQL_COMPLETED_OPERATION_TTL_SECONDS",
+                DEFAULT_COMPLETED_OPERATION_TTL_SECONDS,
+            )?,
+            cleanup_interval: parse_duration_seconds_env(
+                "HARBORSQL_CLEANUP_INTERVAL_SECONDS",
+                DEFAULT_CLEANUP_INTERVAL_SECONDS,
+            )?,
+            max_sessions: parse_usize_env("HARBORSQL_MAX_SESSIONS", DEFAULT_MAX_SESSIONS)?,
+            max_operations: parse_usize_env("HARBORSQL_MAX_OPERATIONS", DEFAULT_MAX_OPERATIONS)?,
+            request_body_limit_bytes: parse_usize_env(
+                "HARBORSQL_REQUEST_BODY_LIMIT_BYTES",
+                DEFAULT_REQUEST_BODY_LIMIT_BYTES,
+            )?,
         })
     }
 }
 
-fn parse_optional_usize_env(name: &str) -> Result<Option<usize>> {
+fn parse_optional_usize_env(name: &str, default: Option<usize>) -> Result<Option<usize>> {
     match env::var(name) {
         Ok(value) if value.trim().is_empty() => Ok(None),
         Ok(value) => value
             .parse()
             .map(Some)
             .map_err(|err| HarborError::Config(format!("invalid {name}: {err}"))),
-        Err(_) => Ok(None),
+        Err(_) => Ok(default),
+    }
+}
+
+fn parse_usize_env(name: &str, default: usize) -> Result<usize> {
+    match env::var(name) {
+        Ok(value) => {
+            let parsed = value
+                .parse()
+                .map_err(|err| HarborError::Config(format!("invalid {name}: {err}")))?;
+            if parsed == 0 {
+                return Err(HarborError::Config(format!(
+                    "{name} must be greater than zero"
+                )));
+            }
+            Ok(parsed)
+        }
+        Err(_) => Ok(default),
+    }
+}
+
+fn parse_duration_seconds_env(name: &str, default: u64) -> Result<Duration> {
+    match env::var(name) {
+        Ok(value) => {
+            let parsed = value
+                .parse()
+                .map_err(|err| HarborError::Config(format!("invalid {name}: {err}")))?;
+            if parsed == 0 {
+                return Err(HarborError::Config(format!(
+                    "{name} must be greater than zero"
+                )));
+            }
+            Ok(Duration::from_secs(parsed))
+        }
+        Err(_) => Ok(Duration::from_secs(default)),
     }
 }
 

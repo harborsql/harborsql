@@ -14,10 +14,15 @@ use deltalake::open_table_with_storage_options;
 use futures::StreamExt;
 use serde::Serialize;
 use sqlparser::{
-    ast::{ObjectName, ObjectNamePart, Query, Select, SetExpr, Statement, TableFactor},
+    ast::{
+        Expr, Function, FunctionArg, FunctionArgExpr, FunctionArgumentClause, FunctionArguments,
+        GroupByExpr, Join, JoinConstraint, JoinOperator, ObjectName, ObjectNamePart, OrderBy,
+        OrderByKind, Query, Select, SelectItem, SetExpr, Statement, TableFactor, TableWithJoins,
+    },
     dialect::GenericDialect,
     parser::Parser,
 };
+use tokio::time::timeout;
 use url::Url;
 
 use crate::{
@@ -35,12 +40,36 @@ pub struct QueryEngine {
 impl QueryEngine {
     pub fn new(config: Config) -> Self {
         Self {
-            unity: UnityCatalogClient::new(config.databricks_host.clone()),
+            unity: UnityCatalogClient::new(
+                config.databricks_host.clone(),
+                config.unity_request_timeout,
+            ),
             config,
         }
     }
 
     pub async fn execute(
+        &self,
+        bearer_token: &str,
+        sql: &str,
+        default_catalog: &str,
+        default_schema: &str,
+    ) -> Result<QueryResult> {
+        match timeout(
+            self.config.query_timeout,
+            self.execute_inner(bearer_token, sql, default_catalog, default_schema),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(HarborError::Query(format!(
+                "query exceeded HARBORSQL_QUERY_TIMEOUT_SECONDS={}",
+                self.config.query_timeout.as_secs()
+            ))),
+        }
+    }
+
+    async fn execute_inner(
         &self,
         bearer_token: &str,
         sql: &str,
@@ -124,32 +153,32 @@ impl QueryEngine {
         while let Some(batch) = stream.next().await {
             let batch = batch?;
             row_count += batch.num_rows();
-            if let Some(max_rows) = self.config.max_result_rows {
-                if row_count > max_rows {
-                    return Err(HarborError::Query(format!(
-                        "query returned more than HARBORSQL_MAX_RESULT_ROWS={max_rows}",
-                    )));
-                }
+            if let Some(max_rows) = self.config.max_result_rows
+                && row_count > max_rows
+            {
+                return Err(HarborError::Query(format!(
+                    "query returned more than HARBORSQL_MAX_RESULT_ROWS={max_rows}",
+                )));
             }
 
             writer.write(&batch)?;
-            if let Some(max_bytes) = self.config.max_result_bytes {
-                if writer.get_ref().len() > max_bytes {
-                    return Err(HarborError::Query(format!(
-                        "query result JSON exceeded HARBORSQL_MAX_RESULT_BYTES={max_bytes}",
-                    )));
-                }
+            if let Some(max_bytes) = self.config.max_result_bytes
+                && writer.get_ref().len() > max_bytes
+            {
+                return Err(HarborError::Query(format!(
+                    "query result JSON exceeded HARBORSQL_MAX_RESULT_BYTES={max_bytes}",
+                )));
             }
         }
         writer.finish()?;
         let buffer = writer.into_inner();
-        if let Some(max_bytes) = self.config.max_result_bytes {
-            if buffer.len() > max_bytes {
-                return Err(HarborError::Query(format!(
-                    "query result JSON is {} bytes, exceeding HARBORSQL_MAX_RESULT_BYTES={max_bytes}",
-                    buffer.len(),
-                )));
-            }
+        if let Some(max_bytes) = self.config.max_result_bytes
+            && buffer.len() > max_bytes
+        {
+            return Err(HarborError::Query(format!(
+                "query result JSON is {} bytes, exceeding HARBORSQL_MAX_RESULT_BYTES={max_bytes}",
+                buffer.len(),
+            )));
         }
         let rows = serde_json::from_slice(&buffer)?;
 
@@ -172,12 +201,8 @@ fn ensure_delta_table(table: &crate::unity::TableInfo) -> Result<()> {
     }
 
     Err(HarborError::UnsupportedSql(format!(
-        "table {} is not an externally readable Delta table (type={:?}, kind={:?}, format={:?}, storage={:?})",
-        table.full_name,
-        table.table_type,
-        table.securable_kind,
-        table.data_source_format,
-        table.storage_location
+        "table {} is not an externally readable Delta table",
+        table.full_name
     )))
 }
 
@@ -238,7 +263,13 @@ fn extract_table_refs(
     let mut refs = BTreeSet::new();
     match statements.first() {
         Some(Statement::Query(query)) => {
-            collect_query_table_refs(query, default_catalog, default_schema, &mut refs)?;
+            collect_query_table_refs(
+                query,
+                default_catalog,
+                default_schema,
+                &mut refs,
+                &BTreeSet::new(),
+            )?;
         }
         _ => {
             return Err(HarborError::UnsupportedSql(
@@ -255,11 +286,18 @@ fn collect_query_table_refs(
     default_catalog: &str,
     default_schema: &str,
     refs: &mut BTreeSet<ResolvedTableRef>,
+    outer_cte_names: &BTreeSet<String>,
 ) -> Result<()> {
-    let mut cte_names = BTreeSet::new();
+    let mut cte_names = outer_cte_names.clone();
     if let Some(with) = &query.with {
         for cte in &with.cte_tables {
-            collect_query_table_refs(&cte.query, default_catalog, default_schema, refs)?;
+            collect_query_table_refs(
+                &cte.query,
+                default_catalog,
+                default_schema,
+                refs,
+                &cte_names,
+            )?;
             cte_names.insert(cte.alias.name.value.to_ascii_lowercase());
         }
     }
@@ -269,7 +307,11 @@ fn collect_query_table_refs(
         default_schema,
         refs,
         &cte_names,
-    )
+    )?;
+    if let Some(order_by) = &query.order_by {
+        collect_order_by_refs(order_by, default_catalog, default_schema, refs, &cte_names)?;
+    }
+    Ok(())
 }
 
 fn collect_set_expr_table_refs(
@@ -284,7 +326,7 @@ fn collect_set_expr_table_refs(
             collect_select_table_refs(select, default_catalog, default_schema, refs, cte_names)
         }
         SetExpr::Query(query) => {
-            collect_query_table_refs(query, default_catalog, default_schema, refs)
+            collect_query_table_refs(query, default_catalog, default_schema, refs, cte_names)
         }
         SetExpr::SetOperation { left, right, .. } => {
             collect_set_expr_table_refs(left, default_catalog, default_schema, refs, cte_names)?;
@@ -300,6 +342,9 @@ fn collect_set_expr_table_refs(
             } else {
                 vec![table_name.to_string()]
             };
+            if parts.len() == 1 && cte_names.contains(&parts[0].to_ascii_lowercase()) {
+                return Ok(());
+            }
             refs.insert(resolve_parts_ref(&parts, default_catalog, default_schema)?);
             Ok(())
         }
@@ -317,17 +362,189 @@ fn collect_select_table_refs(
     refs: &mut BTreeSet<ResolvedTableRef>,
     cte_names: &BTreeSet<String>,
 ) -> Result<()> {
+    for item in &select.projection {
+        collect_select_item_refs(item, default_catalog, default_schema, refs, cte_names)?;
+    }
     for table_with_joins in &select.from {
-        collect_table_factor_refs(
-            &table_with_joins.relation,
+        collect_table_with_joins_refs(
+            table_with_joins,
             default_catalog,
             default_schema,
             refs,
             cte_names,
         )?;
-        for join in &table_with_joins.joins {
-            collect_table_factor_refs(
-                &join.relation,
+    }
+    if let Some(prewhere) = &select.prewhere {
+        collect_expr_table_refs(prewhere, default_catalog, default_schema, refs, cte_names)?;
+    }
+    if let Some(selection) = &select.selection {
+        collect_expr_table_refs(selection, default_catalog, default_schema, refs, cte_names)?;
+    }
+    if let GroupByExpr::Expressions(expressions, _) = &select.group_by {
+        for expression in expressions {
+            collect_expr_table_refs(expression, default_catalog, default_schema, refs, cte_names)?;
+        }
+    }
+    for expression in &select.cluster_by {
+        collect_expr_table_refs(expression, default_catalog, default_schema, refs, cte_names)?;
+    }
+    for expression in &select.distribute_by {
+        collect_expr_table_refs(expression, default_catalog, default_schema, refs, cte_names)?;
+    }
+    for order_by in &select.sort_by {
+        collect_expr_table_refs(
+            &order_by.expr,
+            default_catalog,
+            default_schema,
+            refs,
+            cte_names,
+        )?;
+    }
+    if let Some(having) = &select.having {
+        collect_expr_table_refs(having, default_catalog, default_schema, refs, cte_names)?;
+    }
+    if let Some(qualify) = &select.qualify {
+        collect_expr_table_refs(qualify, default_catalog, default_schema, refs, cte_names)?;
+    }
+    Ok(())
+}
+
+fn collect_select_item_refs(
+    item: &SelectItem,
+    default_catalog: &str,
+    default_schema: &str,
+    refs: &mut BTreeSet<ResolvedTableRef>,
+    cte_names: &BTreeSet<String>,
+) -> Result<()> {
+    match item {
+        SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+            collect_expr_table_refs(expr, default_catalog, default_schema, refs, cte_names)
+        }
+        SelectItem::QualifiedWildcard(_, _) | SelectItem::Wildcard(_) => Ok(()),
+    }
+}
+
+fn collect_table_with_joins_refs(
+    table_with_joins: &TableWithJoins,
+    default_catalog: &str,
+    default_schema: &str,
+    refs: &mut BTreeSet<ResolvedTableRef>,
+    cte_names: &BTreeSet<String>,
+) -> Result<()> {
+    collect_table_factor_refs(
+        &table_with_joins.relation,
+        default_catalog,
+        default_schema,
+        refs,
+        cte_names,
+    )?;
+    for join in &table_with_joins.joins {
+        collect_join_refs(join, default_catalog, default_schema, refs, cte_names)?;
+    }
+    Ok(())
+}
+
+fn collect_join_refs(
+    join: &Join,
+    default_catalog: &str,
+    default_schema: &str,
+    refs: &mut BTreeSet<ResolvedTableRef>,
+    cte_names: &BTreeSet<String>,
+) -> Result<()> {
+    collect_table_factor_refs(
+        &join.relation,
+        default_catalog,
+        default_schema,
+        refs,
+        cte_names,
+    )?;
+    collect_join_operator_refs(
+        &join.join_operator,
+        default_catalog,
+        default_schema,
+        refs,
+        cte_names,
+    )
+}
+
+fn collect_join_operator_refs(
+    join_operator: &JoinOperator,
+    default_catalog: &str,
+    default_schema: &str,
+    refs: &mut BTreeSet<ResolvedTableRef>,
+    cte_names: &BTreeSet<String>,
+) -> Result<()> {
+    match join_operator {
+        JoinOperator::Join(constraint)
+        | JoinOperator::Inner(constraint)
+        | JoinOperator::Left(constraint)
+        | JoinOperator::LeftOuter(constraint)
+        | JoinOperator::Right(constraint)
+        | JoinOperator::RightOuter(constraint)
+        | JoinOperator::FullOuter(constraint)
+        | JoinOperator::CrossJoin(constraint)
+        | JoinOperator::Semi(constraint)
+        | JoinOperator::LeftSemi(constraint)
+        | JoinOperator::RightSemi(constraint)
+        | JoinOperator::Anti(constraint)
+        | JoinOperator::LeftAnti(constraint)
+        | JoinOperator::RightAnti(constraint)
+        | JoinOperator::StraightJoin(constraint) => collect_join_constraint_refs(
+            constraint,
+            default_catalog,
+            default_schema,
+            refs,
+            cte_names,
+        ),
+        JoinOperator::AsOf {
+            match_condition,
+            constraint,
+        } => {
+            collect_expr_table_refs(
+                match_condition,
+                default_catalog,
+                default_schema,
+                refs,
+                cte_names,
+            )?;
+            collect_join_constraint_refs(
+                constraint,
+                default_catalog,
+                default_schema,
+                refs,
+                cte_names,
+            )
+        }
+        JoinOperator::CrossApply | JoinOperator::OuterApply => Ok(()),
+    }
+}
+
+fn collect_join_constraint_refs(
+    constraint: &JoinConstraint,
+    default_catalog: &str,
+    default_schema: &str,
+    refs: &mut BTreeSet<ResolvedTableRef>,
+    cte_names: &BTreeSet<String>,
+) -> Result<()> {
+    match constraint {
+        JoinConstraint::On(expr) => {
+            collect_expr_table_refs(expr, default_catalog, default_schema, refs, cte_names)
+        }
+        JoinConstraint::Using(_) | JoinConstraint::Natural | JoinConstraint::None => Ok(()),
+    }
+}
+
+fn collect_order_by_refs(
+    order_by: &OrderBy,
+    default_catalog: &str,
+    default_schema: &str,
+    refs: &mut BTreeSet<ResolvedTableRef>,
+    cte_names: &BTreeSet<String>,
+) -> Result<()> {
+    if let OrderByKind::Expressions(expressions) = &order_by.kind {
+        for expression in expressions {
+            collect_expr_table_refs(
+                &expression.expr,
                 default_catalog,
                 default_schema,
                 refs,
@@ -336,6 +553,449 @@ fn collect_select_table_refs(
         }
     }
     Ok(())
+}
+
+fn collect_expr_table_refs(
+    expr: &Expr,
+    default_catalog: &str,
+    default_schema: &str,
+    refs: &mut BTreeSet<ResolvedTableRef>,
+    cte_names: &BTreeSet<String>,
+) -> Result<()> {
+    match expr {
+        Expr::Subquery(query)
+        | Expr::Exists {
+            subquery: query, ..
+        } => collect_query_table_refs(query, default_catalog, default_schema, refs, cte_names),
+        Expr::InSubquery { expr, subquery, .. } => {
+            collect_expr_table_refs(expr, default_catalog, default_schema, refs, cte_names)?;
+            collect_query_table_refs(subquery, default_catalog, default_schema, refs, cte_names)
+        }
+        Expr::InList { expr, list, .. } => {
+            collect_expr_table_refs(expr, default_catalog, default_schema, refs, cte_names)?;
+            collect_exprs_table_refs(list, default_catalog, default_schema, refs, cte_names)
+        }
+        Expr::InUnnest {
+            expr, array_expr, ..
+        } => {
+            collect_expr_table_refs(expr, default_catalog, default_schema, refs, cte_names)?;
+            collect_expr_table_refs(array_expr, default_catalog, default_schema, refs, cte_names)
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            collect_expr_table_refs(expr, default_catalog, default_schema, refs, cte_names)?;
+            collect_expr_table_refs(low, default_catalog, default_schema, refs, cte_names)?;
+            collect_expr_table_refs(high, default_catalog, default_schema, refs, cte_names)
+        }
+        Expr::BinaryOp { left, right, .. }
+        | Expr::IsDistinctFrom(left, right)
+        | Expr::IsNotDistinctFrom(left, right) => {
+            collect_expr_table_refs(left, default_catalog, default_schema, refs, cte_names)?;
+            collect_expr_table_refs(right, default_catalog, default_schema, refs, cte_names)
+        }
+        Expr::AnyOp { left, right, .. } | Expr::AllOp { left, right, .. } => {
+            collect_expr_table_refs(left, default_catalog, default_schema, refs, cte_names)?;
+            collect_expr_table_refs(right, default_catalog, default_schema, refs, cte_names)
+        }
+        Expr::Like { expr, pattern, .. }
+        | Expr::ILike { expr, pattern, .. }
+        | Expr::SimilarTo { expr, pattern, .. }
+        | Expr::RLike { expr, pattern, .. } => {
+            collect_expr_table_refs(expr, default_catalog, default_schema, refs, cte_names)?;
+            collect_expr_table_refs(pattern, default_catalog, default_schema, refs, cte_names)
+        }
+        Expr::UnaryOp { expr, .. }
+        | Expr::IsFalse(expr)
+        | Expr::IsNotFalse(expr)
+        | Expr::IsTrue(expr)
+        | Expr::IsNotTrue(expr)
+        | Expr::IsNull(expr)
+        | Expr::IsNotNull(expr)
+        | Expr::IsUnknown(expr)
+        | Expr::IsNotUnknown(expr)
+        | Expr::Nested(expr)
+        | Expr::OuterJoin(expr)
+        | Expr::Prior(expr) => {
+            collect_expr_table_refs(expr, default_catalog, default_schema, refs, cte_names)
+        }
+        Expr::IsNormalized { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Extract { expr, .. }
+        | Expr::Ceil { expr, .. }
+        | Expr::Floor { expr, .. }
+        | Expr::Collate { expr, .. }
+        | Expr::Named { expr, .. } => {
+            collect_expr_table_refs(expr, default_catalog, default_schema, refs, cte_names)
+        }
+        Expr::Convert { expr, styles, .. } => {
+            collect_expr_table_refs(expr, default_catalog, default_schema, refs, cte_names)?;
+            collect_exprs_table_refs(styles, default_catalog, default_schema, refs, cte_names)
+        }
+        Expr::AtTimeZone {
+            timestamp,
+            time_zone,
+        } => {
+            collect_expr_table_refs(timestamp, default_catalog, default_schema, refs, cte_names)?;
+            collect_expr_table_refs(time_zone, default_catalog, default_schema, refs, cte_names)
+        }
+        Expr::Position { expr, r#in } => {
+            collect_expr_table_refs(expr, default_catalog, default_schema, refs, cte_names)?;
+            collect_expr_table_refs(r#in, default_catalog, default_schema, refs, cte_names)
+        }
+        Expr::Substring {
+            expr,
+            substring_from,
+            substring_for,
+            ..
+        } => {
+            collect_expr_table_refs(expr, default_catalog, default_schema, refs, cte_names)?;
+            if let Some(substring_from) = substring_from {
+                collect_expr_table_refs(
+                    substring_from,
+                    default_catalog,
+                    default_schema,
+                    refs,
+                    cte_names,
+                )?;
+            }
+            if let Some(substring_for) = substring_for {
+                collect_expr_table_refs(
+                    substring_for,
+                    default_catalog,
+                    default_schema,
+                    refs,
+                    cte_names,
+                )?;
+            }
+            Ok(())
+        }
+        Expr::Trim {
+            expr,
+            trim_what,
+            trim_characters,
+            ..
+        } => {
+            collect_expr_table_refs(expr, default_catalog, default_schema, refs, cte_names)?;
+            if let Some(trim_what) = trim_what {
+                collect_expr_table_refs(
+                    trim_what,
+                    default_catalog,
+                    default_schema,
+                    refs,
+                    cte_names,
+                )?;
+            }
+            if let Some(trim_characters) = trim_characters {
+                collect_exprs_table_refs(
+                    trim_characters,
+                    default_catalog,
+                    default_schema,
+                    refs,
+                    cte_names,
+                )?;
+            }
+            Ok(())
+        }
+        Expr::Overlay {
+            expr,
+            overlay_what,
+            overlay_from,
+            overlay_for,
+        } => {
+            collect_expr_table_refs(expr, default_catalog, default_schema, refs, cte_names)?;
+            collect_expr_table_refs(
+                overlay_what,
+                default_catalog,
+                default_schema,
+                refs,
+                cte_names,
+            )?;
+            collect_expr_table_refs(
+                overlay_from,
+                default_catalog,
+                default_schema,
+                refs,
+                cte_names,
+            )?;
+            if let Some(overlay_for) = overlay_for {
+                collect_expr_table_refs(
+                    overlay_for,
+                    default_catalog,
+                    default_schema,
+                    refs,
+                    cte_names,
+                )?;
+            }
+            Ok(())
+        }
+        Expr::CompoundFieldAccess { root, .. } => {
+            collect_expr_table_refs(root, default_catalog, default_schema, refs, cte_names)
+        }
+        Expr::JsonAccess { value, .. } | Expr::Prefixed { value, .. } => {
+            collect_expr_table_refs(value, default_catalog, default_schema, refs, cte_names)
+        }
+        Expr::Function(function) => {
+            collect_function_table_refs(function, default_catalog, default_schema, refs, cte_names)
+        }
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            if let Some(operand) = operand {
+                collect_expr_table_refs(operand, default_catalog, default_schema, refs, cte_names)?;
+            }
+            for condition in conditions {
+                collect_expr_table_refs(
+                    &condition.condition,
+                    default_catalog,
+                    default_schema,
+                    refs,
+                    cte_names,
+                )?;
+                collect_expr_table_refs(
+                    &condition.result,
+                    default_catalog,
+                    default_schema,
+                    refs,
+                    cte_names,
+                )?;
+            }
+            if let Some(else_result) = else_result {
+                collect_expr_table_refs(
+                    else_result,
+                    default_catalog,
+                    default_schema,
+                    refs,
+                    cte_names,
+                )?;
+            }
+            Ok(())
+        }
+        Expr::Tuple(expressions) => collect_exprs_table_refs(
+            expressions,
+            default_catalog,
+            default_schema,
+            refs,
+            cte_names,
+        ),
+        Expr::GroupingSets(groups) | Expr::Cube(groups) | Expr::Rollup(groups) => {
+            for group in groups {
+                collect_exprs_table_refs(group, default_catalog, default_schema, refs, cte_names)?;
+            }
+            Ok(())
+        }
+        Expr::Struct { values, .. } => {
+            collect_exprs_table_refs(values, default_catalog, default_schema, refs, cte_names)
+        }
+        Expr::Dictionary(fields) => {
+            for field in fields {
+                collect_expr_table_refs(
+                    &field.value,
+                    default_catalog,
+                    default_schema,
+                    refs,
+                    cte_names,
+                )?;
+            }
+            Ok(())
+        }
+        Expr::Map(map) => {
+            for entry in &map.entries {
+                collect_expr_table_refs(
+                    &entry.key,
+                    default_catalog,
+                    default_schema,
+                    refs,
+                    cte_names,
+                )?;
+                collect_expr_table_refs(
+                    &entry.value,
+                    default_catalog,
+                    default_schema,
+                    refs,
+                    cte_names,
+                )?;
+            }
+            Ok(())
+        }
+        Expr::Array(array) => collect_exprs_table_refs(
+            &array.elem,
+            default_catalog,
+            default_schema,
+            refs,
+            cte_names,
+        ),
+        Expr::Interval(interval) => collect_expr_table_refs(
+            &interval.value,
+            default_catalog,
+            default_schema,
+            refs,
+            cte_names,
+        ),
+        _ => Ok(()),
+    }
+}
+
+fn collect_exprs_table_refs(
+    expressions: &[Expr],
+    default_catalog: &str,
+    default_schema: &str,
+    refs: &mut BTreeSet<ResolvedTableRef>,
+    cte_names: &BTreeSet<String>,
+) -> Result<()> {
+    for expression in expressions {
+        collect_expr_table_refs(expression, default_catalog, default_schema, refs, cte_names)?;
+    }
+    Ok(())
+}
+
+fn collect_function_table_refs(
+    function: &Function,
+    default_catalog: &str,
+    default_schema: &str,
+    refs: &mut BTreeSet<ResolvedTableRef>,
+    cte_names: &BTreeSet<String>,
+) -> Result<()> {
+    collect_function_arguments_table_refs(
+        &function.parameters,
+        default_catalog,
+        default_schema,
+        refs,
+        cte_names,
+    )?;
+    collect_function_arguments_table_refs(
+        &function.args,
+        default_catalog,
+        default_schema,
+        refs,
+        cte_names,
+    )?;
+    if let Some(filter) = &function.filter {
+        collect_expr_table_refs(filter, default_catalog, default_schema, refs, cte_names)?;
+    }
+    for order_by in &function.within_group {
+        collect_expr_table_refs(
+            &order_by.expr,
+            default_catalog,
+            default_schema,
+            refs,
+            cte_names,
+        )?;
+    }
+    Ok(())
+}
+
+fn collect_function_arguments_table_refs(
+    arguments: &FunctionArguments,
+    default_catalog: &str,
+    default_schema: &str,
+    refs: &mut BTreeSet<ResolvedTableRef>,
+    cte_names: &BTreeSet<String>,
+) -> Result<()> {
+    match arguments {
+        FunctionArguments::None => Ok(()),
+        FunctionArguments::Subquery(query) => {
+            collect_query_table_refs(query, default_catalog, default_schema, refs, cte_names)
+        }
+        FunctionArguments::List(arguments) => {
+            for argument in &arguments.args {
+                collect_function_arg_table_refs(
+                    argument,
+                    default_catalog,
+                    default_schema,
+                    refs,
+                    cte_names,
+                )?;
+            }
+            for clause in &arguments.clauses {
+                match clause {
+                    FunctionArgumentClause::OrderBy(order_by) => {
+                        for expression in order_by {
+                            collect_expr_table_refs(
+                                &expression.expr,
+                                default_catalog,
+                                default_schema,
+                                refs,
+                                cte_names,
+                            )?;
+                        }
+                    }
+                    FunctionArgumentClause::Limit(expr) => {
+                        collect_expr_table_refs(
+                            expr,
+                            default_catalog,
+                            default_schema,
+                            refs,
+                            cte_names,
+                        )?;
+                    }
+                    FunctionArgumentClause::Having(bound) => {
+                        collect_expr_table_refs(
+                            &bound.1,
+                            default_catalog,
+                            default_schema,
+                            refs,
+                            cte_names,
+                        )?;
+                    }
+                    FunctionArgumentClause::IgnoreOrRespectNulls(_)
+                    | FunctionArgumentClause::OnOverflow(_)
+                    | FunctionArgumentClause::Separator(_)
+                    | FunctionArgumentClause::JsonNullClause(_)
+                    | FunctionArgumentClause::JsonReturningClause(_) => {}
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+fn collect_function_arg_table_refs(
+    argument: &FunctionArg,
+    default_catalog: &str,
+    default_schema: &str,
+    refs: &mut BTreeSet<ResolvedTableRef>,
+    cte_names: &BTreeSet<String>,
+) -> Result<()> {
+    match argument {
+        FunctionArg::Named { arg, .. } | FunctionArg::Unnamed(arg) => {
+            collect_function_arg_expr_table_refs(
+                arg,
+                default_catalog,
+                default_schema,
+                refs,
+                cte_names,
+            )
+        }
+        FunctionArg::ExprNamed { name, arg, .. } => {
+            collect_expr_table_refs(name, default_catalog, default_schema, refs, cte_names)?;
+            collect_function_arg_expr_table_refs(
+                arg,
+                default_catalog,
+                default_schema,
+                refs,
+                cte_names,
+            )
+        }
+    }
+}
+
+fn collect_function_arg_expr_table_refs(
+    argument: &FunctionArgExpr,
+    default_catalog: &str,
+    default_schema: &str,
+    refs: &mut BTreeSet<ResolvedTableRef>,
+    cte_names: &BTreeSet<String>,
+) -> Result<()> {
+    match argument {
+        FunctionArgExpr::Expr(expr) => {
+            collect_expr_table_refs(expr, default_catalog, default_schema, refs, cte_names)
+        }
+        FunctionArgExpr::QualifiedWildcard(_) | FunctionArgExpr::Wildcard => Ok(()),
+    }
 }
 
 fn collect_table_factor_refs(
@@ -360,29 +1020,17 @@ fn collect_table_factor_refs(
             Ok(())
         }
         TableFactor::Derived { subquery, .. } => {
-            collect_query_table_refs(subquery, default_catalog, default_schema, refs)
+            collect_query_table_refs(subquery, default_catalog, default_schema, refs, cte_names)
         }
         TableFactor::NestedJoin {
             table_with_joins, ..
-        } => {
-            collect_table_factor_refs(
-                &table_with_joins.relation,
-                default_catalog,
-                default_schema,
-                refs,
-                cte_names,
-            )?;
-            for join in &table_with_joins.joins {
-                collect_table_factor_refs(
-                    &join.relation,
-                    default_catalog,
-                    default_schema,
-                    refs,
-                    cte_names,
-                )?;
-            }
-            Ok(())
-        }
+        } => collect_table_with_joins_refs(
+            table_with_joins,
+            default_catalog,
+            default_schema,
+            refs,
+            cte_names,
+        ),
         TableFactor::Pivot { table, .. } | TableFactor::Unpivot { table, .. } => {
             collect_table_factor_refs(table, default_catalog, default_schema, refs, cte_names)
         }
@@ -501,6 +1149,61 @@ mod tests {
         assert_eq!(
             refs,
             vec![ResolvedTableRef::new("workspace", "default", "hits")]
+        );
+    }
+
+    #[test]
+    fn finds_scalar_subquery_table_refs() {
+        let refs = extract_table_refs(
+            "SELECT id, (SELECT max(score) FROM scores) AS max_score \
+             FROM users \
+             WHERE id IN (SELECT user_id FROM purchases)",
+            "workspace",
+            "default",
+        )
+        .unwrap();
+        assert_eq!(
+            refs,
+            vec![
+                ResolvedTableRef::new("workspace", "default", "purchases"),
+                ResolvedTableRef::new("workspace", "default", "scores"),
+                ResolvedTableRef::new("workspace", "default", "users"),
+            ]
+        );
+    }
+
+    #[test]
+    fn keeps_outer_ctes_visible_inside_derived_queries() {
+        let refs = extract_table_refs(
+            "WITH recent AS (SELECT * FROM analytics.events) \
+             SELECT * FROM (SELECT * FROM recent) r \
+             JOIN users u ON r.user_id = u.id",
+            "workspace",
+            "default",
+        )
+        .unwrap();
+        assert_eq!(
+            refs,
+            vec![
+                ResolvedTableRef::new("workspace", "analytics", "events"),
+                ResolvedTableRef::new("workspace", "default", "users"),
+            ]
+        );
+    }
+
+    #[test]
+    fn ctes_can_reference_previous_ctes() {
+        let refs = extract_table_refs(
+            "WITH base AS (SELECT * FROM analytics.events), \
+             filtered AS (SELECT * FROM base) \
+             SELECT * FROM filtered",
+            "workspace",
+            "default",
+        )
+        .unwrap();
+        assert_eq!(
+            refs,
+            vec![ResolvedTableRef::new("workspace", "analytics", "events")]
         );
     }
 }
