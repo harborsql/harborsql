@@ -12,6 +12,7 @@ fn python_databricks_sql_connector_can_execute_noop_statement() {
     let bind_addr = unused_local_addr();
     let mut server = HarborSqlServer::spawn(bind_addr);
     wait_for_healthz(bind_addr, &mut server.child);
+    let auth_mode = configured_auth_mode();
 
     let mut command = Command::new(python());
     command.arg("-c").arg(connector_smoke_script(bind_addr));
@@ -27,12 +28,12 @@ fn python_databricks_sql_connector_can_execute_noop_statement() {
     if let Some(account_id) = optional_env("DATABRICKS_ACCOUNT_ID") {
         command.env("DATABRICKS_ACCOUNT_ID", account_id);
     }
-    if let Some(token) = configured_pat_token() {
+    if auth_mode != "oauth"
+        && let Some(token) = configured_pat_token()
+    {
         command.env("DATABRICKS_TOKEN", token);
     }
-    if let Some(auth_mode) = optional_env("HARBORSQL_CONNECTOR_SMOKE_AUTH") {
-        command.env("HARBORSQL_CONNECTOR_SMOKE_AUTH", auth_mode);
-    }
+    command.env("HARBORSQL_CONNECTOR_SMOKE_AUTH", auth_mode);
 
     let output = command
         .output()
@@ -141,6 +142,10 @@ fn configured_client_secret() -> Option<String> {
 
 fn configured_pat_token() -> Option<String> {
     optional_env("DATABRICKS_TOKEN").or_else(|| optional_env("TEST_CI_DATABRICKS_PAT"))
+}
+
+fn configured_auth_mode() -> String {
+    optional_env("HARBORSQL_CONNECTOR_SMOKE_AUTH").unwrap_or_else(|| "auto".to_string())
 }
 
 fn optional_env(name: &str) -> Option<String> {

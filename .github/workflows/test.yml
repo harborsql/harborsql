@@ -21,7 +21,6 @@ jobs:
       HARBORSQL_DATABRICKS_HOST: ${{ secrets.BENCH_US_DATABRICKS_HOSTNAME }}
       DATABRICKS_CLIENT_ID: ${{ secrets.TEST_CI_DATABRICKS_CLIENT_ID }}
       DATABRICKS_CLIENT_SECRET: ${{ secrets.TEST_CI_DATABRICKS_CLIENT_SECRET }}
-      DATABRICKS_TOKEN: ${{ secrets.TEST_CI_DATABRICKS_PAT }}
       TEST_CI_DATABRICKS_CLIENT_ID: ${{ secrets.TEST_CI_DATABRICKS_CLIENT_ID }}
       TEST_CI_DATABRICKS_CLIENT_SECRET: ${{ secrets.TEST_CI_DATABRICKS_CLIENT_SECRET }}
       TEST_CI_DATABRICKS_PAT: ${{ secrets.TEST_CI_DATABRICKS_PAT }}
@@ -69,4 +68,6 @@ jobs:
         run: cargo test --locked --test databricks_connector_smoke -- --ignored
         env:
           HARBORSQL_CONNECTOR_SMOKE_AUTH: oauth
+          DATABRICKS_TOKEN: ""
+          TEST_CI_DATABRICKS_PAT: ""
           HARBORSQL_CONNECTOR_SMOKE_PYTHON: python
