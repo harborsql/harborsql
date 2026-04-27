@@ -12,6 +12,7 @@ pub const DEFAULT_CLEANUP_INTERVAL_SECONDS: u64 = 60;
 pub const DEFAULT_MAX_SESSIONS: usize = 256;
 pub const DEFAULT_MAX_OPERATIONS: usize = 512;
 pub const DEFAULT_REQUEST_BODY_LIMIT_BYTES: usize = 1024 * 1024;
+pub const DEFAULT_PARQUET_PUSHDOWN_FILTERS: bool = true;
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -30,6 +31,8 @@ pub struct Config {
     pub max_sessions: usize,
     pub max_operations: usize,
     pub request_body_limit_bytes: usize,
+    pub parquet_pushdown_filters: bool,
+    pub parquet_reorder_filters: bool,
 }
 
 impl Config {
@@ -46,6 +49,14 @@ impl Config {
                     "HARBORSQL_DATABRICKS_HOST or DATABRICKS_HOST is required".into(),
                 )
             })?;
+        let parquet_pushdown_filters = parse_bool_env(
+            "HARBORSQL_PARQUET_PUSHDOWN_FILTERS",
+            DEFAULT_PARQUET_PUSHDOWN_FILTERS,
+        )?;
+        let parquet_reorder_filters = parse_bool_env(
+            "HARBORSQL_PARQUET_REORDER_FILTERS",
+            parquet_pushdown_filters,
+        )?;
 
         Ok(Self {
             bind_addr,
@@ -91,6 +102,8 @@ impl Config {
                 "HARBORSQL_REQUEST_BODY_LIMIT_BYTES",
                 DEFAULT_REQUEST_BODY_LIMIT_BYTES,
             )?,
+            parquet_pushdown_filters,
+            parquet_reorder_filters,
         })
     }
 }
@@ -140,6 +153,23 @@ fn parse_duration_seconds_env(name: &str, default: u64) -> Result<Duration> {
     }
 }
 
+fn parse_bool_env(name: &str, default: bool) -> Result<bool> {
+    match env::var(name) {
+        Ok(value) => parse_bool_value(name, &value),
+        Err(_) => Ok(default),
+    }
+}
+
+fn parse_bool_value(name: &str, value: &str) -> Result<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => Err(HarborError::Config(format!(
+            "invalid {name}: expected true/false"
+        ))),
+    }
+}
+
 fn normalize_host(host: &str) -> Result<String> {
     let trimmed = host.trim().trim_end_matches('/');
     if trimmed.is_empty() {
@@ -151,5 +181,21 @@ fn normalize_host(host: &str) -> Result<String> {
         Ok(trimmed.to_string())
     } else {
         Ok(format!("https://{trimmed}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_bool_values() {
+        for value in ["1", "true", "yes", "on", "TRUE", " Yes "] {
+            assert!(parse_bool_value("HARBORSQL_TEST_BOOL", value).unwrap());
+        }
+
+        for value in ["0", "false", "no", "off", "FALSE", " Off "] {
+            assert!(!parse_bool_value("HARBORSQL_TEST_BOOL", value).unwrap());
+        }
     }
 }
