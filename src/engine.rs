@@ -1,17 +1,24 @@
 use std::{
     collections::{BTreeSet, HashMap},
+    fmt,
     sync::Arc,
 };
 
 use arrow_json::ArrayWriter;
+use async_trait::async_trait;
 use datafusion::{
     catalog::{
         CatalogProvider, MemoryCatalogProvider, SchemaProvider, memory::MemorySchemaProvider,
     },
     prelude::{SessionConfig, SessionContext},
 };
-use deltalake::open_table_with_storage_options;
-use futures::StreamExt;
+use deltalake::{logstore::LogStore, open_table_with_storage_options};
+use futures::{StreamExt, stream::BoxStream};
+use object_store::{
+    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+    ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    Result as ObjectStoreResult, path::Path as ObjectPath,
+};
 use serde::Serialize;
 use sqlparser::{
     ast::{
@@ -103,6 +110,7 @@ impl QueryEngine {
 
         let mut catalogs: HashMap<String, Arc<MemoryCatalogProvider>> = HashMap::new();
         let mut schemas: HashMap<(String, String), Arc<MemorySchemaProvider>> = HashMap::new();
+        let mut object_store_routes: HashMap<String, (Url, Vec<ObjectStoreRoute>)> = HashMap::new();
 
         for table_ref in refs {
             let full_name = table_ref.full_name();
@@ -119,6 +127,15 @@ impl QueryEngine {
                 storage_options(&credentials, &self.config.aws_region),
             )
             .await?;
+            let (object_store_url, object_prefix) = table_object_store_route(&credentials.url)?;
+            object_store_routes
+                .entry(object_store_url.to_string())
+                .or_insert_with(|| (object_store_url.clone(), Vec::new()))
+                .1
+                .push(ObjectStoreRoute {
+                    prefix: object_prefix,
+                    store: delta.log_store().root_object_store(None),
+                });
             let provider = delta.table_provider().await?;
 
             let catalog = catalogs
@@ -145,6 +162,13 @@ impl QueryEngine {
             schema
                 .register_table(table_ref.table.clone(), provider)
                 .map_err(HarborError::DataFusion)?;
+        }
+
+        for (_, (object_store_url, routes)) in object_store_routes {
+            ctx.register_object_store(
+                &object_store_url,
+                Arc::new(PrefixRoutingObjectStore::new(routes)),
+            );
         }
 
         let execution_sql = rewrite_sql_fast_paths(sql)?;
@@ -238,6 +262,248 @@ fn storage_options(
         ),
         ("AWS_REGION".to_string(), aws_region.to_string()),
     ])
+}
+
+#[derive(Clone)]
+struct ObjectStoreRoute {
+    prefix: String,
+    store: Arc<dyn ObjectStore>,
+}
+
+impl fmt::Debug for ObjectStoreRoute {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ObjectStoreRoute")
+            .field("prefix", &self.prefix)
+            .finish_non_exhaustive()
+    }
+}
+
+struct PrefixRoutingObjectStore {
+    routes: Vec<ObjectStoreRoute>,
+}
+
+impl PrefixRoutingObjectStore {
+    fn new(mut routes: Vec<ObjectStoreRoute>) -> Self {
+        routes.sort_by(|left, right| right.prefix.len().cmp(&left.prefix.len()));
+        Self { routes }
+    }
+
+    fn store_for_location(&self, location: &ObjectPath) -> ObjectStoreResult<Arc<dyn ObjectStore>> {
+        route_store_for_location(&self.routes, location)
+    }
+
+    fn store_for_prefix(
+        &self,
+        prefix: Option<&ObjectPath>,
+    ) -> ObjectStoreResult<Arc<dyn ObjectStore>> {
+        let Some(prefix) = prefix else {
+            return self.first_store("root list");
+        };
+
+        if let Ok(store) = self.store_for_location(prefix) {
+            return Ok(store);
+        }
+
+        let prefix = prefix.as_ref();
+        self.routes
+            .iter()
+            .find(|route| path_has_prefix(&route.prefix, prefix))
+            .map(|route| route.store.clone())
+            .ok_or_else(|| no_route_error(prefix))
+    }
+
+    fn first_store(&self, operation: &'static str) -> ObjectStoreResult<Arc<dyn ObjectStore>> {
+        self.routes
+            .first()
+            .map(|route| route.store.clone())
+            .ok_or_else(|| object_store::Error::Generic {
+                store: "prefix-routing",
+                source: Box::new(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("no object stores registered for {operation}"),
+                )),
+            })
+    }
+}
+
+impl fmt::Debug for PrefixRoutingObjectStore {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PrefixRoutingObjectStore")
+            .field(
+                "prefixes",
+                &self
+                    .routes
+                    .iter()
+                    .map(|route| route.prefix.as_str())
+                    .collect::<Vec<_>>(),
+            )
+            .finish()
+    }
+}
+
+impl fmt::Display for PrefixRoutingObjectStore {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "PrefixRoutingObjectStore({} route(s))",
+            self.routes.len()
+        )
+    }
+}
+
+#[async_trait]
+impl ObjectStore for PrefixRoutingObjectStore {
+    async fn put_opts(
+        &self,
+        location: &ObjectPath,
+        payload: PutPayload,
+        options: PutOptions,
+    ) -> ObjectStoreResult<PutResult> {
+        self.store_for_location(location)?
+            .put_opts(location, payload, options)
+            .await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &ObjectPath,
+        options: PutMultipartOptions,
+    ) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
+        self.store_for_location(location)?
+            .put_multipart_opts(location, options)
+            .await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &ObjectPath,
+        options: GetOptions,
+    ) -> ObjectStoreResult<GetResult> {
+        self.store_for_location(location)?
+            .get_opts(location, options)
+            .await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, ObjectStoreResult<ObjectPath>>,
+    ) -> BoxStream<'static, ObjectStoreResult<ObjectPath>> {
+        let routes = Arc::new(self.routes.clone());
+        locations
+            .map(move |location| {
+                let routes = routes.clone();
+                async move {
+                    let location = location?;
+                    let store = route_store_for_location(routes.as_slice(), &location)?;
+                    store.delete(&location).await?;
+                    Ok(location)
+                }
+            })
+            .buffered(10)
+            .boxed()
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&ObjectPath>,
+    ) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
+        match self.store_for_prefix(prefix) {
+            Ok(store) => store.list(prefix),
+            Err(error) => futures::stream::once(async move { Err(error) }).boxed(),
+        }
+    }
+
+    fn list_with_offset(
+        &self,
+        prefix: Option<&ObjectPath>,
+        offset: &ObjectPath,
+    ) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
+        match self.store_for_prefix(prefix) {
+            Ok(store) => store.list_with_offset(prefix, offset),
+            Err(error) => futures::stream::once(async move { Err(error) }).boxed(),
+        }
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&ObjectPath>,
+    ) -> ObjectStoreResult<ListResult> {
+        self.store_for_prefix(prefix)?
+            .list_with_delimiter(prefix)
+            .await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &ObjectPath,
+        to: &ObjectPath,
+        options: CopyOptions,
+    ) -> ObjectStoreResult<()> {
+        let from_store = self.store_for_location(from)?;
+        let to_store = self.store_for_location(to)?;
+        if !Arc::ptr_eq(&from_store, &to_store) {
+            return Err(object_store::Error::NotSupported {
+                source: Box::new(std::io::Error::other(
+                    "cross-prefix copy is not supported by prefix routing object store",
+                )),
+            });
+        }
+
+        from_store.copy_opts(from, to, options).await
+    }
+}
+
+fn route_store_for_location(
+    routes: &[ObjectStoreRoute],
+    location: &ObjectPath,
+) -> ObjectStoreResult<Arc<dyn ObjectStore>> {
+    let location = location.as_ref();
+    routes
+        .iter()
+        .find(|route| path_has_prefix(location, &route.prefix))
+        .map(|route| route.store.clone())
+        .ok_or_else(|| no_route_error(location))
+}
+
+fn path_has_prefix(path: &str, prefix: &str) -> bool {
+    prefix.is_empty()
+        || path == prefix
+        || path
+            .strip_prefix(prefix)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn no_route_error(location: &str) -> object_store::Error {
+    object_store::Error::PermissionDenied {
+        path: location.to_string(),
+        source: Box::new(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("no Unity table credential route matched object path {location}"),
+        )),
+    }
+}
+
+fn table_object_store_route(table_url: &str) -> Result<(Url, String)> {
+    let parsed = Url::parse(table_url)?;
+    if parsed.host_str().is_none() {
+        return Err(HarborError::Query(format!(
+            "table storage URL has no host: {table_url}"
+        )));
+    }
+
+    let prefix = ObjectPath::from_url_path(parsed.path())
+        .map_err(|err| HarborError::Query(format!("invalid table storage path: {err}")))?
+        .as_ref()
+        .to_string();
+
+    let mut object_store_url = parsed;
+    object_store_url.set_path("");
+    object_store_url.set_query(None);
+    object_store_url.set_fragment(None);
+
+    Ok((object_store_url, prefix))
 }
 
 fn validate_select_only(sql: &str) -> Result<()> {
@@ -1524,6 +1790,68 @@ mod tests {
             refs,
             vec![ResolvedTableRef::new("workspace", "default", "hits")]
         );
+    }
+
+    #[test]
+    fn derives_bucket_route_from_table_storage_url() {
+        let (object_store_url, prefix) =
+            table_object_store_route("s3://bench-bucket/ssb/sf10/tables/lineorder").unwrap();
+
+        assert_eq!(object_store_url.scheme(), "s3");
+        assert_eq!(object_store_url.host_str(), Some("bench-bucket"));
+        assert_eq!(object_store_url.path(), "");
+        assert_eq!(prefix, "ssb/sf10/tables/lineorder");
+    }
+
+    #[test]
+    fn route_prefixes_match_complete_path_segments() {
+        assert!(path_has_prefix(
+            "ssb/sf10/tables/lineorder/part-00000.parquet",
+            "ssb/sf10/tables/lineorder"
+        ));
+        assert!(!path_has_prefix(
+            "ssb/sf10/tables/lineorder_extra/part-00000.parquet",
+            "ssb/sf10/tables/lineorder"
+        ));
+    }
+
+    #[tokio::test]
+    async fn routes_same_bucket_reads_to_the_matching_table_store() {
+        use object_store::{ObjectStoreExt as _, memory::InMemory};
+
+        let date_store = Arc::new(InMemory::new());
+        let lineorder_store = Arc::new(InMemory::new());
+        let date_path = ObjectPath::from("ssb/sf10/tables/date/part-00000.parquet");
+        let lineorder_path = ObjectPath::from("ssb/sf10/tables/lineorder/part-00000.parquet");
+
+        date_store.put(&date_path, "date".into()).await.unwrap();
+        lineorder_store
+            .put(&lineorder_path, "lineorder".into())
+            .await
+            .unwrap();
+
+        let router = PrefixRoutingObjectStore::new(vec![
+            ObjectStoreRoute {
+                prefix: "ssb/sf10/tables/date".to_string(),
+                store: date_store,
+            },
+            ObjectStoreRoute {
+                prefix: "ssb/sf10/tables/lineorder".to_string(),
+                store: lineorder_store,
+            },
+        ]);
+
+        let date_bytes = router.get(&date_path).await.unwrap().bytes().await.unwrap();
+        let lineorder_bytes = router
+            .get(&lineorder_path)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+
+        assert_eq!(&date_bytes[..], b"date");
+        assert_eq!(&lineorder_bytes[..], b"lineorder");
     }
 
     #[test]

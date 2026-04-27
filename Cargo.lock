@@ -2532,10 +2532,12 @@ name = "harborsql"
 version = "0.1.0"
 dependencies = [
  "arrow-json",
+ "async-trait",
  "axum",
  "datafusion",
  "deltalake",
  "futures",
+ "object_store",
  "regex",
  "reqwest 0.13.2",
  "serde",
