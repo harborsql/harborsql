@@ -248,12 +248,11 @@ fn validate_select_only(sql: &str) -> Result<()> {
         ));
     }
 
-    if matches!(statements.first(), Some(Statement::Query(_))) {
-        Ok(())
-    } else {
-        Err(HarborError::UnsupportedSql(
+    match statements.first() {
+        Some(statement) if is_read_only_query_statement(statement) => Ok(()),
+        _ => Err(HarborError::UnsupportedSql(
             "only read-only SELECT queries are supported".into(),
-        ))
+        )),
     }
 }
 
@@ -263,14 +262,30 @@ fn rewrite_sql_fast_paths(sql: &str) -> Result<String> {
         .map_err(|err| HarborError::UnsupportedSql(err.to_string()))?;
     let mut changed = false;
 
-    if let Some(Statement::Query(query)) = statements.first_mut() {
-        changed = rewrite_query_fast_paths(query);
+    if let Some(statement) = statements.first_mut() {
+        changed = rewrite_statement_fast_paths(statement);
     }
 
     if changed {
         Ok(statements[0].to_string())
     } else {
         Ok(sql.to_string())
+    }
+}
+
+fn is_read_only_query_statement(statement: &Statement) -> bool {
+    match statement {
+        Statement::Query(_) => true,
+        Statement::Explain { statement, .. } => is_read_only_query_statement(statement),
+        _ => false,
+    }
+}
+
+fn rewrite_statement_fast_paths(statement: &mut Statement) -> bool {
+    match statement {
+        Statement::Query(query) => rewrite_query_fast_paths(query),
+        Statement::Explain { statement, .. } => rewrite_statement_fast_paths(statement),
+        _ => false,
     }
 }
 
@@ -411,9 +426,9 @@ fn extract_table_refs(
 
     let mut refs = BTreeSet::new();
     match statements.first() {
-        Some(Statement::Query(query)) => {
+        Some(statement) if is_read_only_query_statement(statement) => {
             collect_query_table_refs(
-                query,
+                statement_query(statement).expect("read-only statement has a query"),
                 default_catalog,
                 default_schema,
                 &mut refs,
@@ -428,6 +443,14 @@ fn extract_table_refs(
     }
 
     Ok(refs.into_iter().collect())
+}
+
+fn statement_query(statement: &Statement) -> Option<&Query> {
+    match statement {
+        Statement::Query(query) => Some(query),
+        Statement::Explain { statement, .. } => statement_query(statement),
+        _ => None,
+    }
 }
 
 fn collect_query_table_refs(
@@ -1357,6 +1380,22 @@ mod tests {
     }
 
     #[test]
+    fn allows_explain_analyze_select_queries() {
+        validate_select_only("EXPLAIN ANALYZE SELECT COUNT(*) FROM hits").unwrap();
+
+        let refs = extract_table_refs(
+            "EXPLAIN ANALYZE SELECT COUNT(*) FROM analytics.events",
+            "workspace",
+            "default",
+        )
+        .unwrap();
+        assert_eq!(
+            refs,
+            vec![ResolvedTableRef::new("workspace", "analytics", "events")]
+        );
+    }
+
+    #[test]
     fn rewrites_simple_contains_like_predicates() {
         let rewritten = rewrite_sql_fast_paths(
             "SELECT COUNT(*) FROM hits WHERE URL LIKE '%google%' AND URL NOT LIKE '%.google.%'",
@@ -1366,6 +1405,17 @@ mod tests {
         assert!(rewritten.contains("contains(URL, 'google')"));
         assert!(rewritten.contains("NOT contains(URL, '.google.')"));
         assert!(!rewritten.contains(" LIKE "));
+    }
+
+    #[test]
+    fn rewrites_simple_contains_like_inside_explain() {
+        let rewritten = rewrite_sql_fast_paths(
+            "EXPLAIN ANALYZE SELECT COUNT(*) FROM hits WHERE URL LIKE '%google%'",
+        )
+        .unwrap();
+
+        assert!(rewritten.contains("EXPLAIN ANALYZE SELECT"));
+        assert!(rewritten.contains("contains(URL, 'google')"));
     }
 
     #[test]
