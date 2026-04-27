@@ -29,6 +29,7 @@ use url::Url;
 use crate::{
     config::Config,
     error::{HarborError, Result},
+    udf,
     unity::{TemporaryTableCredentials, UnityCatalogClient},
 };
 
@@ -98,6 +99,7 @@ impl QueryEngine {
                 self.config.parquet_reorder_filters,
             );
         let ctx = SessionContext::new_with_config(session_config);
+        udf::register_udfs(&ctx);
 
         let mut catalogs: HashMap<String, Arc<MemoryCatalogProvider>> = HashMap::new();
         let mut schemas: HashMap<(String, String), Arc<MemorySchemaProvider>> = HashMap::new();
@@ -290,10 +292,44 @@ fn rewrite_statement_fast_paths(statement: &mut Statement) -> bool {
 }
 
 fn rewrite_query_fast_paths(query: &mut Query) -> bool {
-    match query.body.as_mut() {
+    let mut changed = false;
+    if let Some(with) = &mut query.with {
+        for cte in &mut with.cte_tables {
+            changed |= rewrite_query_fast_paths(&mut cte.query);
+        }
+    }
+    changed |= match query.body.as_mut() {
         SetExpr::Select(select) => rewrite_select_fast_paths(select),
         SetExpr::Query(query) => rewrite_query_fast_paths(query),
+        SetExpr::SetOperation { left, right, .. } => {
+            rewrite_set_expr_fast_paths(left) | rewrite_set_expr_fast_paths(right)
+        }
         _ => false,
+    };
+    if let Some(order_by) = &mut query.order_by {
+        changed |= rewrite_order_by_fast_paths(order_by);
+    }
+    changed
+}
+
+fn rewrite_set_expr_fast_paths(set_expr: &mut SetExpr) -> bool {
+    match set_expr {
+        SetExpr::Select(select) => rewrite_select_fast_paths(select),
+        SetExpr::Query(query) => rewrite_query_fast_paths(query),
+        SetExpr::SetOperation { left, right, .. } => {
+            rewrite_set_expr_fast_paths(left) | rewrite_set_expr_fast_paths(right)
+        }
+        _ => false,
+    }
+}
+
+fn rewrite_order_by_fast_paths(order_by: &mut OrderBy) -> bool {
+    if let OrderByKind::Expressions(expressions) = &mut order_by.kind {
+        expressions.iter_mut().fold(false, |changed, expression| {
+            changed | rewrite_expr_fast_paths(&mut expression.expr)
+        })
+    } else {
+        false
     }
 }
 
@@ -308,6 +344,29 @@ fn rewrite_select_fast_paths(select: &mut Select) -> bool {
     }
     if let Some(selection) = &mut select.selection {
         changed |= rewrite_expr_fast_paths(selection);
+    }
+    if let Some(prewhere) = &mut select.prewhere {
+        changed |= rewrite_expr_fast_paths(prewhere);
+    }
+    if let GroupByExpr::Expressions(expressions, _) = &mut select.group_by {
+        for expression in expressions {
+            changed |= rewrite_expr_fast_paths(expression);
+        }
+    }
+    for expression in &mut select.cluster_by {
+        changed |= rewrite_expr_fast_paths(expression);
+    }
+    for expression in &mut select.distribute_by {
+        changed |= rewrite_expr_fast_paths(expression);
+    }
+    for order_by in &mut select.sort_by {
+        changed |= rewrite_expr_fast_paths(&mut order_by.expr);
+    }
+    if let Some(having) = &mut select.having {
+        changed |= rewrite_expr_fast_paths(having);
+    }
+    if let Some(qualify) = &mut select.qualify {
+        changed |= rewrite_expr_fast_paths(qualify);
     }
     changed
 }
@@ -341,6 +400,16 @@ fn rewrite_expr_fast_paths(expr: &mut Expr) -> bool {
 
 fn rewrite_leaf_expr_fast_paths(expr: &mut Expr) -> bool {
     match expr {
+        Expr::Function(function) => {
+            if let Some((source, pattern, capture_index)) =
+                regexp_replace_capture_fast_path_args(function)
+            {
+                *expr = regexp_replace_capture_expr(source, pattern, capture_index);
+                true
+            } else {
+                rewrite_function_fast_paths(function)
+            }
+        }
         Expr::Like {
             negated,
             any: false,
@@ -356,6 +425,114 @@ fn rewrite_leaf_expr_fast_paths(expr: &mut Expr) -> bool {
         }
         _ => false,
     }
+}
+
+fn rewrite_function_fast_paths(function: &mut Function) -> bool {
+    let mut changed = false;
+    if let FunctionArguments::List(FunctionArgumentList { args, .. }) = &mut function.args {
+        for arg in args {
+            changed |= rewrite_function_arg_fast_paths(arg);
+        }
+    }
+    changed
+}
+
+fn rewrite_function_arg_fast_paths(arg: &mut FunctionArg) -> bool {
+    match arg {
+        FunctionArg::Named { arg, .. }
+        | FunctionArg::ExprNamed { arg, .. }
+        | FunctionArg::Unnamed(arg) => match arg {
+            FunctionArgExpr::Expr(expr) => rewrite_expr_fast_paths(expr),
+            FunctionArgExpr::QualifiedWildcard(_) | FunctionArgExpr::Wildcard => false,
+        },
+    }
+}
+
+fn regexp_replace_capture_fast_path_args(function: &Function) -> Option<(Expr, String, u64)> {
+    if !function_name_eq(function, "regexp_replace")
+        || function.uses_odbc_syntax
+        || !matches!(function.parameters, FunctionArguments::None)
+        || function.filter.is_some()
+        || function.null_treatment.is_some()
+        || function.over.is_some()
+        || !function.within_group.is_empty()
+    {
+        return None;
+    }
+
+    let FunctionArguments::List(FunctionArgumentList {
+        duplicate_treatment: None,
+        args,
+        clauses,
+    }) = &function.args
+    else {
+        return None;
+    };
+    if args.len() != 3 || !clauses.is_empty() {
+        return None;
+    }
+
+    let source = function_arg_expr(args.first()?)?.clone();
+    let pattern = string_literal_value(function_arg_expr(args.get(1)?)?)?.to_string();
+    let replacement = string_literal_value(function_arg_expr(args.get(2)?)?)?;
+    let capture_index = capture_replacement_index(replacement)?;
+    Some((source, pattern, capture_index))
+}
+
+fn function_name_eq(function: &Function, expected: &str) -> bool {
+    if function.name.0.len() != 1 {
+        return false;
+    }
+    match &function.name.0[0] {
+        ObjectNamePart::Identifier(ident) => ident.value.eq_ignore_ascii_case(expected),
+        _ => false,
+    }
+}
+
+fn function_arg_expr(arg: &FunctionArg) -> Option<&Expr> {
+    match arg {
+        FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => Some(expr),
+        _ => None,
+    }
+}
+
+fn capture_replacement_index(replacement: &str) -> Option<u64> {
+    let digits = replacement
+        .strip_prefix('$')
+        .or_else(|| replacement.strip_prefix('\\'))?;
+    let digits = digits
+        .strip_prefix('{')
+        .and_then(|digits| digits.strip_suffix('}'))
+        .unwrap_or(digits);
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+fn regexp_replace_capture_expr(source: Expr, pattern: String, capture_index: u64) -> Expr {
+    Expr::Function(Function {
+        name: ObjectName::from(Ident::new(udf::REGEXP_REPLACE_CAPTURE_UDF)),
+        uses_odbc_syntax: false,
+        parameters: FunctionArguments::None,
+        args: FunctionArguments::List(FunctionArgumentList {
+            duplicate_treatment: None,
+            args: vec![
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(source)),
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(
+                    Value::SingleQuotedString(pattern).into(),
+                ))),
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(
+                    Value::Number(capture_index.to_string(), false).into(),
+                ))),
+            ],
+            clauses: vec![],
+        }),
+        filter: None,
+        null_treatment: None,
+        over: None,
+        within_group: vec![],
+    })
 }
 
 fn contains_expr(haystack: Expr, needle: String, negated: bool) -> Expr {
@@ -1416,6 +1593,33 @@ mod tests {
 
         assert!(rewritten.contains("EXPLAIN ANALYZE SELECT"));
         assert!(rewritten.contains("contains(URL, 'google')"));
+    }
+
+    #[test]
+    fn rewrites_single_capture_regexp_replace() {
+        let rewritten = rewrite_sql_fast_paths(
+            "SELECT REGEXP_REPLACE(Referer, '^https?://(?:www\\.)?([^/]+)/.*$', '$1') AS k FROM hits",
+        )
+        .unwrap();
+
+        assert!(rewritten.contains("harborsql_regexp_replace_capture"));
+        assert!(!rewritten.contains("'$1'"));
+    }
+
+    #[test]
+    fn rewrites_single_capture_regexp_replace_in_group_by() {
+        let rewritten = rewrite_sql_fast_paths(
+            "SELECT COUNT(*) FROM hits GROUP BY REGEXP_REPLACE(Referer, '(.*)', '$1')",
+        )
+        .unwrap();
+
+        assert!(rewritten.contains("GROUP BY harborsql_regexp_replace_capture"));
+    }
+
+    #[test]
+    fn leaves_complex_regexp_replace_unchanged() {
+        let sql = "SELECT REGEXP_REPLACE(Referer, 'foo', 'bar') FROM hits";
+        assert_eq!(rewrite_sql_fast_paths(sql).unwrap(), sql);
     }
 
     #[test]
