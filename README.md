@@ -58,6 +58,8 @@ HarborSQL reads configuration from environment variables:
 | `HARBORSQL_MAX_SESSIONS` | no | `256` | Maximum concurrent Thrift sessions |
 | `HARBORSQL_MAX_OPERATIONS` | no | `512` | Maximum retained Thrift operations |
 | `HARBORSQL_REQUEST_BODY_LIMIT_BYTES` | no | `1048576` | Maximum HTTP request body size |
+| `HARBORSQL_PARQUET_PUSHDOWN_FILTERS` | no | `true` | Enable DataFusion Parquet filter pushdown / late materialization; useful for wide filtered scans such as ClickBench q24 |
+| `HARBORSQL_PARQUET_REORDER_FILTERS` | no | same as `HARBORSQL_PARQUET_PUSHDOWN_FILTERS` | Reorder pushed-down Parquet filters heuristically |
 | `DATABRICKS_TOKEN` | query mode only | none | Token used by `harborsql query --sql ...` |
 
 ## Run The Server
@@ -72,6 +74,13 @@ cargo run -- server
 ```
 
 The server listens on `127.0.0.1:1992` by default.
+
+Parquet late materialization is enabled by default. To disable it for comparison runs:
+
+```bash
+export HARBORSQL_PARQUET_PUSHDOWN_FILTERS=false
+cargo run -- server
+```
 
 ## Run A One-Off Query
 

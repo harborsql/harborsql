@@ -86,7 +86,15 @@ impl QueryEngine {
 
         let session_config = SessionConfig::new()
             .with_default_catalog_and_schema(default_catalog, default_schema)
-            .set_bool("datafusion.sql_parser.enable_ident_normalization", false);
+            .set_bool("datafusion.sql_parser.enable_ident_normalization", false)
+            .set_bool(
+                "datafusion.execution.parquet.pushdown_filters",
+                self.config.parquet_pushdown_filters,
+            )
+            .set_bool(
+                "datafusion.execution.parquet.reorder_filters",
+                self.config.parquet_reorder_filters,
+            );
         let ctx = SessionContext::new_with_config(session_config);
 
         let mut catalogs: HashMap<String, Arc<MemoryCatalogProvider>> = HashMap::new();
