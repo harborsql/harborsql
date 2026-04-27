@@ -3,6 +3,7 @@ mod engine;
 mod error;
 mod server;
 mod thrift;
+mod udf;
 mod unity;
 
 use std::env;
