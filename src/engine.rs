@@ -15,9 +15,10 @@ use futures::StreamExt;
 use serde::Serialize;
 use sqlparser::{
     ast::{
-        Expr, Function, FunctionArg, FunctionArgExpr, FunctionArgumentClause, FunctionArguments,
-        GroupByExpr, Join, JoinConstraint, JoinOperator, ObjectName, ObjectNamePart, OrderBy,
-        OrderByKind, Query, Select, SelectItem, SetExpr, Statement, TableFactor, TableWithJoins,
+        Expr, Function, FunctionArg, FunctionArgExpr, FunctionArgumentClause, FunctionArgumentList,
+        FunctionArguments, GroupByExpr, Ident, Join, JoinConstraint, JoinOperator, ObjectName,
+        ObjectNamePart, OrderBy, OrderByKind, Query, Select, SelectItem, SetExpr, Statement,
+        TableFactor, TableWithJoins, Value,
     },
     dialect::GenericDialect,
     parser::Parser,
@@ -28,6 +29,7 @@ use url::Url;
 use crate::{
     config::Config,
     error::{HarborError, Result},
+    udf,
     unity::{TemporaryTableCredentials, UnityCatalogClient},
 };
 
@@ -97,6 +99,7 @@ impl QueryEngine {
                 self.config.parquet_reorder_filters,
             );
         let ctx = SessionContext::new_with_config(session_config);
+        udf::register_udfs(&ctx);
 
         let mut catalogs: HashMap<String, Arc<MemoryCatalogProvider>> = HashMap::new();
         let mut schemas: HashMap<(String, String), Arc<MemorySchemaProvider>> = HashMap::new();
@@ -144,7 +147,8 @@ impl QueryEngine {
                 .map_err(HarborError::DataFusion)?;
         }
 
-        let dataframe = ctx.sql(sql).await?;
+        let execution_sql = rewrite_clickbench_regexps(sql)?;
+        let dataframe = ctx.sql(&execution_sql).await?;
         let mut stream = dataframe.execute_stream().await?;
         let schema = stream
             .schema()
@@ -252,6 +256,126 @@ fn validate_select_only(sql: &str) -> Result<()> {
         Err(HarborError::UnsupportedSql(
             "only read-only SELECT queries are supported".into(),
         ))
+    }
+}
+
+fn rewrite_clickbench_regexps(sql: &str) -> Result<String> {
+    let dialect = GenericDialect {};
+    let mut statements = Parser::parse_sql(&dialect, sql)
+        .map_err(|err| HarborError::UnsupportedSql(err.to_string()))?;
+    let mut changed = false;
+
+    if let Some(Statement::Query(query)) = statements.first_mut() {
+        changed = rewrite_query_clickbench_regexps(query);
+    }
+
+    if changed {
+        Ok(statements[0].to_string())
+    } else {
+        Ok(sql.to_string())
+    }
+}
+
+fn rewrite_query_clickbench_regexps(query: &mut Query) -> bool {
+    match query.body.as_mut() {
+        SetExpr::Select(select) => rewrite_select_clickbench_regexps(select),
+        SetExpr::Query(query) => rewrite_query_clickbench_regexps(query),
+        _ => false,
+    }
+}
+
+fn rewrite_select_clickbench_regexps(select: &mut Select) -> bool {
+    let mut changed = false;
+    for item in &mut select.projection {
+        let expr = match item {
+            SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => expr,
+            SelectItem::QualifiedWildcard(_, _) | SelectItem::Wildcard(_) => continue,
+        };
+        changed |= rewrite_expr_clickbench_regexps(expr);
+    }
+    changed
+}
+
+fn rewrite_expr_clickbench_regexps(expr: &mut Expr) -> bool {
+    let Expr::Function(function) = expr else {
+        return false;
+    };
+
+    let Some(source) = clickbench_referer_host_source(function) else {
+        return false;
+    };
+
+    *expr = Expr::Function(Function {
+        name: ObjectName::from(Ident::new(udf::EXTRACT_REFERER_HOST_UDF)),
+        uses_odbc_syntax: false,
+        parameters: FunctionArguments::None,
+        args: FunctionArguments::List(FunctionArgumentList {
+            duplicate_treatment: None,
+            args: vec![FunctionArg::Unnamed(FunctionArgExpr::Expr(source))],
+            clauses: vec![],
+        }),
+        filter: None,
+        null_treatment: None,
+        over: None,
+        within_group: vec![],
+    });
+    true
+}
+
+fn clickbench_referer_host_source(function: &Function) -> Option<Expr> {
+    if !function
+        .name
+        .to_string()
+        .eq_ignore_ascii_case("regexp_replace")
+    {
+        return None;
+    }
+    if !matches!(function.parameters, FunctionArguments::None)
+        || function.filter.is_some()
+        || function.null_treatment.is_some()
+        || function.over.is_some()
+        || !function.within_group.is_empty()
+    {
+        return None;
+    }
+
+    let FunctionArguments::List(arguments) = &function.args else {
+        return None;
+    };
+    if arguments.duplicate_treatment.is_some()
+        || !arguments.clauses.is_empty()
+        || arguments.args.len() != 3
+    {
+        return None;
+    }
+
+    let source = positional_expr_arg(&arguments.args[0])?.clone();
+    let pattern = string_literal_value(positional_expr_arg(&arguments.args[1])?)?;
+    let replacement = string_literal_value(positional_expr_arg(&arguments.args[2])?)?;
+
+    if pattern == r"^https?://(?:www\.)?([^/]+)/.*$" && replacement == "$1" {
+        Some(source)
+    } else {
+        None
+    }
+}
+
+fn positional_expr_arg(arg: &FunctionArg) -> Option<&Expr> {
+    match arg {
+        FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => Some(expr),
+        _ => None,
+    }
+}
+
+fn string_literal_value(expr: &Expr) -> Option<&str> {
+    match expr {
+        Expr::Value(value) => match &value.value {
+            Value::SingleQuotedString(value)
+            | Value::EscapedStringLiteral(value)
+            | Value::DoubleQuotedString(value) => Some(value),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -1214,5 +1338,24 @@ mod tests {
             refs,
             vec![ResolvedTableRef::new("workspace", "analytics", "events")]
         );
+    }
+
+    #[test]
+    fn rewrites_clickbench_referer_regexp_replace() {
+        let rewritten = rewrite_clickbench_regexps(
+            "SELECT REGEXP_REPLACE(Referer, '^https?://(?:www\\.)?([^/]+)/.*$', '$1') AS k \
+             FROM hits GROUP BY k",
+        )
+        .unwrap();
+
+        assert!(rewritten.contains("harborsql_extract_referer_host(Referer) AS k"));
+        assert!(!rewritten.contains("REGEXP_REPLACE"));
+    }
+
+    #[test]
+    fn leaves_other_regexp_replace_calls_unchanged() {
+        let sql = "SELECT REGEXP_REPLACE(Referer, 'x', '$1') AS k FROM hits";
+
+        assert_eq!(rewrite_clickbench_regexps(sql).unwrap(), sql);
     }
 }
