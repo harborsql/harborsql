@@ -24,12 +24,18 @@ on:
         description: Tag to use when manually publishing. Defaults to sha-<commit>.
         required: false
         type: string
+      build_macos:
+        description: Build the macOS Apple Silicon artifact for manual pre-release runs. Stable GitHub releases always build it.
+        required: true
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
   RUST_BACKTRACE: 1
 
 jobs:
@@ -43,6 +49,8 @@ jobs:
       image_tags: ${{ steps.meta.outputs.image_tags }}
       publish: ${{ steps.meta.outputs.publish }}
       publish_latest: ${{ steps.meta.outputs.publish_latest }}
+      build_macos: ${{ steps.meta.outputs.build_macos }}
+      binary_matrix: ${{ steps.meta.outputs.binary_matrix }}
     steps:
       - name: Resolve package metadata
         id: meta
@@ -54,12 +62,16 @@ jobs:
           binaries_ref="${image_ref}-binaries"
           publish="false"
           publish_latest="false"
+          build_macos="false"
 
           if [[ "${{ github.event_name }}" == "release" ]]; then
             package_tag="${GITHUB_REF_NAME}"
             publish="true"
             if [[ "${{ github.event.release.prerelease }}" != "true" ]]; then
               publish_latest="true"
+              build_macos="true"
+            elif [[ "${{ contains(github.event.release.body, '[build-macos]') }}" == "true" ]]; then
+              build_macos="true"
             fi
           else
             package_tag="${{ inputs.package_tag }}"
@@ -69,12 +81,21 @@ jobs:
             if [[ "${{ inputs.publish }}" == "true" ]]; then
               publish="true"
             fi
+            if [[ "${{ inputs.build_macos }}" == "true" ]]; then
+              build_macos="true"
+            fi
           fi
 
           if [[ ! "${package_tag}" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
             echo "::error::Package tag '${package_tag}' is not a valid Docker/OCI tag."
             exit 1
           fi
+
+          binary_matrix='{"include":[{"label":"Linux x86_64","runner":"ubuntu-22.04","target":"x86_64-unknown-linux-gnu","artifact":"harborsql-linux-x86_64","binary":"harborsql","fast_linker":"true"}'
+          if [[ "${build_macos}" == "true" ]]; then
+            binary_matrix="${binary_matrix}"',{"label":"macOS Apple Silicon","runner":"macos-15","target":"aarch64-apple-darwin","artifact":"harborsql-macos-arm64","binary":"harborsql","fast_linker":"false"}'
+          fi
+          binary_matrix="${binary_matrix}"']}'
 
           {
             echo "image_ref=${image_ref}"
@@ -88,6 +109,8 @@ jobs:
             echo "EOF"
             echo "publish=${publish}"
             echo "publish_latest=${publish_latest}"
+            echo "build_macos=${build_macos}"
+            echo "binary_matrix=${binary_matrix}"
           } >> "${GITHUB_OUTPUT}"
 
   pre-release-checks:
@@ -129,18 +152,7 @@ jobs:
     timeout-minutes: 90
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - label: Linux x86_64
-            runner: ubuntu-22.04
-            target: x86_64-unknown-linux-gnu
-            artifact: harborsql-linux-x86_64
-            binary: harborsql
-          - label: macOS Apple Silicon
-            runner: macos-15
-            target: aarch64-apple-darwin
-            artifact: harborsql-macos-arm64
-            binary: harborsql
+      matrix: ${{ fromJson(needs.prepare.outputs.binary_matrix) }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -155,8 +167,17 @@ jobs:
         with:
           key: release-${{ matrix.target }}
 
+      - name: Install fast Linux linker
+        if: matrix.fast_linker == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang mold
+
       - name: Build release binary
-        run: cargo build --release --locked --target ${{ matrix.target }}
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.fast_linker == 'true' && 'clang' || '' }}
+          RUSTFLAGS: ${{ matrix.fast_linker == 'true' && '-C link-arg=-fuse-ld=mold' || '' }}
+        run: cargo build --release --locked --bin harborsql --target ${{ matrix.target }}
 
       - name: Package binary
         shell: bash
@@ -265,28 +286,40 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          artifacts=(
+            dist/artifacts/harborsql-linux-x86_64.tar.gz:application/gzip
+            dist/artifacts/harborsql-linux-x86_64.tar.gz.sha256:text/plain
+          )
+          if [[ "${{ needs.prepare.outputs.build_macos }}" == "true" ]]; then
+            artifacts+=(
+              dist/artifacts/harborsql-macos-arm64.tar.gz:application/gzip
+              dist/artifacts/harborsql-macos-arm64.tar.gz.sha256:text/plain
+            )
+          fi
+
           oras push "${{ needs.prepare.outputs.binaries_ref }}:${{ needs.prepare.outputs.package_tag }}" \
             --artifact-type application/vnd.harborsql.binaries.v1+tar \
             --annotation "org.opencontainers.image.source=https://github.com/${{ github.repository }}" \
             --annotation "org.opencontainers.image.version=${{ needs.prepare.outputs.package_tag }}" \
-            dist/artifacts/harborsql-linux-x86_64.tar.gz:application/gzip \
-            dist/artifacts/harborsql-linux-x86_64.tar.gz.sha256:text/plain \
-            dist/artifacts/harborsql-macos-arm64.tar.gz:application/gzip \
-            dist/artifacts/harborsql-macos-arm64.tar.gz.sha256:text/plain
+            "${artifacts[@]}"
 
       - name: Push latest binary archive package
         if: needs.prepare.outputs.publish_latest == 'true'
         shell: bash
         run: |
           set -euo pipefail
+          artifacts=(
+            dist/artifacts/harborsql-linux-x86_64.tar.gz:application/gzip
+            dist/artifacts/harborsql-linux-x86_64.tar.gz.sha256:text/plain
+            dist/artifacts/harborsql-macos-arm64.tar.gz:application/gzip
+            dist/artifacts/harborsql-macos-arm64.tar.gz.sha256:text/plain
+          )
+
           oras push "${{ needs.prepare.outputs.binaries_ref }}:latest" \
             --artifact-type application/vnd.harborsql.binaries.v1+tar \
             --annotation "org.opencontainers.image.source=https://github.com/${{ github.repository }}" \
             --annotation "org.opencontainers.image.version=${{ needs.prepare.outputs.package_tag }}" \
-            dist/artifacts/harborsql-linux-x86_64.tar.gz:application/gzip \
-            dist/artifacts/harborsql-linux-x86_64.tar.gz.sha256:text/plain \
-            dist/artifacts/harborsql-macos-arm64.tar.gz:application/gzip \
-            dist/artifacts/harborsql-macos-arm64.tar.gz.sha256:text/plain
+            "${artifacts[@]}"
 
       - name: Upload binaries to GitHub release
         if: github.event_name == 'release'
