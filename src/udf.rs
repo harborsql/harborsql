@@ -3,10 +3,11 @@ use std::{any::Any, sync::Arc};
 use datafusion::{
     arrow::{
         array::{
-            Array, ArrayRef, GenericStringArray, LargeStringBuilder, StringBuilder,
-            StringViewBuilder,
+            Array, ArrayRef, GenericStringArray, Int32Builder, LargeStringBuilder, StringBuilder,
+            StringViewBuilder, TimestampMicrosecondArray, TimestampMillisecondArray,
+            TimestampNanosecondArray, TimestampSecondArray,
         },
-        datatypes::DataType,
+        datatypes::{DataType, TimeUnit},
     },
     common::{
         DataFusionError, Result as DataFusionResult, ScalarValue, cast::as_string_view_array,
@@ -19,9 +20,11 @@ use datafusion::{
 };
 
 pub const EXTRACT_REFERER_HOST_UDF: &str = "harborsql_extract_referer_host";
+pub const EXTRACT_MINUTE_UDF: &str = "harborsql_extract_minute";
 
 pub fn register_udfs(ctx: &SessionContext) {
     ctx.register_udf(ScalarUDF::new_from_impl(ExtractRefererHostFunc::new()));
+    ctx.register_udf(ScalarUDF::new_from_impl(ExtractMinuteFunc::new()));
 }
 
 #[derive(Debug, PartialEq, Eq, Hash)]
@@ -73,6 +76,171 @@ impl ScalarUDFImpl for ExtractRefererHostFunc {
             ColumnarValue::Array(array) => extract_array(array).map(ColumnarValue::Array),
         }
     }
+}
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct ExtractMinuteFunc {
+    signature: Signature,
+}
+
+impl ExtractMinuteFunc {
+    fn new() -> Self {
+        Self {
+            signature: Signature::any(1, Volatility::Immutable),
+        }
+    }
+}
+
+impl ScalarUDFImpl for ExtractMinuteFunc {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn name(&self) -> &str {
+        EXTRACT_MINUTE_UDF
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, arg_types: &[DataType]) -> DataFusionResult<DataType> {
+        match &arg_types[0] {
+            DataType::Timestamp(_, timezone) if is_utc_timezone(timezone.as_deref()) => {
+                Ok(DataType::Int32)
+            }
+            other => Err(DataFusionError::Plan(format!(
+                "{EXTRACT_MINUTE_UDF} expects a UTC timestamp argument, got {other:?}"
+            ))),
+        }
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DataFusionResult<ColumnarValue> {
+        if args.args.len() != 1 {
+            return Err(DataFusionError::Execution(format!(
+                "{EXTRACT_MINUTE_UDF} expects one argument"
+            )));
+        }
+
+        match &args.args[0] {
+            ColumnarValue::Scalar(scalar) => extract_minute_scalar(scalar),
+            ColumnarValue::Array(array) => extract_minute_array(array).map(ColumnarValue::Array),
+        }
+    }
+}
+
+fn extract_minute_scalar(scalar: &ScalarValue) -> DataFusionResult<ColumnarValue> {
+    let minute = match scalar {
+        ScalarValue::TimestampSecond(value, timezone) if is_utc_timezone(timezone.as_deref()) => {
+            value.map(|value| minute_from_timestamp(value, 1))
+        }
+        ScalarValue::TimestampMillisecond(value, timezone)
+            if is_utc_timezone(timezone.as_deref()) =>
+        {
+            value.map(|value| minute_from_timestamp(value, 1_000))
+        }
+        ScalarValue::TimestampMicrosecond(value, timezone)
+            if is_utc_timezone(timezone.as_deref()) =>
+        {
+            value.map(|value| minute_from_timestamp(value, 1_000_000))
+        }
+        ScalarValue::TimestampNanosecond(value, timezone)
+            if is_utc_timezone(timezone.as_deref()) =>
+        {
+            value.map(|value| minute_from_timestamp(value, 1_000_000_000))
+        }
+        other => {
+            return Err(DataFusionError::Execution(format!(
+                "{EXTRACT_MINUTE_UDF} expects a UTC timestamp argument, got {other:?}"
+            )));
+        }
+    };
+
+    Ok(ColumnarValue::Scalar(ScalarValue::Int32(minute)))
+}
+
+fn extract_minute_array(array: &ArrayRef) -> DataFusionResult<ArrayRef> {
+    match array.data_type() {
+        DataType::Timestamp(TimeUnit::Second, timezone) if is_utc_timezone(timezone.as_deref()) => {
+            let array = array
+                .as_any()
+                .downcast_ref::<TimestampSecondArray>()
+                .ok_or_else(|| {
+                    DataFusionError::Execution(format!(
+                        "{EXTRACT_MINUTE_UDF} received a non-TimestampSecond array"
+                    ))
+                })?;
+            extract_minute_timestamp_array(array, 1)
+        }
+        DataType::Timestamp(TimeUnit::Millisecond, timezone)
+            if is_utc_timezone(timezone.as_deref()) =>
+        {
+            let array = array
+                .as_any()
+                .downcast_ref::<TimestampMillisecondArray>()
+                .ok_or_else(|| {
+                    DataFusionError::Execution(format!(
+                        "{EXTRACT_MINUTE_UDF} received a non-TimestampMillisecond array"
+                    ))
+                })?;
+            extract_minute_timestamp_array(array, 1_000)
+        }
+        DataType::Timestamp(TimeUnit::Microsecond, timezone)
+            if is_utc_timezone(timezone.as_deref()) =>
+        {
+            let array = array
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .ok_or_else(|| {
+                    DataFusionError::Execution(format!(
+                        "{EXTRACT_MINUTE_UDF} received a non-TimestampMicrosecond array"
+                    ))
+                })?;
+            extract_minute_timestamp_array(array, 1_000_000)
+        }
+        DataType::Timestamp(TimeUnit::Nanosecond, timezone)
+            if is_utc_timezone(timezone.as_deref()) =>
+        {
+            let array = array
+                .as_any()
+                .downcast_ref::<TimestampNanosecondArray>()
+                .ok_or_else(|| {
+                    DataFusionError::Execution(format!(
+                        "{EXTRACT_MINUTE_UDF} received a non-TimestampNanosecond array"
+                    ))
+                })?;
+            extract_minute_timestamp_array(array, 1_000_000_000)
+        }
+        other => Err(DataFusionError::Execution(format!(
+            "{EXTRACT_MINUTE_UDF} expects a UTC timestamp array, got {other:?}"
+        ))),
+    }
+}
+
+fn extract_minute_timestamp_array<T>(
+    array: &datafusion::arrow::array::PrimitiveArray<T>,
+    units_per_second: i64,
+) -> DataFusionResult<ArrayRef>
+where
+    T: datafusion::arrow::array::types::ArrowTimestampType,
+{
+    let mut builder = Int32Builder::with_capacity(array.len());
+    for index in 0..array.len() {
+        if array.is_null(index) {
+            builder.append_null();
+        } else {
+            builder.append_value(minute_from_timestamp(array.value(index), units_per_second));
+        }
+    }
+    Ok(Arc::new(builder.finish()) as ArrayRef)
+}
+
+fn minute_from_timestamp(value: i64, units_per_second: i64) -> i32 {
+    value.div_euclid(units_per_second * 60).rem_euclid(60) as i32
+}
+
+fn is_utc_timezone(timezone: Option<&str>) -> bool {
+    timezone.is_none_or(|timezone| timezone.eq_ignore_ascii_case("UTC"))
 }
 
 fn extract_scalar(scalar: &ScalarValue) -> DataFusionResult<ColumnarValue> {
