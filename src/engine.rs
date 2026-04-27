@@ -15,10 +15,10 @@ use futures::StreamExt;
 use serde::Serialize;
 use sqlparser::{
     ast::{
-        DateTimeField, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArgumentClause,
-        FunctionArgumentList, FunctionArguments, GroupByExpr, Ident, Join, JoinConstraint,
-        JoinOperator, ObjectName, ObjectNamePart, OrderBy, OrderByKind, Query, Select, SelectItem,
-        SetExpr, Statement, TableFactor, TableWithJoins, Value,
+        Expr, Function, FunctionArg, FunctionArgExpr, FunctionArgumentClause, FunctionArgumentList,
+        FunctionArguments, GroupByExpr, Ident, Join, JoinConstraint, JoinOperator, ObjectName,
+        ObjectNamePart, OrderBy, OrderByKind, Query, Select, SelectItem, SetExpr, Statement,
+        TableFactor, TableWithJoins, UnaryOperator, Value,
     },
     dialect::GenericDialect,
     parser::Parser,
@@ -29,7 +29,6 @@ use url::Url;
 use crate::{
     config::Config,
     error::{HarborError, Result},
-    udf,
     unity::{TemporaryTableCredentials, UnityCatalogClient},
 };
 
@@ -99,7 +98,6 @@ impl QueryEngine {
                 self.config.parquet_reorder_filters,
             );
         let ctx = SessionContext::new_with_config(session_config);
-        udf::register_udfs(&ctx);
 
         let mut catalogs: HashMap<String, Arc<MemoryCatalogProvider>> = HashMap::new();
         let mut schemas: HashMap<(String, String), Arc<MemorySchemaProvider>> = HashMap::new();
@@ -147,7 +145,7 @@ impl QueryEngine {
                 .map_err(HarborError::DataFusion)?;
         }
 
-        let execution_sql = rewrite_clickbench_fast_paths(sql)?;
+        let execution_sql = rewrite_sql_fast_paths(sql)?;
         let dataframe = ctx.sql(&execution_sql).await?;
         let mut stream = dataframe.execute_stream().await?;
         let schema = stream
@@ -259,14 +257,14 @@ fn validate_select_only(sql: &str) -> Result<()> {
     }
 }
 
-fn rewrite_clickbench_fast_paths(sql: &str) -> Result<String> {
+fn rewrite_sql_fast_paths(sql: &str) -> Result<String> {
     let dialect = GenericDialect {};
     let mut statements = Parser::parse_sql(&dialect, sql)
         .map_err(|err| HarborError::UnsupportedSql(err.to_string()))?;
     let mut changed = false;
 
     if let Some(Statement::Query(query)) = statements.first_mut() {
-        changed = rewrite_query_clickbench_fast_paths(query);
+        changed = rewrite_query_fast_paths(query);
     }
 
     if changed {
@@ -276,49 +274,88 @@ fn rewrite_clickbench_fast_paths(sql: &str) -> Result<String> {
     }
 }
 
-fn rewrite_query_clickbench_fast_paths(query: &mut Query) -> bool {
+fn rewrite_query_fast_paths(query: &mut Query) -> bool {
     match query.body.as_mut() {
-        SetExpr::Select(select) => rewrite_select_clickbench_fast_paths(select),
-        SetExpr::Query(query) => rewrite_query_clickbench_fast_paths(query),
+        SetExpr::Select(select) => rewrite_select_fast_paths(select),
+        SetExpr::Query(query) => rewrite_query_fast_paths(query),
         _ => false,
     }
 }
 
-fn rewrite_select_clickbench_fast_paths(select: &mut Select) -> bool {
+fn rewrite_select_fast_paths(select: &mut Select) -> bool {
     let mut changed = false;
     for item in &mut select.projection {
         let expr = match item {
             SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => expr,
             SelectItem::QualifiedWildcard(_, _) | SelectItem::Wildcard(_) => continue,
         };
-        changed |= rewrite_expr_clickbench_fast_paths(expr);
+        changed |= rewrite_expr_fast_paths(expr);
+    }
+    if let Some(selection) = &mut select.selection {
+        changed |= rewrite_expr_fast_paths(selection);
     }
     changed
 }
 
-fn rewrite_expr_clickbench_fast_paths(expr: &mut Expr) -> bool {
-    let (udf_name, source) = match expr {
-        Expr::Function(function) => {
-            let Some(source) = clickbench_referer_host_source(function) else {
+fn rewrite_expr_fast_paths(expr: &mut Expr) -> bool {
+    if rewrite_leaf_expr_fast_paths(expr) {
+        return true;
+    }
+
+    match expr {
+        Expr::BinaryOp { left, right, .. }
+        | Expr::IsDistinctFrom(left, right)
+        | Expr::IsNotDistinctFrom(left, right) => {
+            rewrite_expr_fast_paths(left) | rewrite_expr_fast_paths(right)
+        }
+        Expr::UnaryOp { expr, .. }
+        | Expr::IsFalse(expr)
+        | Expr::IsNotFalse(expr)
+        | Expr::IsTrue(expr)
+        | Expr::IsNotTrue(expr)
+        | Expr::IsNull(expr)
+        | Expr::IsNotNull(expr)
+        | Expr::IsUnknown(expr)
+        | Expr::IsNotUnknown(expr)
+        | Expr::Nested(expr)
+        | Expr::OuterJoin(expr)
+        | Expr::Prior(expr) => rewrite_expr_fast_paths(expr),
+        _ => false,
+    }
+}
+
+fn rewrite_leaf_expr_fast_paths(expr: &mut Expr) -> bool {
+    match expr {
+        Expr::Like {
+            negated,
+            any: false,
+            expr: like_expr,
+            pattern,
+            escape_char: None,
+        } => {
+            let Some(needle) = contains_needle_from_like_pattern(pattern) else {
                 return false;
             };
-            (udf::EXTRACT_REFERER_HOST_UDF, source)
+            *expr = contains_expr((**like_expr).clone(), needle, *negated);
+            true
         }
-        Expr::Extract {
-            field: DateTimeField::Minute,
-            expr,
-            ..
-        } => (udf::EXTRACT_MINUTE_UDF, (**expr).clone()),
-        _ => return false,
-    };
+        _ => false,
+    }
+}
 
-    *expr = Expr::Function(Function {
-        name: ObjectName::from(Ident::new(udf_name)),
+fn contains_expr(haystack: Expr, needle: String, negated: bool) -> Expr {
+    let contains = Expr::Function(Function {
+        name: ObjectName::from(Ident::new("contains")),
         uses_odbc_syntax: false,
         parameters: FunctionArguments::None,
         args: FunctionArguments::List(FunctionArgumentList {
             duplicate_treatment: None,
-            args: vec![FunctionArg::Unnamed(FunctionArgExpr::Expr(source))],
+            args: vec![
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(haystack)),
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(
+                    Value::SingleQuotedString(needle).into(),
+                ))),
+            ],
             clauses: vec![],
         }),
         filter: None,
@@ -326,52 +363,24 @@ fn rewrite_expr_clickbench_fast_paths(expr: &mut Expr) -> bool {
         over: None,
         within_group: vec![],
     });
-    true
-}
 
-fn clickbench_referer_host_source(function: &Function) -> Option<Expr> {
-    if !function
-        .name
-        .to_string()
-        .eq_ignore_ascii_case("regexp_replace")
-    {
-        return None;
-    }
-    if !matches!(function.parameters, FunctionArguments::None)
-        || function.filter.is_some()
-        || function.null_treatment.is_some()
-        || function.over.is_some()
-        || !function.within_group.is_empty()
-    {
-        return None;
-    }
-
-    let FunctionArguments::List(arguments) = &function.args else {
-        return None;
-    };
-    if arguments.duplicate_treatment.is_some()
-        || !arguments.clauses.is_empty()
-        || arguments.args.len() != 3
-    {
-        return None;
-    }
-
-    let source = positional_expr_arg(&arguments.args[0])?.clone();
-    let pattern = string_literal_value(positional_expr_arg(&arguments.args[1])?)?;
-    let replacement = string_literal_value(positional_expr_arg(&arguments.args[2])?)?;
-
-    if pattern == r"^https?://(?:www\.)?([^/]+)/.*$" && replacement == "$1" {
-        Some(source)
+    if negated {
+        Expr::UnaryOp {
+            op: UnaryOperator::Not,
+            expr: Box::new(contains),
+        }
     } else {
-        None
+        contains
     }
 }
 
-fn positional_expr_arg(arg: &FunctionArg) -> Option<&Expr> {
-    match arg {
-        FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => Some(expr),
-        _ => None,
+fn contains_needle_from_like_pattern(pattern: &Expr) -> Option<String> {
+    let pattern = string_literal_value(pattern)?;
+    let needle = pattern.strip_prefix('%')?.strip_suffix('%')?;
+    if needle.contains(['%', '_']) {
+        return None;
     }
+    Some(needle.to_string())
 }
 
 fn string_literal_value(expr: &Expr) -> Option<&str> {
@@ -1348,31 +1357,21 @@ mod tests {
     }
 
     #[test]
-    fn rewrites_clickbench_referer_regexp_replace() {
-        let rewritten = rewrite_clickbench_fast_paths(
-            "SELECT REGEXP_REPLACE(Referer, '^https?://(?:www\\.)?([^/]+)/.*$', '$1') AS k \
-             FROM hits GROUP BY k",
+    fn rewrites_simple_contains_like_predicates() {
+        let rewritten = rewrite_sql_fast_paths(
+            "SELECT COUNT(*) FROM hits WHERE URL LIKE '%google%' AND URL NOT LIKE '%.google.%'",
         )
         .unwrap();
 
-        assert!(rewritten.contains("harborsql_extract_referer_host(Referer) AS k"));
-        assert!(!rewritten.contains("REGEXP_REPLACE"));
+        assert!(rewritten.contains("contains(URL, 'google')"));
+        assert!(rewritten.contains("NOT contains(URL, '.google.')"));
+        assert!(!rewritten.contains(" LIKE "));
     }
 
     #[test]
-    fn leaves_other_regexp_replace_calls_unchanged() {
-        let sql = "SELECT REGEXP_REPLACE(Referer, 'x', '$1') AS k FROM hits";
+    fn leaves_complex_like_predicates_unchanged() {
+        let sql = "SELECT COUNT(*) FROM hits WHERE URL LIKE '%goo_le%'";
 
-        assert_eq!(rewrite_clickbench_fast_paths(sql).unwrap(), sql);
-    }
-
-    #[test]
-    fn rewrites_clickbench_extract_minute() {
-        let rewritten = rewrite_clickbench_fast_paths(
-            "SELECT UserID, extract(minute FROM EventTime) AS m, COUNT(*) FROM hits GROUP BY UserID, m",
-        )
-        .unwrap();
-
-        assert!(rewritten.contains("harborsql_extract_minute(EventTime) AS m"));
+        assert_eq!(rewrite_sql_fast_paths(sql).unwrap(), sql);
     }
 }
