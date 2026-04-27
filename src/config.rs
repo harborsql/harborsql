@@ -13,6 +13,7 @@ pub const DEFAULT_MAX_SESSIONS: usize = 256;
 pub const DEFAULT_MAX_OPERATIONS: usize = 512;
 pub const DEFAULT_REQUEST_BODY_LIMIT_BYTES: usize = 1024 * 1024;
 pub const DEFAULT_PARQUET_PUSHDOWN_FILTERS: bool = true;
+pub const DEFAULT_MIN_TARGET_PARTITIONS: usize = 32;
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -33,6 +34,7 @@ pub struct Config {
     pub request_body_limit_bytes: usize,
     pub parquet_pushdown_filters: bool,
     pub parquet_reorder_filters: bool,
+    pub target_partitions: usize,
 }
 
 impl Config {
@@ -57,6 +59,7 @@ impl Config {
             "HARBORSQL_PARQUET_REORDER_FILTERS",
             parquet_pushdown_filters,
         )?;
+        let default_target_partitions = default_target_partitions();
 
         Ok(Self {
             bind_addr,
@@ -104,8 +107,18 @@ impl Config {
             )?,
             parquet_pushdown_filters,
             parquet_reorder_filters,
+            target_partitions: parse_usize_env(
+                "HARBORSQL_TARGET_PARTITIONS",
+                default_target_partitions,
+            )?,
         })
     }
+}
+
+fn default_target_partitions() -> usize {
+    std::thread::available_parallelism()
+        .map(|parallelism| parallelism.get().max(DEFAULT_MIN_TARGET_PARTITIONS))
+        .unwrap_or(DEFAULT_MIN_TARGET_PARTITIONS)
 }
 
 fn parse_optional_usize_env(name: &str, default: Option<usize>) -> Result<Option<usize>> {

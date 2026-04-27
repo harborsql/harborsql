@@ -86,6 +86,7 @@ impl QueryEngine {
 
         let session_config = SessionConfig::new()
             .with_default_catalog_and_schema(default_catalog, default_schema)
+            .with_target_partitions(self.config.target_partitions)
             .set_bool("datafusion.sql_parser.enable_ident_normalization", false)
             .set_bool(
                 "datafusion.execution.parquet.pushdown_filters",
