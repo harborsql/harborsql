@@ -3,9 +3,10 @@ use std::{any::Any, borrow::Cow, sync::Arc};
 use datafusion::{
     arrow::{
         array::{
-            Array, ArrayRef, GenericStringArray, LargeStringBuilder, StringBuilder,
-            StringViewBuilder,
+            Array, ArrayRef, ArrowPrimitiveType, AsArray, GenericStringArray, Int32Array,
+            LargeStringBuilder, StringBuilder, StringViewBuilder,
         },
+        compute::{DatePart, date_part},
         datatypes::DataType,
     },
     common::{
@@ -20,9 +21,107 @@ use datafusion::{
 use regex::Regex;
 
 pub const REGEXP_REPLACE_CAPTURE_UDF: &str = "harborsql_regexp_replace_capture";
+pub const EXTRACT_MINUTE_UDF: &str = "harborsql_extract_minute";
 
 pub fn register_udfs(ctx: &SessionContext) {
     ctx.register_udf(ScalarUDF::new_from_impl(RegexpReplaceCaptureFunc::new()));
+    ctx.register_udf(ScalarUDF::new_from_impl(ExtractMinuteFunc::new()));
+}
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct ExtractMinuteFunc {
+    signature: Signature,
+}
+
+impl ExtractMinuteFunc {
+    fn new() -> Self {
+        Self {
+            signature: Signature::any(1, Volatility::Immutable),
+        }
+    }
+}
+
+impl ScalarUDFImpl for ExtractMinuteFunc {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn name(&self) -> &str {
+        EXTRACT_MINUTE_UDF
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _arg_types: &[DataType]) -> DataFusionResult<DataType> {
+        Ok(DataType::Int32)
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DataFusionResult<ColumnarValue> {
+        if args.args.len() != 1 {
+            return Err(DataFusionError::Execution(format!(
+                "{EXTRACT_MINUTE_UDF} expects one argument"
+            )));
+        }
+
+        match &args.args[0] {
+            ColumnarValue::Scalar(scalar) => {
+                let input = scalar.to_array()?;
+                let output = extract_minute_array(&input)?;
+                ScalarValue::try_from_array(output.as_ref(), 0).map(ColumnarValue::Scalar)
+            }
+            ColumnarValue::Array(array) => extract_minute_array(array).map(ColumnarValue::Array),
+        }
+    }
+}
+
+fn extract_minute_array(array: &ArrayRef) -> DataFusionResult<ArrayRef> {
+    use datafusion::arrow::datatypes::{
+        TimeUnit, TimestampMicrosecondType, TimestampMillisecondType, TimestampNanosecondType,
+        TimestampSecondType,
+    };
+
+    match array.data_type() {
+        DataType::Timestamp(TimeUnit::Second, timezone) if is_utc_timezone(timezone.as_deref()) => {
+            extract_timestamp_minute::<TimestampSecondType>(array, 1)
+        }
+        DataType::Timestamp(TimeUnit::Millisecond, timezone)
+            if is_utc_timezone(timezone.as_deref()) =>
+        {
+            extract_timestamp_minute::<TimestampMillisecondType>(array, 1_000)
+        }
+        DataType::Timestamp(TimeUnit::Microsecond, timezone)
+            if is_utc_timezone(timezone.as_deref()) =>
+        {
+            extract_timestamp_minute::<TimestampMicrosecondType>(array, 1_000_000)
+        }
+        DataType::Timestamp(TimeUnit::Nanosecond, timezone)
+            if is_utc_timezone(timezone.as_deref()) =>
+        {
+            extract_timestamp_minute::<TimestampNanosecondType>(array, 1_000_000_000)
+        }
+        _ => date_part(array.as_ref(), DatePart::Minute).map_err(DataFusionError::from),
+    }
+}
+
+fn is_utc_timezone(timezone: Option<&str>) -> bool {
+    timezone.is_none_or(|timezone| timezone.eq_ignore_ascii_case("UTC"))
+}
+
+fn extract_timestamp_minute<T>(
+    array: &ArrayRef,
+    units_per_second: i64,
+) -> DataFusionResult<ArrayRef>
+where
+    T: ArrowPrimitiveType<Native = i64>,
+{
+    let array = array.as_primitive::<T>();
+    let minutes: Int32Array = array.unary_opt(|value| {
+        let second = value.div_euclid(units_per_second);
+        Some((second.rem_euclid(60 * 60) / 60) as i32)
+    });
+    Ok(Arc::new(minutes) as ArrayRef)
 }
 
 #[derive(Debug, PartialEq, Eq, Hash)]
@@ -236,9 +335,15 @@ fn replace_capture<'a>(value: &'a str, regex: &Regex, capture_index: usize) -> C
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use datafusion::arrow::{
+        array::{Array, ArrayRef, Int32Array, TimestampMicrosecondArray},
+        datatypes::{DataType, TimeUnit},
+    };
     use regex::Regex;
 
-    use super::replace_capture;
+    use super::{extract_minute_array, replace_capture};
 
     #[test]
     fn replaces_first_match_with_capture() {
@@ -262,5 +367,28 @@ mod tests {
     fn uses_empty_string_for_missing_capture() {
         let regex = Regex::new("b(..)").unwrap();
         assert_eq!(replace_capture("foobarbequebaz", &regex, 2), "foobequebaz");
+    }
+
+    #[test]
+    fn extracts_timestamp_minutes_with_euclidean_time() {
+        let array = TimestampMicrosecondArray::from(vec![
+            Some(0),
+            Some(59_000_000),
+            Some(60_000_000),
+            Some(-1),
+            None,
+        ])
+        .with_data_type(DataType::Timestamp(
+            TimeUnit::Microsecond,
+            Some("UTC".into()),
+        ));
+        let result = extract_minute_array(&(Arc::new(array) as ArrayRef)).unwrap();
+        let result = result.as_any().downcast_ref::<Int32Array>().unwrap();
+
+        assert_eq!(result.value(0), 0);
+        assert_eq!(result.value(1), 0);
+        assert_eq!(result.value(2), 1);
+        assert_eq!(result.value(3), 59);
+        assert!(result.is_null(4));
     }
 }

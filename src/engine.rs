@@ -15,10 +15,10 @@ use futures::StreamExt;
 use serde::Serialize;
 use sqlparser::{
     ast::{
-        Expr, Function, FunctionArg, FunctionArgExpr, FunctionArgumentClause, FunctionArgumentList,
-        FunctionArguments, GroupByExpr, Ident, Join, JoinConstraint, JoinOperator, ObjectName,
-        ObjectNamePart, OrderBy, OrderByKind, Query, Select, SelectItem, SetExpr, Statement,
-        TableFactor, TableWithJoins, UnaryOperator, Value,
+        DateTimeField, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArgumentClause,
+        FunctionArgumentList, FunctionArguments, GroupByExpr, Ident, Join, JoinConstraint,
+        JoinOperator, ObjectName, ObjectNamePart, OrderBy, OrderByKind, Query, Select, SelectItem,
+        SetExpr, Statement, TableFactor, TableWithJoins, UnaryOperator, Value,
     },
     dialect::GenericDialect,
     parser::Parser,
@@ -400,6 +400,14 @@ fn rewrite_expr_fast_paths(expr: &mut Expr) -> bool {
 
 fn rewrite_leaf_expr_fast_paths(expr: &mut Expr) -> bool {
     match expr {
+        Expr::Extract {
+            field: DateTimeField::Minute | DateTimeField::Minutes,
+            expr: source,
+            ..
+        } => {
+            *expr = extract_minute_expr((**source).clone());
+            true
+        }
         Expr::Function(function) => {
             if let Some((source, pattern, capture_index)) =
                 regexp_replace_capture_fast_path_args(function)
@@ -425,6 +433,23 @@ fn rewrite_leaf_expr_fast_paths(expr: &mut Expr) -> bool {
         }
         _ => false,
     }
+}
+
+fn extract_minute_expr(source: Expr) -> Expr {
+    Expr::Function(Function {
+        name: ObjectName::from(Ident::new(udf::EXTRACT_MINUTE_UDF)),
+        uses_odbc_syntax: false,
+        parameters: FunctionArguments::None,
+        args: FunctionArguments::List(FunctionArgumentList {
+            duplicate_treatment: None,
+            args: vec![FunctionArg::Unnamed(FunctionArgExpr::Expr(source))],
+            clauses: vec![],
+        }),
+        filter: None,
+        null_treatment: None,
+        over: None,
+        within_group: vec![],
+    })
 }
 
 fn rewrite_function_fast_paths(function: &mut Function) -> bool {
@@ -1614,6 +1639,16 @@ mod tests {
         .unwrap();
 
         assert!(rewritten.contains("GROUP BY harborsql_regexp_replace_capture"));
+    }
+
+    #[test]
+    fn rewrites_extract_minute() {
+        let rewritten = rewrite_sql_fast_paths(
+            "SELECT UserID, extract(minute FROM EventTime) AS m FROM hits GROUP BY UserID, m",
+        )
+        .unwrap();
+
+        assert!(rewritten.contains("harborsql_extract_minute(EventTime) AS m"));
     }
 
     #[test]
