@@ -24,7 +24,7 @@ use uuid::Uuid;
 use crate::{
     config::Config,
     engine::{Column, QueryEngine, QueryResult, QueryResultPage},
-    error::{HarborError, Result},
+    error::{ClientError, HarborError, Result, redact_sensitive},
 };
 
 const T_STOP: u8 = 0;
@@ -189,7 +189,10 @@ impl DatabricksThriftService {
                     };
                     OperationCompletion {
                         duration_ms: started.elapsed().as_millis() as u64,
-                        result: result.map_err(|err| err.to_string()),
+                        result: result.map_err(|err| {
+                            err.log_internal("thrift operation");
+                            err.client_error()
+                        }),
                     }
                 });
 
@@ -232,10 +235,13 @@ impl DatabricksThriftService {
                             Some(result) => {
                                 write_get_result_set_metadata_response(message.seqid, result)
                             }
-                            None => write_get_result_set_metadata_not_ready(
-                                message.seqid,
-                                operation.state.error_message(),
-                            ),
+                            None => {
+                                let error = operation.state.error_message();
+                                write_get_result_set_metadata_not_ready(
+                                    message.seqid,
+                                    error.as_deref(),
+                                )
+                            }
                         },
                     )
                     .await
@@ -255,10 +261,10 @@ impl DatabricksThriftService {
                                 request.start_row_offset.unwrap_or(0),
                                 request.max_rows,
                             ),
-                            None => write_fetch_results_not_ready(
-                                message.seqid,
-                                operation.state.error_message(),
-                            ),
+                            None => {
+                                let error = operation.state.error_message();
+                                write_fetch_results_not_ready(message.seqid, error.as_deref())
+                            }
                         },
                     )
                     .await
@@ -581,7 +587,7 @@ enum OperationExecution {
         completed_at: Instant,
     },
     Failed {
-        error: String,
+        error: ClientError,
         duration_ms: u64,
         completed_at: Instant,
     },
@@ -618,11 +624,19 @@ impl OperationExecution {
                 duration_ms: started.elapsed().as_millis() as u64,
                 completed_at: Instant::now(),
             },
-            Err(err) => Self::Failed {
-                error: err.to_string(),
-                duration_ms: started.elapsed().as_millis() as u64,
-                completed_at: Instant::now(),
-            },
+            Err(err) => {
+                let error = ClientError::internal();
+                tracing::error!(
+                    error_code = error.code,
+                    internal_error = %redact_sensitive(&err.to_string()),
+                    "operation task failed"
+                );
+                Self::Failed {
+                    error,
+                    duration_ms: started.elapsed().as_millis() as u64,
+                    completed_at: Instant::now(),
+                }
+            }
         }
     }
 
@@ -669,11 +683,13 @@ impl OperationExecution {
         }
     }
 
-    fn error_message(&self) -> Option<&str> {
+    fn error_message(&self) -> Option<String> {
         match self {
-            Self::Running { .. } | Self::Refreshing { .. } => Some("operation is still running"),
-            Self::Failed { error, .. } => Some(error),
-            Self::Canceled { .. } => Some("operation was canceled"),
+            Self::Running { .. } | Self::Refreshing { .. } => {
+                Some("OPERATION_RUNNING: operation is still running".to_string())
+            }
+            Self::Failed { error, .. } => Some(error.status_message()),
+            Self::Canceled { .. } => Some("OPERATION_CANCELED: operation was canceled".to_string()),
             Self::Finished { .. } => None,
         }
     }
@@ -691,7 +707,7 @@ impl OperationExecution {
 
 struct OperationCompletion {
     duration_ms: u64,
-    result: std::result::Result<QueryResult, String>,
+    result: std::result::Result<QueryResult, ClientError>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1035,12 +1051,13 @@ fn write_execute_statement_invalid(seqid: i32, message: &str) -> Vec<u8> {
 
 fn write_get_operation_status_response(seqid: i32, operation: &OperationState) -> Vec<u8> {
     write_success_response("GetOperationStatus", seqid, |writer| {
+        let error = operation.state.error_message();
         write_operation_status_response(
             writer,
             operation.state.status_code(),
             operation.state.operation_state(),
             operation.state.result().is_some(),
-            operation.state.error_message(),
+            error.as_deref(),
         );
     })
 }
@@ -2038,6 +2055,20 @@ mod tests {
 
         assert_eq!(operation.state.operation_state(), FINISHED_STATE);
         assert_eq!(operation.state.history_status(), "FINISHED");
+    }
+
+    #[test]
+    fn failed_operation_reports_client_error_message() {
+        let operation = OperationExecution::from_completion(OperationCompletion {
+            duration_ms: 5,
+            result: Err(ClientError::new("QUERY_FAILED", "query execution failed")),
+        });
+
+        assert_eq!(operation.operation_state(), ERROR_STATE);
+        assert_eq!(
+            operation.error_message().as_deref(),
+            Some("QUERY_FAILED: query execution failed")
+        );
     }
 
     #[test]

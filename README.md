@@ -208,6 +208,10 @@ Keep environment-specific benchmark data, workspace identifiers, storage paths, 
 - Do not log or persist temporary cloud credentials.
 - Keep `HARBORSQL_DATABRICKS_HOST` on HTTPS for real Databricks workspaces;
   the HTTP override is only for local non-Databricks test endpoints.
+- Client-facing errors use stable error codes and short messages. Internal error
+  details are emitted only through structured logs after central redaction of
+  tokens, cloud credentials, URLs, object paths, SQL, and known sensitive
+  Databricks/AWS fields.
 - Table cache entries are per bearer-token fingerprint, in-memory only, bounded,
   and expire before Unity temporary table credentials expire.
 - Treat Unity Catalog as the authorization source of truth.
