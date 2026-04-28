@@ -14,6 +14,8 @@ pub const DEFAULT_MAX_OPERATIONS: usize = 512;
 pub const DEFAULT_REQUEST_BODY_LIMIT_BYTES: usize = 1024 * 1024;
 pub const DEFAULT_PARQUET_PUSHDOWN_FILTERS: bool = true;
 pub const DEFAULT_MIN_TARGET_PARTITIONS: usize = 32;
+pub const DEFAULT_SKIP_PARTIAL_AGGREGATION_PROBE_ROWS_THRESHOLD: usize = 10_000;
+pub const DEFAULT_SKIP_PARTIAL_AGGREGATION_PROBE_RATIO_THRESHOLD: f64 = 0.8;
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -35,6 +37,8 @@ pub struct Config {
     pub parquet_pushdown_filters: bool,
     pub parquet_reorder_filters: bool,
     pub target_partitions: usize,
+    pub skip_partial_aggregation_probe_rows_threshold: usize,
+    pub skip_partial_aggregation_probe_ratio_threshold: f64,
 }
 
 impl Config {
@@ -111,6 +115,14 @@ impl Config {
                 "HARBORSQL_TARGET_PARTITIONS",
                 default_target_partitions,
             )?,
+            skip_partial_aggregation_probe_rows_threshold: parse_usize_env(
+                "HARBORSQL_SKIP_PARTIAL_AGGREGATION_PROBE_ROWS_THRESHOLD",
+                DEFAULT_SKIP_PARTIAL_AGGREGATION_PROBE_ROWS_THRESHOLD,
+            )?,
+            skip_partial_aggregation_probe_ratio_threshold: parse_ratio_env(
+                "HARBORSQL_SKIP_PARTIAL_AGGREGATION_PROBE_RATIO_THRESHOLD",
+                DEFAULT_SKIP_PARTIAL_AGGREGATION_PROBE_RATIO_THRESHOLD,
+            )?,
         })
     }
 }
@@ -173,6 +185,23 @@ fn parse_bool_env(name: &str, default: bool) -> Result<bool> {
     }
 }
 
+fn parse_ratio_env(name: &str, default: f64) -> Result<f64> {
+    match env::var(name) {
+        Ok(value) => {
+            let parsed: f64 = value
+                .parse()
+                .map_err(|err| HarborError::Config(format!("invalid {name}: {err}")))?;
+            if !(0.0..=1.0).contains(&parsed) {
+                return Err(HarborError::Config(format!(
+                    "{name} must be between 0 and 1"
+                )));
+            }
+            Ok(parsed)
+        }
+        Err(_) => Ok(default),
+    }
+}
+
 fn parse_bool_value(name: &str, value: &str) -> Result<bool> {
     match value.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => Ok(true),
@@ -209,6 +238,28 @@ mod tests {
 
         for value in ["0", "false", "no", "off", "FALSE", " Off "] {
             assert!(!parse_bool_value("HARBORSQL_TEST_BOOL", value).unwrap());
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_ratio_values() {
+        temp_remove_var("HARBORSQL_TEST_RATIO");
+        temp_set_var("HARBORSQL_TEST_RATIO", "1.2");
+        assert!(parse_ratio_env("HARBORSQL_TEST_RATIO", 0.8).is_err());
+        temp_set_var("HARBORSQL_TEST_RATIO", "-0.1");
+        assert!(parse_ratio_env("HARBORSQL_TEST_RATIO", 0.8).is_err());
+        temp_remove_var("HARBORSQL_TEST_RATIO");
+    }
+
+    fn temp_set_var(key: &str, value: &str) {
+        unsafe {
+            env::set_var(key, value);
+        }
+    }
+
+    fn temp_remove_var(key: &str) {
+        unsafe {
+            env::remove_var(key);
         }
     }
 }

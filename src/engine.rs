@@ -104,6 +104,17 @@ impl QueryEngine {
             .set_bool(
                 "datafusion.execution.parquet.reorder_filters",
                 self.config.parquet_reorder_filters,
+            )
+            .set_usize(
+                "datafusion.execution.skip_partial_aggregation_probe_rows_threshold",
+                self.config.skip_partial_aggregation_probe_rows_threshold,
+            )
+            .set_str(
+                "datafusion.execution.skip_partial_aggregation_probe_ratio_threshold",
+                &self
+                    .config
+                    .skip_partial_aggregation_probe_ratio_threshold
+                    .to_string(),
             );
         let ctx = SessionContext::new_with_config(session_config);
         udf::register_udfs(&ctx);
@@ -615,7 +626,7 @@ fn rewrite_select_fast_paths(select: &mut Select) -> bool {
         changed |= rewrite_expr_fast_paths(prewhere);
     }
     if let GroupByExpr::Expressions(expressions, _) = &mut select.group_by {
-        for expression in expressions {
+        for expression in &mut *expressions {
             changed |= rewrite_expr_fast_paths(expression);
         }
     }
