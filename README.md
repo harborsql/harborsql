@@ -49,7 +49,7 @@ HarborSQL reads configuration from environment variables:
 | `HARBORSQL_DEFAULT_SCHEMA` or `DATABRICKS_SCHEMA` | no | `default` | Default schema for unqualified queries |
 | `HARBORSQL_AWS_REGION` | no | `us-west-2` | AWS region passed to Delta object-store access |
 | `HARBORSQL_MAX_RESULT_ROWS` | no | `100000` | Maximum rows HarborSQL will materialize for one query; set to an empty value to disable |
-| `HARBORSQL_MAX_RESULT_BYTES` | no | `67108864` | Maximum JSON result bytes HarborSQL will materialize for one query; set to an empty value to disable |
+| `HARBORSQL_MAX_RESULT_BYTES` | no | `67108864` | Maximum retained Arrow result page bytes HarborSQL will materialize for one query; set to an empty value to disable |
 | `HARBORSQL_UNITY_TIMEOUT_SECONDS` | no | `30` | Timeout for Unity Catalog HTTP requests |
 | `HARBORSQL_QUERY_TIMEOUT_SECONDS` | no | `300` | Timeout for each query execution |
 | `HARBORSQL_IDLE_SESSION_TIMEOUT_SECONDS` | no | `1800` | Idle timeout for Thrift sessions |
