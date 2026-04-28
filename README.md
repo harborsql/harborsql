@@ -45,7 +45,8 @@ HarborSQL reads configuration from environment variables:
 
 | Variable | Required | Default | Description |
 | --- | --- | --- | --- |
-| `HARBORSQL_DATABRICKS_HOST` or `DATABRICKS_HOST` | yes | none | Databricks workspace URL or host |
+| `HARBORSQL_DATABRICKS_HOST` or `DATABRICKS_HOST` | yes | none | Databricks workspace URL or host; defaults to `https://` when no scheme is supplied and rejects `http://` unless explicitly allowed |
+| `HARBORSQL_UNSAFE_ALLOW_HTTP_DATABRICKS_HOST` | no | `false` | Allows an `http://` Databricks host value for local non-Databricks test endpoints only; do not use with real Databricks bearer tokens |
 | `HARBORSQL_BIND_ADDR` | no | `127.0.0.1:1992` | HTTP bind address |
 | `HARBORSQL_DEFAULT_CATALOG` or `DATABRICKS_CATALOG` | no | `workspace` | Default catalog for unqualified queries |
 | `HARBORSQL_DEFAULT_SCHEMA` or `DATABRICKS_SCHEMA` | no | `default` | Default schema for unqualified queries |
@@ -116,7 +117,9 @@ connection = sql.connect(
 )
 ```
 
-Production deployments should serve HarborSQL over HTTPS and use normal connector settings.
+This local HTTP override is only for the client-to-HarborSQL hop. HarborSQL still requires its upstream `HARBORSQL_DATABRICKS_HOST` to use HTTPS by default because bearer tokens are forwarded to Unity Catalog. If a local test double really needs an HTTP upstream endpoint, set `HARBORSQL_UNSAFE_ALLOW_HTTP_DATABRICKS_HOST=true` and do not use real Databricks credentials.
+
+Production deployments should serve HarborSQL over HTTPS, or behind a TLS-terminating proxy, and use normal connector settings. The HarborSQL-to-Databricks/Unity Catalog hop should always be HTTPS for real Databricks workspaces.
 
 ## Tests
 
@@ -203,6 +206,8 @@ Keep environment-specific benchmark data, workspace identifiers, storage paths, 
 
 - Do not log or persist bearer tokens.
 - Do not log or persist temporary cloud credentials.
+- Keep `HARBORSQL_DATABRICKS_HOST` on HTTPS for real Databricks workspaces;
+  the HTTP override is only for local non-Databricks test endpoints.
 - Table cache entries are per bearer-token fingerprint, in-memory only, bounded,
   and expire before Unity temporary table credentials expire.
 - Treat Unity Catalog as the authorization source of truth.

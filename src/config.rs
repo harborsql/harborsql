@@ -19,6 +19,7 @@ pub const DEFAULT_SKIP_PARTIAL_AGGREGATION_PROBE_RATIO_THRESHOLD: f64 = 0.8;
 pub const DEFAULT_TABLE_CACHE_TTL_SECONDS: u64 = 300;
 pub const DEFAULT_TABLE_CACHE_MAX_ENTRIES: usize = 1024;
 pub const TABLE_CACHE_CREDENTIAL_EXPIRY_SKEW_SECONDS: u64 = 60;
+pub const DEFAULT_UNSAFE_ALLOW_HTTP_DATABRICKS_HOST: bool = false;
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -69,11 +70,15 @@ impl Config {
             "HARBORSQL_PARQUET_REORDER_FILTERS",
             parquet_pushdown_filters,
         )?;
+        let unsafe_allow_http_databricks_host = parse_bool_env(
+            "HARBORSQL_UNSAFE_ALLOW_HTTP_DATABRICKS_HOST",
+            DEFAULT_UNSAFE_ALLOW_HTTP_DATABRICKS_HOST,
+        )?;
         let default_target_partitions = default_target_partitions();
 
         Ok(Self {
             bind_addr,
-            databricks_host: normalize_host(&databricks_host)?,
+            databricks_host: normalize_host(&databricks_host, unsafe_allow_http_databricks_host)?,
             default_catalog: env::var("HARBORSQL_DEFAULT_CATALOG")
                 .or_else(|_| env::var("DATABRICKS_CATALOG"))
                 .unwrap_or_else(|_| "workspace".into()),
@@ -248,15 +253,28 @@ fn parse_bool_value(name: &str, value: &str) -> Result<bool> {
     }
 }
 
-fn normalize_host(host: &str) -> Result<String> {
+fn normalize_host(host: &str, unsafe_allow_http: bool) -> Result<String> {
     let trimmed = host.trim().trim_end_matches('/');
     if trimmed.is_empty() {
         return Err(HarborError::Config(
             "Databricks host cannot be empty".into(),
         ));
     }
-    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+
+    if trimmed.starts_with("https://") {
         Ok(trimmed.to_string())
+    } else if trimmed.starts_with("http://") {
+        if unsafe_allow_http {
+            Ok(trimmed.to_string())
+        } else {
+            Err(HarborError::Config(
+                "Databricks host must use https://; set HARBORSQL_UNSAFE_ALLOW_HTTP_DATABRICKS_HOST=true only for local development against a non-Databricks test endpoint".into(),
+            ))
+        }
+    } else if trimmed.contains("://") {
+        Err(HarborError::Config(
+            "Databricks host must use https://".into(),
+        ))
     } else {
         Ok(format!("https://{trimmed}"))
     }
@@ -285,6 +303,32 @@ mod tests {
         temp_set_var("HARBORSQL_TEST_RATIO", "-0.1");
         assert!(parse_ratio_env("HARBORSQL_TEST_RATIO", 0.8).is_err());
         temp_remove_var("HARBORSQL_TEST_RATIO");
+    }
+
+    #[test]
+    fn databricks_hosts_default_to_https() {
+        assert_eq!(
+            normalize_host("workspace.cloud.databricks.com/", false).unwrap(),
+            "https://workspace.cloud.databricks.com"
+        );
+        assert_eq!(
+            normalize_host("https://workspace.cloud.databricks.com/", false).unwrap(),
+            "https://workspace.cloud.databricks.com"
+        );
+    }
+
+    #[test]
+    fn databricks_hosts_reject_http_without_explicit_unsafe_opt_in() {
+        assert!(normalize_host("http://127.0.0.1:8080", false).is_err());
+        assert_eq!(
+            normalize_host("http://127.0.0.1:8080", true).unwrap(),
+            "http://127.0.0.1:8080"
+        );
+    }
+
+    #[test]
+    fn databricks_hosts_reject_other_url_schemes() {
+        assert!(normalize_host("ftp://workspace.cloud.databricks.com", false).is_err());
     }
 
     #[test]
