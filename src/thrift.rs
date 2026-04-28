@@ -4,8 +4,16 @@ use std::{
     time::{Duration, Instant},
 };
 
+use datafusion::arrow::{
+    array::{
+        Array, ArrayRef, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array,
+        Int32Array, Int64Array, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    },
+    datatypes::DataType,
+    record_batch::RecordBatch,
+    util::display::array_value_to_string,
+};
 use serde::Serialize;
-use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::{
     sync::RwLock,
@@ -15,7 +23,7 @@ use uuid::Uuid;
 
 use crate::{
     config::Config,
-    engine::{Column, QueryEngine, QueryResult},
+    engine::{Column, QueryEngine, QueryResult, QueryResultPage},
     error::{HarborError, Result},
 };
 
@@ -1320,12 +1328,12 @@ fn write_type_desc(writer: &mut Writer, type_id: i32) {
     writer.write_stop();
 }
 
-fn write_row_set(writer: &mut Writer, result: &QueryResult, page: &RowPage<'_>) {
+fn write_row_set(writer: &mut Writer, result: &QueryResult, page: &QueryResultPage) {
     writer.write_field(T_I64, 1, |writer| writer.write_i64(page.start_row_offset));
     writer.write_field(T_LIST, 3, |writer| {
         writer.write_list_begin(T_STRUCT, result.columns.len());
-        for column in &result.columns {
-            write_column(writer, column, page.rows);
+        for (column_index, column) in result.columns.iter().enumerate() {
+            write_column(writer, column, column_index, page);
         }
     });
     writer.write_field(T_I32, 5, |writer| {
@@ -1334,24 +1342,8 @@ fn write_row_set(writer: &mut Writer, result: &QueryResult, page: &RowPage<'_>) 
     writer.write_stop();
 }
 
-struct RowPage<'a> {
-    rows: &'a [Value],
-    start_row_offset: i64,
-    has_more_rows: bool,
-}
-
-fn row_page(result: &QueryResult, start_row_offset: i64, max_rows: Option<i64>) -> RowPage<'_> {
-    let rows = result.rows.as_array().map(Vec::as_slice).unwrap_or(&[]);
-    let start = usize::try_from(start_row_offset.max(0)).unwrap_or(usize::MAX);
-    let start = start.min(rows.len());
-    let limit = requested_row_limit(max_rows);
-    let end = start.saturating_add(limit).min(rows.len());
-
-    RowPage {
-        rows: &rows[start..end],
-        start_row_offset: start as i64,
-        has_more_rows: end < rows.len(),
-    }
+fn row_page(result: &QueryResult, start_row_offset: i64, max_rows: Option<i64>) -> QueryResultPage {
+    result.page(start_row_offset, requested_row_limit(max_rows))
 }
 
 fn requested_row_limit(max_rows: Option<i64>) -> usize {
@@ -1364,32 +1356,44 @@ fn requested_row_limit(max_rows: Option<i64>) -> usize {
     }
 }
 
-fn write_column(writer: &mut Writer, column: &Column, rows: &[Value]) {
+fn write_column(writer: &mut Writer, column: &Column, column_index: usize, page: &QueryResultPage) {
     match column_kind(column).physical_type {
         PhysicalType::Bool => writer.write_field(T_STRUCT, 1, |writer| {
-            write_column_values(writer, T_BOOL, rows, column, |writer, value| {
-                writer.write_bool(value.as_bool().unwrap_or(false));
+            write_column_values(writer, T_BOOL, page, column_index, |writer, array, row| {
+                writer.write_bool(arrow_value_to_bool(array.as_ref(), row));
             });
         }),
         PhysicalType::I32 => writer.write_field(T_STRUCT, 4, |writer| {
-            write_column_values(writer, T_I32, rows, column, |writer, value| {
-                writer.write_i32(value_to_i64(value) as i32);
+            write_column_values(writer, T_I32, page, column_index, |writer, array, row| {
+                writer.write_i32(arrow_value_to_i64(array.as_ref(), row) as i32);
             });
         }),
         PhysicalType::I64 => writer.write_field(T_STRUCT, 5, |writer| {
-            write_column_values(writer, T_I64, rows, column, |writer, value| {
-                writer.write_i64(value_to_i64(value));
+            write_column_values(writer, T_I64, page, column_index, |writer, array, row| {
+                writer.write_i64(arrow_value_to_i64(array.as_ref(), row));
             });
         }),
         PhysicalType::F64 => writer.write_field(T_STRUCT, 6, |writer| {
-            write_column_values(writer, T_DOUBLE, rows, column, |writer, value| {
-                writer.write_double(value.as_f64().unwrap_or_default());
-            });
+            write_column_values(
+                writer,
+                T_DOUBLE,
+                page,
+                column_index,
+                |writer, array, row| {
+                    writer.write_double(arrow_value_to_f64(array.as_ref(), row));
+                },
+            );
         }),
         PhysicalType::String => writer.write_field(T_STRUCT, 7, |writer| {
-            write_column_values(writer, T_STRING, rows, column, |writer, value| {
-                writer.write_string(&value_to_string(value));
-            });
+            write_column_values(
+                writer,
+                T_STRING,
+                page,
+                column_index,
+                |writer, array, row| {
+                    writer.write_string(&arrow_value_to_string(array.as_ref(), row));
+                },
+            );
         }),
     }
     writer.write_stop();
@@ -1398,36 +1402,40 @@ fn write_column(writer: &mut Writer, column: &Column, rows: &[Value]) {
 fn write_column_values<F>(
     writer: &mut Writer,
     value_type: u8,
-    rows: &[Value],
-    column: &Column,
+    page: &QueryResultPage,
+    column_index: usize,
     write_value: F,
 ) where
-    F: Fn(&mut Writer, &Value),
+    F: Fn(&mut Writer, &ArrayRef, usize),
 {
-    let nulls = null_bitset(rows, &column.name);
+    let nulls = null_bitset(&page.batches, column_index, page.row_count);
     writer.write_field(T_LIST, 1, |writer| {
-        writer.write_list_begin(value_type, rows.len());
-        for row in rows {
-            let value = row
-                .as_object()
-                .and_then(|object| object.get(&column.name))
-                .unwrap_or(&Value::Null);
-            write_value(writer, value);
+        writer.write_list_begin(value_type, page.row_count);
+        for batch in &page.batches {
+            let Some(array) = batch.columns().get(column_index) else {
+                continue;
+            };
+            for row in 0..batch.num_rows() {
+                write_value(writer, array, row);
+            }
         }
     });
     writer.write_field(T_STRING, 2, |writer| writer.write_binary(&nulls));
     writer.write_stop();
 }
 
-fn null_bitset(rows: &[Value], column_name: &str) -> Vec<u8> {
-    let mut nulls = vec![0_u8; rows.len().div_ceil(8)];
-    for (index, row) in rows.iter().enumerate() {
-        let is_null = row
-            .as_object()
-            .and_then(|object| object.get(column_name))
-            .is_none_or(Value::is_null);
-        if is_null {
-            nulls[index >> 3] |= 1 << (index & 7);
+fn null_bitset(batches: &[RecordBatch], column_index: usize, row_count: usize) -> Vec<u8> {
+    let mut nulls = vec![0_u8; row_count.div_ceil(8)];
+    let mut page_row = 0;
+    for batch in batches {
+        let Some(array) = batch.columns().get(column_index) else {
+            continue;
+        };
+        for row in 0..batch.num_rows() {
+            if array.is_null(row) {
+                nulls[page_row >> 3] |= 1 << (page_row & 7);
+            }
+            page_row += 1;
         }
     }
     nulls
@@ -1493,19 +1501,146 @@ fn column_kind(column: &Column) -> ColumnKind {
     }
 }
 
-fn value_to_i64(value: &Value) -> i64 {
-    value
-        .as_i64()
-        .or_else(|| value.as_u64().and_then(|value| i64::try_from(value).ok()))
-        .or_else(|| value.as_f64().map(|value| value as i64))
-        .unwrap_or_default()
+fn arrow_value_to_bool(array: &dyn Array, row: usize) -> bool {
+    if array.is_null(row) {
+        return false;
+    }
+
+    match array.data_type() {
+        DataType::Boolean => array
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .map(|array| array.value(row))
+            .unwrap_or_default(),
+        _ => false,
+    }
 }
 
-fn value_to_string(value: &Value) -> String {
-    match value {
-        Value::Null => String::new(),
-        Value::String(value) => value.clone(),
-        other => other.to_string(),
+fn arrow_value_to_i64(array: &dyn Array, row: usize) -> i64 {
+    if array.is_null(row) {
+        return 0;
+    }
+
+    match array.data_type() {
+        DataType::Int8 => array
+            .as_any()
+            .downcast_ref::<Int8Array>()
+            .map(|array| i64::from(array.value(row)))
+            .unwrap_or_default(),
+        DataType::Int16 => array
+            .as_any()
+            .downcast_ref::<Int16Array>()
+            .map(|array| i64::from(array.value(row)))
+            .unwrap_or_default(),
+        DataType::Int32 => array
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .map(|array| i64::from(array.value(row)))
+            .unwrap_or_default(),
+        DataType::Int64 => array
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .map(|array| array.value(row))
+            .unwrap_or_default(),
+        DataType::UInt8 => array
+            .as_any()
+            .downcast_ref::<UInt8Array>()
+            .map(|array| i64::from(array.value(row)))
+            .unwrap_or_default(),
+        DataType::UInt16 => array
+            .as_any()
+            .downcast_ref::<UInt16Array>()
+            .map(|array| i64::from(array.value(row)))
+            .unwrap_or_default(),
+        DataType::UInt32 => array
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .map(|array| i64::from(array.value(row)))
+            .unwrap_or_default(),
+        DataType::UInt64 => array
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .and_then(|array| i64::try_from(array.value(row)).ok())
+            .unwrap_or_default(),
+        DataType::Float32 => array
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .map(|array| array.value(row) as i64)
+            .unwrap_or_default(),
+        DataType::Float64 => array
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .map(|array| array.value(row) as i64)
+            .unwrap_or_default(),
+        _ => 0,
+    }
+}
+
+fn arrow_value_to_f64(array: &dyn Array, row: usize) -> f64 {
+    if array.is_null(row) {
+        return 0.0;
+    }
+
+    match array.data_type() {
+        DataType::Int8 => array
+            .as_any()
+            .downcast_ref::<Int8Array>()
+            .map(|array| f64::from(array.value(row)))
+            .unwrap_or_default(),
+        DataType::Int16 => array
+            .as_any()
+            .downcast_ref::<Int16Array>()
+            .map(|array| f64::from(array.value(row)))
+            .unwrap_or_default(),
+        DataType::Int32 => array
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .map(|array| f64::from(array.value(row)))
+            .unwrap_or_default(),
+        DataType::Int64 => array
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .map(|array| array.value(row) as f64)
+            .unwrap_or_default(),
+        DataType::UInt8 => array
+            .as_any()
+            .downcast_ref::<UInt8Array>()
+            .map(|array| f64::from(array.value(row)))
+            .unwrap_or_default(),
+        DataType::UInt16 => array
+            .as_any()
+            .downcast_ref::<UInt16Array>()
+            .map(|array| f64::from(array.value(row)))
+            .unwrap_or_default(),
+        DataType::UInt32 => array
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .map(|array| f64::from(array.value(row)))
+            .unwrap_or_default(),
+        DataType::UInt64 => array
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .map(|array| array.value(row) as f64)
+            .unwrap_or_default(),
+        DataType::Float32 => array
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .map(|array| f64::from(array.value(row)))
+            .unwrap_or_default(),
+        DataType::Float64 => array
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .map(|array| array.value(row))
+            .unwrap_or_default(),
+        _ => 0.0,
+    }
+}
+
+fn arrow_value_to_string(array: &dyn Array, row: usize) -> String {
+    if array.is_null(row) {
+        String::new()
+    } else {
+        array_value_to_string(array, row).unwrap_or_default()
     }
 }
 
@@ -1741,42 +1876,101 @@ fn _duration_to_ms(duration: Duration) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
+    use datafusion::arrow::{
+        array::{Array, Int32Array},
+        datatypes::{DataType, Field, Schema},
+        record_batch::RecordBatch,
+    };
 
     use super::*;
 
     #[test]
     fn row_page_respects_offset_and_limit() {
-        let result = QueryResult {
-            columns: Vec::new(),
-            rows: json!([
-                {"id": 1},
-                {"id": 2},
-                {"id": 3}
-            ]),
-            row_count: 3,
-        };
+        let result = int_result(&[Some(1), Some(2), Some(3)]);
 
         let page = row_page(&result, 1, Some(1));
 
         assert_eq!(page.start_row_offset, 1);
-        assert_eq!(page.rows, &[json!({"id": 2})]);
+        assert_eq!(page.row_count, 1);
+        let ids = page.batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(ids.value(0), 2);
         assert!(page.has_more_rows);
     }
 
     #[test]
     fn row_page_clamps_negative_offset_and_large_limit() {
-        let result = QueryResult {
-            columns: Vec::new(),
-            rows: json!([{"id": 1}, {"id": 2}]),
-            row_count: 2,
-        };
+        let result = int_result(&[Some(1), Some(2)]);
 
         let page = row_page(&result, -10, Some((MAX_FETCH_ROWS + 100) as i64));
 
         assert_eq!(page.start_row_offset, 0);
-        assert_eq!(page.rows.len(), 2);
+        assert_eq!(page.row_count, 2);
         assert!(!page.has_more_rows);
+    }
+
+    #[test]
+    fn row_page_can_span_record_batches() {
+        let result = int_result_from_batches(&[&[Some(1), Some(2)], &[Some(3), Some(4)]]);
+
+        let page = row_page(&result, 1, Some(2));
+
+        assert_eq!(page.start_row_offset, 1);
+        assert_eq!(page.row_count, 2);
+        assert_eq!(page.batches.len(), 2);
+        let first = page.batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let second = page.batches[1]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(first.value(0), 2);
+        assert_eq!(second.value(0), 3);
+        assert!(page.has_more_rows);
+    }
+
+    #[test]
+    fn null_bitset_reads_arrow_nulls() {
+        let result = int_result(&[Some(1), None, Some(3), None, Some(5)]);
+        let page = row_page(&result, 0, Some(5));
+
+        assert_eq!(
+            null_bitset(&page.batches, 0, page.row_count),
+            vec![0b0000_1010]
+        );
+    }
+
+    fn int_result(values: &[Option<i32>]) -> QueryResult {
+        int_result_from_batches(&[values])
+    }
+
+    fn int_result_from_batches(values: &[&[Option<i32>]]) -> QueryResult {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, true)]));
+        let batches = values
+            .iter()
+            .map(|values| {
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![Arc::new(Int32Array::from(values.to_vec()))],
+                )
+                .unwrap()
+            })
+            .collect();
+        QueryResult::from_batches(
+            vec![Column {
+                name: "id".to_string(),
+                data_type: "Int32".to_string(),
+                nullable: true,
+            }],
+            batches,
+        )
     }
 
     #[test]

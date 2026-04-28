@@ -7,6 +7,7 @@ use std::{
 use arrow_json::ArrayWriter;
 use async_trait::async_trait;
 use datafusion::{
+    arrow::record_batch::RecordBatch,
     catalog::{
         CatalogProvider, MemoryCatalogProvider, SchemaProvider, memory::MemorySchemaProvider,
     },
@@ -19,7 +20,7 @@ use object_store::{
     ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload, PutResult,
     Result as ObjectStoreResult, path::Path as ObjectPath,
 };
-use serde::Serialize;
+use serde::{Serialize, Serializer, ser::SerializeStruct};
 use sqlparser::{
     ast::{
         DateTimeField, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArgumentClause,
@@ -197,7 +198,8 @@ impl QueryEngine {
             .collect();
 
         let mut row_count = 0;
-        let mut writer = ArrayWriter::new(Vec::new());
+        let mut result_bytes = 0_usize;
+        let mut batches = Vec::new();
         while let Some(batch) = stream.next().await {
             let batch = batch?;
             row_count += batch.num_rows();
@@ -209,32 +211,18 @@ impl QueryEngine {
                 )));
             }
 
-            writer.write(&batch)?;
+            result_bytes = result_bytes.saturating_add(batch.get_array_memory_size());
             if let Some(max_bytes) = self.config.max_result_bytes
-                && writer.get_ref().len() > max_bytes
+                && result_bytes > max_bytes
             {
                 return Err(HarborError::Query(format!(
-                    "query result JSON exceeded HARBORSQL_MAX_RESULT_BYTES={max_bytes}",
+                    "query result Arrow pages exceeded HARBORSQL_MAX_RESULT_BYTES={max_bytes}",
                 )));
             }
+            batches.push(batch);
         }
-        writer.finish()?;
-        let buffer = writer.into_inner();
-        if let Some(max_bytes) = self.config.max_result_bytes
-            && buffer.len() > max_bytes
-        {
-            return Err(HarborError::Query(format!(
-                "query result JSON is {} bytes, exceeding HARBORSQL_MAX_RESULT_BYTES={max_bytes}",
-                buffer.len(),
-            )));
-        }
-        let rows = serde_json::from_slice(&buffer)?;
 
-        Ok(QueryResult {
-            columns: schema,
-            rows,
-            row_count,
-        })
+        Ok(QueryResult::from_batches(schema, batches))
     }
 }
 
@@ -296,7 +284,7 @@ struct PrefixRoutingObjectStore {
 
 impl PrefixRoutingObjectStore {
     fn new(mut routes: Vec<ObjectStoreRoute>) -> Self {
-        routes.sort_by(|left, right| right.prefix.len().cmp(&left.prefix.len()));
+        routes.sort_by_key(|route| std::cmp::Reverse(route.prefix.len()));
         Self { routes }
     }
 
@@ -1744,20 +1732,164 @@ impl ResolvedTableRef {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Clone)]
 pub struct QueryResult {
     pub columns: Vec<Column>,
-    pub rows: serde_json::Value,
     pub row_count: usize,
+    store: Arc<dyn ResultStore>,
 }
 
 impl QueryResult {
-    pub fn empty() -> Self {
+    pub fn from_batches(columns: Vec<Column>, batches: Vec<RecordBatch>) -> Self {
+        let store = Arc::new(InlineResultStore::new(batches));
         Self {
-            columns: Vec::new(),
-            rows: serde_json::Value::Array(Vec::new()),
-            row_count: 0,
+            columns,
+            row_count: store.row_count(),
+            store,
         }
+    }
+
+    pub fn empty() -> Self {
+        Self::from_batches(Vec::new(), Vec::new())
+    }
+
+    pub fn page(&self, start_row_offset: i64, limit: usize) -> QueryResultPage {
+        self.store.page(start_row_offset, limit)
+    }
+
+    fn rows_json(&self) -> Result<serde_json::Value> {
+        self.store.rows_json()
+    }
+}
+
+impl fmt::Debug for QueryResult {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("QueryResult")
+            .field("columns", &self.columns)
+            .field("row_count", &self.row_count)
+            .field("store_kind", &self.store.kind())
+            .field("retained_bytes", &self.store.retained_bytes())
+            .finish()
+    }
+}
+
+impl Serialize for QueryResult {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut state = serializer.serialize_struct("QueryResult", 3)?;
+        state.serialize_field("columns", &self.columns)?;
+        state.serialize_field("rows", &JsonRows(self))?;
+        state.serialize_field("row_count", &self.row_count)?;
+        state.end()
+    }
+}
+
+struct JsonRows<'a>(&'a QueryResult);
+
+impl Serialize for JsonRows<'_> {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.0
+            .rows_json()
+            .map_err(serde::ser::Error::custom)?
+            .serialize(serializer)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct QueryResultPage {
+    pub batches: Vec<RecordBatch>,
+    pub start_row_offset: i64,
+    pub row_count: usize,
+    pub has_more_rows: bool,
+}
+
+trait ResultStore: Send + Sync {
+    fn kind(&self) -> &'static str;
+    fn row_count(&self) -> usize;
+    fn retained_bytes(&self) -> usize;
+    fn page(&self, start_row_offset: i64, limit: usize) -> QueryResultPage;
+    fn rows_json(&self) -> Result<serde_json::Value>;
+}
+
+#[derive(Debug)]
+struct InlineResultStore {
+    batches: Vec<RecordBatch>,
+    row_count: usize,
+    retained_bytes: usize,
+}
+
+impl InlineResultStore {
+    fn new(batches: Vec<RecordBatch>) -> Self {
+        let row_count = batches.iter().map(RecordBatch::num_rows).sum();
+        let retained_bytes = batches.iter().map(RecordBatch::get_array_memory_size).sum();
+        Self {
+            batches,
+            row_count,
+            retained_bytes,
+        }
+    }
+}
+
+impl ResultStore for InlineResultStore {
+    fn kind(&self) -> &'static str {
+        "inline-arrow"
+    }
+
+    fn row_count(&self) -> usize {
+        self.row_count
+    }
+
+    fn retained_bytes(&self) -> usize {
+        self.retained_bytes
+    }
+
+    fn page(&self, start_row_offset: i64, limit: usize) -> QueryResultPage {
+        let start = usize::try_from(start_row_offset.max(0)).unwrap_or(usize::MAX);
+        let start = start.min(self.row_count);
+        let end = start.saturating_add(limit).min(self.row_count);
+        let mut remaining_skip = start;
+        let mut remaining_take = end.saturating_sub(start);
+        let mut page_batches = Vec::new();
+
+        for batch in &self.batches {
+            if remaining_take == 0 {
+                break;
+            }
+
+            let batch_rows = batch.num_rows();
+            if remaining_skip >= batch_rows {
+                remaining_skip -= batch_rows;
+                continue;
+            }
+
+            let local_start = remaining_skip;
+            let local_take = (batch_rows - local_start).min(remaining_take);
+            page_batches.push(batch.slice(local_start, local_take));
+            remaining_take -= local_take;
+            remaining_skip = 0;
+        }
+
+        QueryResultPage {
+            batches: page_batches,
+            start_row_offset: start as i64,
+            row_count: end.saturating_sub(start),
+            has_more_rows: end < self.row_count,
+        }
+    }
+
+    fn rows_json(&self) -> Result<serde_json::Value> {
+        let mut writer = ArrayWriter::new(Vec::new());
+        for batch in &self.batches {
+            writer.write(batch)?;
+        }
+        writer.finish()?;
+        Ok(serde_json::from_slice(&writer.into_inner())?)
     }
 }
 
