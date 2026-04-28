@@ -2,6 +2,7 @@ mod config;
 mod engine;
 mod error;
 mod server;
+mod table_cache;
 mod thrift;
 mod udf;
 mod unity;

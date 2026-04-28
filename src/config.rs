@@ -16,6 +16,9 @@ pub const DEFAULT_PARQUET_PUSHDOWN_FILTERS: bool = true;
 pub const DEFAULT_MIN_TARGET_PARTITIONS: usize = 32;
 pub const DEFAULT_SKIP_PARTIAL_AGGREGATION_PROBE_ROWS_THRESHOLD: usize = 10_000;
 pub const DEFAULT_SKIP_PARTIAL_AGGREGATION_PROBE_RATIO_THRESHOLD: f64 = 0.8;
+pub const DEFAULT_TABLE_CACHE_TTL_SECONDS: u64 = 300;
+pub const DEFAULT_TABLE_CACHE_MAX_ENTRIES: usize = 1024;
+pub const TABLE_CACHE_CREDENTIAL_EXPIRY_SKEW_SECONDS: u64 = 60;
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -39,6 +42,9 @@ pub struct Config {
     pub target_partitions: usize,
     pub skip_partial_aggregation_probe_rows_threshold: usize,
     pub skip_partial_aggregation_probe_ratio_threshold: f64,
+    pub table_cache_ttl: Duration,
+    pub table_cache_max_entries: usize,
+    pub table_cache_credential_expiry_skew: Duration,
 }
 
 impl Config {
@@ -123,6 +129,17 @@ impl Config {
                 "HARBORSQL_SKIP_PARTIAL_AGGREGATION_PROBE_RATIO_THRESHOLD",
                 DEFAULT_SKIP_PARTIAL_AGGREGATION_PROBE_RATIO_THRESHOLD,
             )?,
+            table_cache_ttl: parse_duration_seconds_env_allow_zero(
+                "HARBORSQL_TABLE_CACHE_TTL_SECONDS",
+                DEFAULT_TABLE_CACHE_TTL_SECONDS,
+            )?,
+            table_cache_max_entries: parse_usize_env_allow_zero(
+                "HARBORSQL_TABLE_CACHE_MAX_ENTRIES",
+                DEFAULT_TABLE_CACHE_MAX_ENTRIES,
+            )?,
+            table_cache_credential_expiry_skew: Duration::from_secs(
+                TABLE_CACHE_CREDENTIAL_EXPIRY_SKEW_SECONDS,
+            ),
         })
     }
 }
@@ -161,6 +178,15 @@ fn parse_usize_env(name: &str, default: usize) -> Result<usize> {
     }
 }
 
+fn parse_usize_env_allow_zero(name: &str, default: usize) -> Result<usize> {
+    match env::var(name) {
+        Ok(value) => value
+            .parse()
+            .map_err(|err| HarborError::Config(format!("invalid {name}: {err}"))),
+        Err(_) => Ok(default),
+    }
+}
+
 fn parse_duration_seconds_env(name: &str, default: u64) -> Result<Duration> {
     match env::var(name) {
         Ok(value) => {
@@ -174,6 +200,16 @@ fn parse_duration_seconds_env(name: &str, default: u64) -> Result<Duration> {
             }
             Ok(Duration::from_secs(parsed))
         }
+        Err(_) => Ok(Duration::from_secs(default)),
+    }
+}
+
+fn parse_duration_seconds_env_allow_zero(name: &str, default: u64) -> Result<Duration> {
+    match env::var(name) {
+        Ok(value) => value
+            .parse()
+            .map(Duration::from_secs)
+            .map_err(|err| HarborError::Config(format!("invalid {name}: {err}"))),
         Err(_) => Ok(Duration::from_secs(default)),
     }
 }
@@ -249,6 +285,25 @@ mod tests {
         temp_set_var("HARBORSQL_TEST_RATIO", "-0.1");
         assert!(parse_ratio_env("HARBORSQL_TEST_RATIO", 0.8).is_err());
         temp_remove_var("HARBORSQL_TEST_RATIO");
+    }
+
+    #[test]
+    fn cache_config_allows_zero_to_disable_cache() {
+        temp_set_var("HARBORSQL_TEST_TABLE_CACHE_TTL_SECONDS", "0");
+        temp_set_var("HARBORSQL_TEST_TABLE_CACHE_MAX_ENTRIES", "0");
+
+        assert_eq!(
+            parse_duration_seconds_env_allow_zero("HARBORSQL_TEST_TABLE_CACHE_TTL_SECONDS", 300)
+                .unwrap(),
+            Duration::ZERO
+        );
+        assert_eq!(
+            parse_usize_env_allow_zero("HARBORSQL_TEST_TABLE_CACHE_MAX_ENTRIES", 1024).unwrap(),
+            0
+        );
+
+        temp_remove_var("HARBORSQL_TEST_TABLE_CACHE_TTL_SECONDS");
+        temp_remove_var("HARBORSQL_TEST_TABLE_CACHE_MAX_ENTRIES");
     }
 
     fn temp_set_var(key: &str, value: &str) {
