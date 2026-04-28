@@ -3,7 +3,7 @@ use std::time::Duration;
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 
-use crate::error::{HarborError, Result};
+use crate::error::{HarborError, Result, redact_and_truncate};
 
 #[derive(Clone)]
 pub struct UnityCatalogClient {
@@ -87,25 +87,15 @@ where
 
     let body = response.text().await.unwrap_or_default();
     if let Ok(error) = serde_json::from_str::<DatabricksError>(&body) {
-        return Err(HarborError::Unity(format!(
+        let detail = format!(
             "{}: {}",
             error.error_code.unwrap_or_else(|| status.to_string()),
             error.message
-        )));
+        );
+        return Err(HarborError::Unity(redact_and_truncate(&detail, 600)));
     }
-    Err(HarborError::Unity(format!(
-        "HTTP {} from Unity Catalog: {}",
-        status,
-        truncate(&body, 600)
-    )))
-}
-
-fn truncate(value: &str, max_len: usize) -> String {
-    if value.len() <= max_len {
-        value.to_string()
-    } else {
-        format!("{}...", &value[..max_len])
-    }
+    let detail = format!("HTTP {} from Unity Catalog: {}", status, body);
+    Err(HarborError::Unity(redact_and_truncate(&detail, 600)))
 }
 
 #[derive(Debug, Deserialize)]
