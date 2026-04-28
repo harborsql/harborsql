@@ -23,12 +23,14 @@ For each query, HarborSQL:
 1. Reads the bearer token from the Databricks SQL client request.
 2. Uses that token to call Unity Catalog.
 3. Resolves referenced Delta tables.
-4. Requests temporary table credentials from Unity Catalog.
-5. Registers Delta table providers in DataFusion.
-6. Executes the SQL query locally.
-7. Returns rows through the Databricks SQL connector protocol.
+4. Reuses an in-memory, token-scoped table cache when the caller already has
+   fresh Unity temporary table credentials for that table.
+5. Requests temporary table credentials from Unity Catalog on cache misses.
+6. Registers Delta table providers in DataFusion.
+7. Executes the SQL query locally.
+8. Returns rows through the Databricks SQL connector protocol.
 
-Authorization remains anchored in Unity Catalog. HarborSQL does not persist Databricks bearer tokens or temporary cloud credentials.
+Authorization remains anchored in Unity Catalog. HarborSQL does not persist Databricks bearer tokens or temporary cloud credentials. Cached table entries are keyed by a process-local HMAC of the caller's bearer token and expire before Unity temporary credentials expire.
 
 ## Requirements
 
@@ -63,6 +65,8 @@ HarborSQL reads configuration from environment variables:
 | `HARBORSQL_TARGET_PARTITIONS` | no | max of available CPU parallelism and `32` | DataFusion target partition count; higher values improve S3 scan concurrency for ordered-limit scans |
 | `HARBORSQL_SKIP_PARTIAL_AGGREGATION_PROBE_ROWS_THRESHOLD` | no | `10000` | Rows per partition DataFusion samples before bypassing partial aggregation for high-cardinality group keys |
 | `HARBORSQL_SKIP_PARTIAL_AGGREGATION_PROBE_RATIO_THRESHOLD` | no | `0.8` | Distinct-groups/input-rows ratio that triggers partial aggregation bypass |
+| `HARBORSQL_TABLE_CACHE_TTL_SECONDS` | no | `300` | Maximum lifetime for token-scoped cached table providers; set to `0` to disable |
+| `HARBORSQL_TABLE_CACHE_MAX_ENTRIES` | no | `1024` | Maximum token/table/region cache entries; set to `0` to disable |
 | `DATABRICKS_TOKEN` | query mode only | none | Token used by `harborsql query --sql ...` |
 
 ## Run The Server
@@ -199,5 +203,7 @@ Keep environment-specific benchmark data, workspace identifiers, storage paths, 
 
 - Do not log or persist bearer tokens.
 - Do not log or persist temporary cloud credentials.
+- Table cache entries are per bearer-token fingerprint, in-memory only, bounded,
+  and expire before Unity temporary table credentials expire.
 - Treat Unity Catalog as the authorization source of truth.
 - Keep concrete workspace, schema, bucket, table, and credential identifiers in private runbooks.

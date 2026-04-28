@@ -37,6 +37,7 @@ use url::Url;
 use crate::{
     config::Config,
     error::{HarborError, Result},
+    table_cache::{CachedTable, TableCache, expires_at_from_unity_expiration_ms},
     udf,
     unity::{TemporaryTableCredentials, UnityCatalogClient},
 };
@@ -45,15 +46,18 @@ use crate::{
 pub struct QueryEngine {
     config: Config,
     unity: UnityCatalogClient,
+    table_cache: TableCache,
 }
 
 impl QueryEngine {
     pub fn new(config: Config) -> Self {
+        let table_cache = TableCache::new(config.table_cache_max_entries, config.table_cache_ttl);
         Self {
             unity: UnityCatalogClient::new(
                 config.databricks_host.clone(),
                 config.unity_request_timeout,
             ),
+            table_cache,
             config,
         }
     }
@@ -126,29 +130,28 @@ impl QueryEngine {
 
         for table_ref in refs {
             let full_name = table_ref.full_name();
-            let table = self.unity.table(bearer_token, &full_name).await?;
-            ensure_delta_table(&table)?;
-
-            let credentials = self
-                .unity
-                .temporary_table_credentials(bearer_token, &table.table_id)
+            let unity = self.unity.clone();
+            let config = self.config.clone();
+            let full_name_for_load = full_name.clone();
+            let cached_table = self
+                .table_cache
+                .get_or_load(
+                    bearer_token,
+                    &full_name,
+                    &self.config.aws_region,
+                    || async move {
+                        load_cached_table(&unity, &config, bearer_token, &full_name_for_load).await
+                    },
+                )
                 .await?;
-            let _credential_expiration_time_ms = credentials.expiration_time;
-            let delta = open_table_with_storage_options(
-                Url::parse(&credentials.url)?,
-                storage_options(&credentials, &self.config.aws_region),
-            )
-            .await?;
-            let (object_store_url, object_prefix) = table_object_store_route(&credentials.url)?;
             object_store_routes
-                .entry(object_store_url.to_string())
-                .or_insert_with(|| (object_store_url.clone(), Vec::new()))
+                .entry(cached_table.object_store_url.to_string())
+                .or_insert_with(|| (cached_table.object_store_url.clone(), Vec::new()))
                 .1
                 .push(ObjectStoreRoute {
-                    prefix: object_prefix,
-                    store: delta.log_store().root_object_store(None),
+                    prefix: cached_table.object_prefix.clone(),
+                    store: cached_table.object_store.clone(),
                 });
-            let provider = delta.table_provider().await?;
 
             let catalog = catalogs
                 .entry(table_ref.catalog.clone())
@@ -172,7 +175,7 @@ impl QueryEngine {
                 .clone();
 
             schema
-                .register_table(table_ref.table.clone(), provider)
+                .register_table(table_ref.table.clone(), cached_table.provider.clone())
                 .map_err(HarborError::DataFusion)?;
         }
 
@@ -224,6 +227,40 @@ impl QueryEngine {
 
         Ok(QueryResult::from_batches(schema, batches))
     }
+}
+
+async fn load_cached_table(
+    unity: &UnityCatalogClient,
+    config: &Config,
+    bearer_token: &str,
+    full_name: &str,
+) -> Result<CachedTable> {
+    let table = unity.table(bearer_token, full_name).await?;
+    ensure_delta_table(&table)?;
+
+    let credentials = unity
+        .temporary_table_credentials(bearer_token, &table.table_id)
+        .await?;
+    let credential_expires_at = expires_at_from_unity_expiration_ms(
+        credentials.expiration_time,
+        config.table_cache_credential_expiry_skew,
+    );
+    let delta = open_table_with_storage_options(
+        Url::parse(&credentials.url)?,
+        storage_options(&credentials, &config.aws_region),
+    )
+    .await?;
+    let (object_store_url, object_prefix) = table_object_store_route(&credentials.url)?;
+    let object_store = delta.log_store().root_object_store(None);
+    let provider = delta.table_provider().await?;
+
+    Ok(CachedTable::new(
+        provider,
+        object_store_url,
+        object_prefix,
+        object_store,
+        credential_expires_at,
+    ))
 }
 
 fn ensure_delta_table(table: &crate::unity::TableInfo) -> Result<()> {
