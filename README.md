@@ -88,6 +88,7 @@ HarborSQL reads configuration from environment variables:
 | `HARBORSQL_SKIP_PARTIAL_AGGREGATION_PROBE_RATIO_THRESHOLD` | no | `0.8` | Distinct-groups/input-rows ratio that triggers partial aggregation bypass |
 | `HARBORSQL_TABLE_CACHE_TTL_SECONDS` | no | `300` | Maximum lifetime for token-scoped cached table providers; set to `0` to disable |
 | `HARBORSQL_TABLE_CACHE_MAX_ENTRIES` | no | `1024` | Maximum token/table/region cache entries; set to `0` to disable |
+| `HARBORSQL_UNSAFE_LOG_SQL` | no | `false` | Include redacted SQL text in internal tracing spans for controlled debugging; SQL is omitted from logs by default |
 | `DATABRICKS_TOKEN` | query mode only | none | Token used by `harborsql query --sql ...` |
 
 ## Run The Server
@@ -102,6 +103,25 @@ cargo run -- server
 ```
 
 The server listens on `127.0.0.1:1992` by default.
+
+## Observability
+
+HarborSQL emits structured `tracing` spans for HTTP requests, Thrift RPCs,
+query execution, Unity Catalog calls, Delta table opens, DataFusion planning and
+execution, result materialization, fetches, and operation cancellation. HTTP
+responses include an `x-request-id`; callers can provide one or let HarborSQL
+generate it.
+
+Prometheus-format metrics are available at `/metrics`. The current metric set
+includes HTTP/Thrift request counts and timings, query lifecycle counters,
+Unity/Delta/DataFusion/materialization timings, result row/byte counters,
+session/operation gauges, fetch counters, and cancellation counters. Expose
+`/metrics` only on a trusted network or through an authenticated monitoring
+proxy.
+
+SQL text is not logged by default. Query spans include a stable SQL hash and
+length; set `HARBORSQL_UNSAFE_LOG_SQL=true` only in controlled debugging
+environments to include centrally redacted SQL text.
 
 Parquet late materialization is enabled by default. To disable it for comparison runs:
 

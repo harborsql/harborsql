@@ -1,7 +1,12 @@
+use std::time::Instant;
+
 use datafusion::execution::SendableRecordBatchStream;
 use futures::StreamExt;
 
-use crate::error::{HarborError, Result};
+use crate::{
+    error::{HarborError, Result},
+    observability,
+};
 
 use super::{Column, QueryResult};
 
@@ -15,6 +20,7 @@ pub(super) async fn materialize_stream(
     mut stream: SendableRecordBatchStream,
     limits: ResultLimits,
 ) -> Result<QueryResult> {
+    let started = Instant::now();
     let stream_schema = stream.schema();
     let fields = stream_schema.fields();
     let schema = fields
@@ -39,6 +45,12 @@ pub(super) async fn materialize_stream(
         if let Some(max_rows) = limits.max_rows
             && row_count > max_rows
         {
+            observability::get()
+                .metrics()
+                .observe_duration("result_materialization", started.elapsed());
+            observability::get()
+                .metrics()
+                .increment("harborsql_result_limit_errors_total");
             return Err(HarborError::Query(format!(
                 "query returned more than HARBORSQL_MAX_RESULT_ROWS={max_rows}",
             )));
@@ -48,6 +60,12 @@ pub(super) async fn materialize_stream(
         if let Some(max_bytes) = limits.max_bytes
             && result_bytes > max_bytes
         {
+            observability::get()
+                .metrics()
+                .observe_duration("result_materialization", started.elapsed());
+            observability::get()
+                .metrics()
+                .increment("harborsql_result_limit_errors_total");
             return Err(HarborError::Query(format!(
                 "query result Arrow pages exceeded HARBORSQL_MAX_RESULT_BYTES={max_bytes}",
             )));
@@ -55,7 +73,16 @@ pub(super) async fn materialize_stream(
         batches.push(batch);
     }
 
-    Ok(QueryResult::from_batches_with_data_types(
-        schema, data_types, batches,
-    ))
+    let result = QueryResult::from_batches_with_data_types(schema, data_types, batches);
+    let metrics = observability::get().metrics();
+    metrics.observe_duration("result_materialization", started.elapsed());
+    metrics.add("harborsql_result_rows_total", row_count as u64);
+    metrics.add("harborsql_result_arrow_bytes_total", result_bytes as u64);
+    tracing::info!(
+        row_count,
+        arrow_bytes = result_bytes,
+        duration_ms = started.elapsed().as_millis() as u64,
+        "result materialized"
+    );
+    Ok(result)
 }

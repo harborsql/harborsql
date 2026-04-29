@@ -13,11 +13,13 @@ use datafusion::{
 };
 use deltalake::{logstore::LogStore, open_table_with_storage_options};
 use object_store::{ObjectStore, path::Path as ObjectPath};
+use tracing::Instrument;
 use url::Url;
 
 use crate::{
     config::Config,
     error::{HarborError, Result},
+    observability,
     table_cache::{CachedTable, TableCache, expires_at_from_unity_expiration_ms},
     unity::{TableInfo, TemporaryTableCredentials, UnityCatalogClient},
 };
@@ -36,7 +38,17 @@ pub(super) trait UnityCatalog: Send + Sync {
 #[async_trait]
 impl UnityCatalog for UnityCatalogClient {
     async fn table(&self, bearer_token: &str, full_name: &str) -> Result<TableInfo> {
-        UnityCatalogClient::table(self, bearer_token, full_name).await
+        let started = Instant::now();
+        let identifier_hash = observability::stable_hash(full_name);
+        let result = UnityCatalogClient::table(self, bearer_token, full_name)
+            .instrument(tracing::info_span!(
+                "unity_call",
+                stage = "table",
+                identifier_hash = %identifier_hash
+            ))
+            .await;
+        observe_unity_call("unity_table", full_name, started, &result);
+        result
     }
 
     async fn temporary_table_credentials(
@@ -44,7 +56,17 @@ impl UnityCatalog for UnityCatalogClient {
         bearer_token: &str,
         table_id: &str,
     ) -> Result<TemporaryTableCredentials> {
-        UnityCatalogClient::temporary_table_credentials(self, bearer_token, table_id).await
+        let started = Instant::now();
+        let identifier_hash = observability::stable_hash(table_id);
+        let result = UnityCatalogClient::temporary_table_credentials(self, bearer_token, table_id)
+            .instrument(tracing::info_span!(
+                "unity_call",
+                stage = "temporary_table_credentials",
+                identifier_hash = %identifier_hash
+            ))
+            .await;
+        observe_unity_call("unity_credentials", table_id, started, &result);
+        result
     }
 }
 
@@ -276,22 +298,87 @@ impl TableOpener for DeltaTableOpener {
         aws_region: &str,
         credential_expires_at: Instant,
     ) -> Result<CachedTable> {
-        let delta = open_table_with_storage_options(
-            Url::parse(&credentials.url)?,
-            storage_options(credentials, aws_region),
-        )
-        .await?;
-        let (object_store_url, object_prefix) = table_object_store_route(&credentials.url)?;
-        let object_store = delta.log_store().root_object_store(None);
-        let provider = delta.table_provider().await?;
+        let started = Instant::now();
+        let table_url_hash = observability::stable_hash(&credentials.url);
+        let result: Result<CachedTable> = async {
+            let delta = open_table_with_storage_options(
+                Url::parse(&credentials.url)?,
+                storage_options(credentials, aws_region),
+            )
+            .await?;
+            let (object_store_url, object_prefix) = table_object_store_route(&credentials.url)?;
+            let object_store = delta.log_store().root_object_store(None);
+            let provider = delta.table_provider().await?;
 
-        Ok(CachedTable::new(
-            provider,
-            object_store_url,
-            object_prefix,
-            object_store,
-            credential_expires_at,
+            Ok(CachedTable::new(
+                provider,
+                object_store_url,
+                object_prefix,
+                object_store,
+                credential_expires_at,
+            ))
+        }
+        .instrument(tracing::info_span!(
+            "delta_open",
+            table_url_hash = %table_url_hash
         ))
+        .await;
+
+        let duration = started.elapsed();
+        let metrics = observability::get().metrics();
+        metrics.observe_duration("delta_open", duration);
+        match &result {
+            Ok(_) => metrics.increment("harborsql_delta_open_succeeded_total"),
+            Err(error) => {
+                metrics.increment("harborsql_delta_open_failed_total");
+                tracing::warn!(
+                    table_url_hash = %table_url_hash,
+                    duration_ms = duration.as_millis() as u64,
+                    internal_error = %error.redacted_internal_message(),
+                    "Delta table open failed"
+                );
+            }
+        }
+        if result.is_ok() {
+            tracing::info!(
+                table_url_hash = %table_url_hash,
+                duration_ms = duration.as_millis() as u64,
+                "Delta table opened"
+            );
+        }
+        result
+    }
+}
+
+fn observe_unity_call<T>(
+    stage: &'static str,
+    identifier: &str,
+    started: Instant,
+    result: &Result<T>,
+) {
+    let duration = started.elapsed();
+    let metrics = observability::get().metrics();
+    metrics.observe_duration(stage, duration);
+    match result {
+        Ok(_) => metrics.increment("harborsql_unity_requests_succeeded_total"),
+        Err(error) => {
+            metrics.increment("harborsql_unity_requests_failed_total");
+            tracing::warn!(
+                stage,
+                identifier_hash = %observability::stable_hash(identifier),
+                duration_ms = duration.as_millis() as u64,
+                internal_error = %error.redacted_internal_message(),
+                "Unity Catalog call failed"
+            );
+        }
+    }
+    if result.is_ok() {
+        tracing::info!(
+            stage,
+            identifier_hash = %observability::stable_hash(identifier),
+            duration_ms = duration.as_millis() as u64,
+            "Unity Catalog call completed"
+        );
     }
 }
 

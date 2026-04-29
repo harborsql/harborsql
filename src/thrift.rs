@@ -5,12 +5,14 @@ use std::{
 };
 
 use tokio::{sync::RwLock, task::JoinHandle};
+use tracing::{Instrument, field};
 use uuid::Uuid;
 
 use crate::{
     config::Config,
     engine::{QueryEngine, QueryResult},
     error::{HarborError, Result},
+    observability,
 };
 
 mod codec;
@@ -21,7 +23,7 @@ mod state;
 use codec::{Reader, Writer};
 use protocol::*;
 use result_encoding::{
-    write_fetch_results_response_struct, write_result_set_metadata_response,
+    row_page, write_fetch_results_response_struct, write_result_set_metadata_response,
     write_result_set_metadata_response_with_error,
 };
 pub use state::QueryHistory;
@@ -60,7 +62,37 @@ impl DatabricksThriftService {
     }
 
     pub async fn handle(&self, bearer_token: &str, body: &[u8]) -> Result<Vec<u8>> {
-        let message = decode_message(body)?;
+        let started = Instant::now();
+        let message = match decode_message(body) {
+            Ok(message) => message,
+            Err(error) => {
+                observability::get()
+                    .metrics()
+                    .observe_thrift("decode", "error", started.elapsed());
+                return Err(error);
+            }
+        };
+        let method = message.name.clone();
+        let seqid = message.seqid;
+        let result = self
+            .handle_decoded(bearer_token, message)
+            .instrument(tracing::info_span!("thrift_rpc", method = %method, seqid))
+            .await;
+        observability::get().metrics().observe_thrift(
+            &method,
+            if result.is_ok() { "ok" } else { "error" },
+            started.elapsed(),
+        );
+        if let Ok(response) = &result {
+            observability::get().metrics().add(
+                "harborsql_thrift_response_bytes_total",
+                response.len() as u64,
+            );
+        }
+        result
+    }
+
+    async fn handle_decoded(&self, bearer_token: &str, message: Message<'_>) -> Result<Vec<u8>> {
         if message.message_type != T_MESSAGE_CALL {
             return Ok(write_application_exception(
                 &message.name,
@@ -93,13 +125,20 @@ impl DatabricksThriftService {
                 sessions.insert(
                     session_id_string.clone(),
                     SessionState {
-                        id: session_id_string,
+                        id: session_id_string.clone(),
                         secret: *secret.as_bytes(),
                         token_fingerprint: token_fingerprint(bearer_token),
                         catalog: catalog.clone(),
                         schema: schema.clone(),
                         last_access: Instant::now(),
                     },
+                );
+                record_session_gauge(&sessions);
+                tracing::info!(
+                    session_id = %session_id_string,
+                    catalog_hash = %observability::stable_hash(&catalog),
+                    schema_hash = %observability::stable_hash(&schema),
+                    "Thrift session opened"
                 );
 
                 Ok(write_open_session_response(
@@ -137,6 +176,7 @@ impl DatabricksThriftService {
                 let token = bearer_token.to_string();
                 let catalog = session.catalog.clone();
                 let schema = session.schema.clone();
+                let execution_query_id = query_id.clone();
                 let mut operations = self.operations.write().await;
                 if operations.len() >= self.config.max_operations {
                     return Ok(write_execute_statement_error(
@@ -144,20 +184,72 @@ impl DatabricksThriftService {
                         "maximum operation count exceeded",
                     ));
                 }
+                let sql_observation = observability::get().sql_observation(&statement);
+                let operation_span = tracing::info_span!(
+                    "thrift_operation",
+                    query_id = %query_id,
+                    session_id = %session.id,
+                    sql_hash = %sql_observation.hash,
+                    sql_len = sql_observation.len,
+                    sql = field::Empty,
+                );
+                if let Some(sql) = sql_observation.text.as_deref() {
+                    operation_span.record("sql", field::display(sql));
+                }
+                observability::get()
+                    .metrics()
+                    .increment("harborsql_thrift_operations_started_total");
+                tracing::info!(
+                    query_id = %query_id,
+                    session_id = %session.id,
+                    sql_hash = %sql_observation.hash,
+                    "Thrift operation started"
+                );
                 let task = tokio::spawn(async move {
-                    let started = Instant::now();
-                    let result = if is_noop_statement(&statement) {
-                        Ok(QueryResult::empty())
-                    } else {
-                        engine.execute(&token, &statement, &catalog, &schema).await
-                    };
-                    OperationCompletion {
-                        duration_ms: started.elapsed().as_millis() as u64,
-                        result: result.map_err(|err| {
-                            err.log_internal("thrift operation");
-                            err.client_error()
-                        }),
+                    async move {
+                        let started = Instant::now();
+                        let result = if is_noop_statement(&statement) {
+                            Ok(QueryResult::empty())
+                        } else {
+                            engine
+                                .execute_with_query_id(
+                                    Some(&execution_query_id),
+                                    &token,
+                                    &statement,
+                                    &catalog,
+                                    &schema,
+                                )
+                                .await
+                        };
+                        let duration = started.elapsed();
+                        observability::get()
+                            .metrics()
+                            .observe_duration("thrift_operation_execution", duration);
+                        match &result {
+                            Ok(result) => {
+                                observability::get()
+                                    .metrics()
+                                    .increment("harborsql_thrift_operations_succeeded_total");
+                                tracing::info!(
+                                    duration_ms = duration.as_millis() as u64,
+                                    row_count = result.row_count,
+                                    "Thrift operation execution finished"
+                                );
+                            }
+                            Err(error) => {
+                                observability::get()
+                                    .metrics()
+                                    .increment("harborsql_thrift_operations_failed_total");
+                                error.log_internal("thrift operation");
+                            }
+                        }
+                        OperationCompletion {
+                            duration_ms: duration.as_millis() as u64,
+                            result: result.map_err(|err| err.client_error()),
+                        }
                     }
+                    .instrument(operation_span)
+                    .await
                 });
 
                 operations.insert(
@@ -172,6 +264,7 @@ impl DatabricksThriftService {
                         },
                     },
                 );
+                record_operation_gauges(&operations);
                 Ok(write_execute_statement_response(
                     message.seqid,
                     operation_id.as_bytes(),
@@ -213,24 +306,51 @@ impl DatabricksThriftService {
             }
             "FetchResults" => {
                 let request = read_args(message.payload, read_fetch_results_req)?;
+                let query_id = request
+                    .operation_handle
+                    .as_ref()
+                    .map(|handle| handle.id.as_str())
+                    .unwrap_or("");
                 Ok(self
                     .with_operation(
                         request.operation_handle.as_ref(),
                         bearer_token,
                         |operation| match operation.state.result() {
-                            Some(result) => write_fetch_results_response(
-                                message.seqid,
-                                result,
-                                true,
-                                request.start_row_offset.unwrap_or(0),
-                                request.max_rows,
-                            ),
+                            Some(result) => {
+                                let start_row_offset = request.start_row_offset.unwrap_or(0);
+                                let page = row_page(result, start_row_offset, request.max_rows);
+                                let response = write_fetch_results_response(
+                                    message.seqid,
+                                    result,
+                                    true,
+                                    start_row_offset,
+                                    request.max_rows,
+                                );
+                                let metrics = observability::get().metrics();
+                                metrics.increment("harborsql_thrift_fetches_total");
+                                metrics.add(
+                                    "harborsql_thrift_fetch_rows_total",
+                                    page.row_count as u64,
+                                );
+                                metrics.add(
+                                    "harborsql_thrift_fetch_response_bytes_total",
+                                    response.len() as u64,
+                                );
+                                tracing::info!(
+                                    row_count = page.row_count,
+                                    has_more_rows = page.has_more_rows,
+                                    response_bytes = response.len(),
+                                    "Thrift results fetched"
+                                );
+                                response
+                            }
                             None => {
                                 let error = operation.state.error_message();
                                 write_fetch_results_not_ready(message.seqid, error.as_deref())
                             }
                         },
                     )
+                    .instrument(tracing::info_span!("thrift_fetch", query_id = %query_id))
                     .await
                     .unwrap_or_else(|| write_fetch_results_invalid(message.seqid)))
             }
@@ -243,8 +363,14 @@ impl DatabricksThriftService {
             }
             "CancelOperation" => {
                 let request = read_args(message.payload, read_operation_req)?;
+                let query_id = request
+                    .operation_handle
+                    .as_ref()
+                    .map(|handle| handle.id.as_str())
+                    .unwrap_or("");
                 let canceled = self
                     .cancel_operation(request.operation_handle.as_ref(), bearer_token)
+                    .instrument(tracing::info_span!("thrift_cancel", query_id = %query_id))
                     .await;
                 Ok(write_cancel_operation_response(message.seqid, canceled))
             }
@@ -311,14 +437,17 @@ impl DatabricksThriftService {
             return false;
         }
         sessions.remove(&handle.id);
+        record_session_gauge(&sessions);
         drop(sessions);
 
         self.remove_operations_for_session(&handle.id).await;
+        tracing::info!(session_id = %handle.id, "Thrift session closed");
         true
     }
 
     async fn remove_operations_for_session(&self, session_id: &str) {
-        self.operations.write().await.retain(|_, operation| {
+        let mut operations = self.operations.write().await;
+        operations.retain(|_, operation| {
             if operation.session_id == session_id {
                 operation.abort();
                 false
@@ -326,6 +455,7 @@ impl DatabricksThriftService {
                 true
             }
         });
+        record_operation_gauges(&operations);
     }
 
     async fn touch_session(&self, session_id: &str) {
@@ -369,6 +499,11 @@ impl DatabricksThriftService {
         });
         if valid && let Some(operation) = operations.remove(&handle.id) {
             operation.abort();
+            observability::get()
+                .metrics()
+                .increment("harborsql_thrift_operations_closed_total");
+            record_operation_gauges(&operations);
+            tracing::info!(query_id = %handle.id, "Thrift operation closed");
         }
         valid
     }
@@ -387,6 +522,11 @@ impl DatabricksThriftService {
             return false;
         }
         operation.cancel();
+        observability::get()
+            .metrics()
+            .increment("harborsql_thrift_operations_canceled_total");
+        record_operation_gauges(&operations);
+        tracing::info!(query_id = %handle.id, "Thrift operation canceled");
         true
     }
 
@@ -402,7 +542,14 @@ impl DatabricksThriftService {
             let mut operations = self.operations.write().await;
             if let Some(operation) = operations.get_mut(operation_id) {
                 operation.finish_refresh(started, result);
+                tracing::info!(
+                    query_id = %operation_id,
+                    status = operation.state.history_status(),
+                    duration_ms = operation.state.duration_ms(),
+                    "Thrift operation completed"
+                );
             }
+            record_operation_gauges(&operations);
         };
     }
 
@@ -437,7 +584,8 @@ impl DatabricksThriftService {
             expired_sessions
         };
 
-        self.operations.write().await.retain(|_, operation| {
+        let mut operations = self.operations.write().await;
+        operations.retain(|_, operation| {
             if expired_sessions.contains(&operation.session_id)
                 || operation.is_expired(now, self.config.completed_operation_ttl)
             {
@@ -447,7 +595,24 @@ impl DatabricksThriftService {
                 true
             }
         });
+        record_operation_gauges(&operations);
     }
+}
+
+fn record_session_gauge(sessions: &HashMap<String, SessionState>) {
+    observability::get()
+        .metrics()
+        .set_gauge("harborsql_thrift_sessions", sessions.len() as i64);
+}
+
+fn record_operation_gauges(operations: &HashMap<String, OperationState>) {
+    let active = operations
+        .values()
+        .filter(|operation| operation.is_active())
+        .count();
+    let metrics = observability::get().metrics();
+    metrics.set_gauge("harborsql_thrift_operations", operations.len() as i64);
+    metrics.set_gauge("harborsql_thrift_active_operations", active as i64);
 }
 
 #[derive(Debug)]
