@@ -480,8 +480,10 @@ impl fmt::Debug for ObjectStoreRoute {
 
 #[derive(Clone, Default)]
 pub(super) struct ObjectStoreRouteRegistry {
-    routes: Arc<Mutex<HashMap<String, (Url, Vec<ObjectStoreRoute>)>>>,
+    routes: Arc<Mutex<ObjectStoreRoutes>>,
 }
+
+type ObjectStoreRoutes = HashMap<String, (Url, Vec<ObjectStoreRoute>)>;
 
 impl ObjectStoreRouteRegistry {
     pub(super) fn record(&self, cached_table: &CachedTable) -> Result<()> {
