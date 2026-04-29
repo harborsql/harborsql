@@ -27,6 +27,17 @@ const GOLDEN_OPEN_SESSION_REQUEST: &[u8] = &[
     b'e', b'f', b'a', b'u', b'l', b't', 0x00, 0x00, 0x00,
 ];
 
+const GOLDEN_FETCH_RESULTS_REQUEST: &[u8] = &[
+    0x80, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x0c, b'F', b'e', b't', b'c', b'h', b'R', b'e', b's',
+    b'u', b'l', b't', b's', 0x00, 0x00, 0x00, 0x0b, 0x0c, 0x00, 0x01, 0x0c, 0x00, 0x01, 0x0c, 0x00,
+    0x01, 0x0b, 0x00, 0x01, 0x00, 0x00, 0x00, 0x10, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+    0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x0b, 0x00, 0x02, 0x00, 0x00, 0x00, 0x10, 0x10,
+    0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x00,
+    0x08, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x03, 0x01, 0x00, 0x0a, 0x00, 0x03, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x0a, 0x05, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x01, 0x00, 0x00,
+];
+
 #[test]
 fn golden_open_session_request_decodes() {
     let message = decode_message(GOLDEN_OPEN_SESSION_REQUEST).unwrap();
@@ -38,6 +49,27 @@ fn golden_open_session_request_decodes() {
     let request = read_args(message.payload, read_open_session_req).unwrap();
     assert_eq!(request.catalog.as_deref(), Some("main"));
     assert_eq!(request.schema.as_deref(), Some("default"));
+}
+
+#[test]
+fn golden_fetch_results_request_decodes_operation_handle_and_pagination() {
+    let message = decode_message(GOLDEN_FETCH_RESULTS_REQUEST).unwrap();
+
+    assert_eq!(message.name, "FetchResults");
+    assert_eq!(message.message_type, T_MESSAGE_CALL);
+    assert_eq!(message.seqid, 11);
+
+    let request = read_args(message.payload, read_fetch_results_req).unwrap();
+    let handle = request.operation_handle.unwrap();
+    let expected_guid = Uuid::from_slice(&(0_u8..16).collect::<Vec<_>>())
+        .unwrap()
+        .to_string();
+    let expected_secret: [u8; 16] = (16_u8..32).collect::<Vec<_>>().try_into().unwrap();
+
+    assert_eq!(handle.id, expected_guid);
+    assert_eq!(handle.secret, expected_secret);
+    assert_eq!(request.start_row_offset, Some(1));
+    assert_eq!(request.max_rows, Some(1));
 }
 
 #[test]
@@ -347,6 +379,47 @@ fn row_set_rejects_uint64_values_outside_signed_bigint_range() {
 }
 
 #[test]
+fn fetch_response_encodes_typed_values_and_pagination() {
+    let result = typed_pagination_result();
+
+    let first_response = write_fetch_results_response(21, &result, true, 0, Some(1));
+    let first_page = read_fetch_page(&first_response);
+
+    assert_eq!(first_page.status, SUCCESS_STATUS);
+    assert!(first_page.has_more_rows);
+    assert!(first_page.metadata_included);
+    assert_eq!(first_page.start_row_offset, 0);
+    assert_eq!(
+        first_page.columns,
+        vec![
+            DecodedColumn::Bool(vec![true]),
+            DecodedColumn::I32(vec![7]),
+            DecodedColumn::I64(vec![9]),
+            DecodedColumn::F64(vec![1.5]),
+            DecodedColumn::String(vec!["alpha".to_string()]),
+        ]
+    );
+
+    let second_response = write_fetch_results_response(22, &result, false, 1, Some(1));
+    let second_page = read_fetch_page(&second_response);
+
+    assert_eq!(second_page.status, SUCCESS_STATUS);
+    assert!(!second_page.has_more_rows);
+    assert!(!second_page.metadata_included);
+    assert_eq!(second_page.start_row_offset, 1);
+    assert_eq!(
+        second_page.columns,
+        vec![
+            DecodedColumn::Bool(vec![false]),
+            DecodedColumn::I32(vec![8]),
+            DecodedColumn::I64(vec![10]),
+            DecodedColumn::F64(vec![2.5]),
+            DecodedColumn::String(vec!["beta".to_string()]),
+        ]
+    );
+}
+
+#[test]
 fn metadata_response_reports_unsupported_result_type() {
     let result = QueryResult::from_batches_with_data_types(
         vec![Column {
@@ -457,6 +530,28 @@ fn int_result_from_batches(values: &[&[Option<i32>]]) -> QueryResult {
     )
 }
 
+fn typed_pagination_result() -> QueryResult {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("flag", DataType::Boolean, true),
+        Field::new("i32", DataType::Int32, true),
+        Field::new("i64", DataType::Int64, true),
+        Field::new("f64", DataType::Float64, true),
+        Field::new("text", DataType::Utf8, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(BooleanArray::from(vec![Some(true), Some(false)])),
+            Arc::new(Int32Array::from(vec![Some(7), Some(8)])),
+            Arc::new(Int64Array::from(vec![Some(9), Some(10)])),
+            Arc::new(Float64Array::from(vec![Some(1.5), Some(2.5)])),
+            Arc::new(StringArray::from(vec![Some("alpha"), Some("beta")])),
+        ],
+    )
+    .unwrap();
+    QueryResult::from_batches(columns_from_schema(&schema), vec![batch])
+}
+
 fn columns_from_schema(schema: &Schema) -> Vec<Column> {
     schema
         .fields()
@@ -467,6 +562,178 @@ fn columns_from_schema(schema: &Schema) -> Vec<Column> {
             nullable: field.is_nullable(),
         })
         .collect()
+}
+
+#[derive(Debug, PartialEq)]
+struct DecodedFetchPage {
+    status: i32,
+    has_more_rows: bool,
+    metadata_included: bool,
+    start_row_offset: i64,
+    columns: Vec<DecodedColumn>,
+}
+
+#[derive(Debug, PartialEq)]
+enum DecodedColumn {
+    Bool(Vec<bool>),
+    I32(Vec<i32>),
+    I64(Vec<i64>),
+    F64(Vec<f64>),
+    String(Vec<String>),
+}
+
+#[derive(Clone, Copy)]
+enum ColumnKind {
+    Bool,
+    I32,
+    I64,
+    F64,
+    String,
+}
+
+fn read_fetch_page(response: &[u8]) -> DecodedFetchPage {
+    let mut reader = success_reader(response, "FetchResults");
+    let mut status = None;
+    let mut has_more_rows = None;
+    let mut metadata_included = false;
+    let mut start_row_offset = None;
+    let mut columns = None;
+
+    loop {
+        let (field_type, field_id) = reader.read_field_begin().unwrap();
+        if field_type == T_STOP {
+            break;
+        }
+        match (field_id, field_type) {
+            (1, T_STRUCT) => status = Some(read_status_code(&mut reader)),
+            (2, T_BOOL) => has_more_rows = Some(reader.read_u8().unwrap() != 0),
+            (3, T_STRUCT) => {
+                let row_set = read_row_set_values(&mut reader);
+                start_row_offset = Some(row_set.0);
+                columns = Some(row_set.1);
+            }
+            (1281, T_STRUCT) => {
+                metadata_included = true;
+                reader.skip(field_type).unwrap();
+            }
+            _ => reader.skip(field_type).unwrap(),
+        }
+    }
+
+    DecodedFetchPage {
+        status: status.unwrap(),
+        has_more_rows: has_more_rows.unwrap(),
+        metadata_included,
+        start_row_offset: start_row_offset.unwrap(),
+        columns: columns.unwrap(),
+    }
+}
+
+fn read_row_set_values(reader: &mut Reader<'_>) -> (i64, Vec<DecodedColumn>) {
+    let mut start_row_offset = None;
+    let mut columns = None;
+    let mut column_count = None;
+
+    loop {
+        let (field_type, field_id) = reader.read_field_begin().unwrap();
+        if field_type == T_STOP {
+            break;
+        }
+        match (field_id, field_type) {
+            (1, T_I64) => start_row_offset = Some(reader.read_i64().unwrap()),
+            (3, T_LIST) => {
+                assert_eq!(reader.read_u8().unwrap(), T_STRUCT);
+                let len = reader.read_i32().unwrap();
+                assert!(len >= 0);
+                let mut decoded = Vec::with_capacity(len as usize);
+                for _ in 0..len {
+                    decoded.push(read_column(&mut *reader));
+                }
+                columns = Some(decoded);
+            }
+            (5, T_I32) => column_count = Some(reader.read_i32().unwrap()),
+            _ => reader.skip(field_type).unwrap(),
+        }
+    }
+
+    let columns = columns.unwrap();
+    assert_eq!(column_count.unwrap() as usize, columns.len());
+    (start_row_offset.unwrap(), columns)
+}
+
+fn read_column(reader: &mut Reader<'_>) -> DecodedColumn {
+    let mut column = None;
+    loop {
+        let (field_type, field_id) = reader.read_field_begin().unwrap();
+        if field_type == T_STOP {
+            break;
+        }
+        let kind = match (field_id, field_type) {
+            (1, T_STRUCT) => ColumnKind::Bool,
+            (4, T_STRUCT) => ColumnKind::I32,
+            (5, T_STRUCT) => ColumnKind::I64,
+            (6, T_STRUCT) => ColumnKind::F64,
+            (7, T_STRUCT) => ColumnKind::String,
+            _ => {
+                reader.skip(field_type).unwrap();
+                continue;
+            }
+        };
+        column = Some(read_column_values(reader, kind));
+    }
+    column.unwrap()
+}
+
+fn read_column_values(reader: &mut Reader<'_>, kind: ColumnKind) -> DecodedColumn {
+    let mut column = None;
+    let mut nulls = None;
+
+    loop {
+        let (field_type, field_id) = reader.read_field_begin().unwrap();
+        if field_type == T_STOP {
+            break;
+        }
+        match (field_id, field_type) {
+            (1, T_LIST) => column = Some(read_value_list(reader, kind)),
+            (2, T_STRING) => nulls = Some(reader.read_binary().unwrap()),
+            _ => reader.skip(field_type).unwrap(),
+        }
+    }
+
+    assert_eq!(nulls.as_deref(), Some(&[0][..]));
+    column.unwrap()
+}
+
+fn read_value_list(reader: &mut Reader<'_>, kind: ColumnKind) -> DecodedColumn {
+    let element_type = reader.read_u8().unwrap();
+    let len = reader.read_i32().unwrap();
+    assert!(len >= 0);
+    match kind {
+        ColumnKind::Bool => {
+            assert_eq!(element_type, T_BOOL);
+            DecodedColumn::Bool((0..len).map(|_| reader.read_u8().unwrap() != 0).collect())
+        }
+        ColumnKind::I32 => {
+            assert_eq!(element_type, T_I32);
+            DecodedColumn::I32((0..len).map(|_| reader.read_i32().unwrap()).collect())
+        }
+        ColumnKind::I64 => {
+            assert_eq!(element_type, T_I64);
+            DecodedColumn::I64((0..len).map(|_| reader.read_i64().unwrap()).collect())
+        }
+        ColumnKind::F64 => {
+            assert_eq!(element_type, T_DOUBLE);
+            DecodedColumn::F64(
+                (0..len)
+                    .map(|_| f64::from_bits(reader.read_i64().unwrap() as u64))
+                    .collect(),
+            )
+        }
+        ColumnKind::String => {
+            assert_eq!(element_type, T_STRING);
+            DecodedColumn::String((0..len).map(|_| reader.read_string().unwrap()).collect())
+        }
+    }
 }
 
 #[test]

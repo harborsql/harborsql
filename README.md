@@ -167,12 +167,15 @@ Production deployments should serve HarborSQL over HTTPS, or behind a TLS-termin
 cargo test
 ```
 
-The local Databricks SQL connector smoke test is ignored by default because it
-requires Python with `databricks-sql-connector` installed:
+The Databricks SQL connector smoke tests are ignored by default because they
+require Python with `databricks-sql-connector` installed. Run the offline local
+connector check with:
 
 ```bash
 HARBORSQL_CONNECTOR_SMOKE_PYTHON=/path/to/python \
-  cargo test --test databricks_connector_smoke -- --ignored
+HARBORSQL_CONNECTOR_SMOKE_AUTH=local \
+  cargo test --test databricks_connector_smoke \
+    python_databricks_sql_connector_can_execute_noop_statement -- --ignored
 ```
 
 Set `HARBORSQL_CONNECTOR_SMOKE_AUTH` to choose the connector authentication path:
@@ -185,6 +188,24 @@ Set `HARBORSQL_CONNECTOR_SMOKE_AUTH` to choose the connector authentication path
 
 OAuth mode reads the workspace host from `HARBORSQL_DATABRICKS_HOST`,
 `DATABRICKS_HOST`, or `BENCH_US_DATABRICKS_HOSTNAME`.
+
+The Databricks-backed integration smoke test runs a typed probe query against
+`bench_eu.harborsql_delta_types.delta_type_matrix` by default. It validates
+Unity Catalog lookup, temporary credentials, Delta reads, metadata names,
+typed fetch values, and `fetchmany(1)` pagination behavior:
+
+```bash
+HARBORSQL_CONNECTOR_SMOKE_AUTH=pat \
+DATABRICKS_TOKEN=<token> \
+HARBORSQL_DATABRICKS_HOST=https://<workspace-host> \
+  cargo test --test databricks_connector_smoke \
+    python_databricks_sql_connector_can_execute_type_matrix_probe_query -- --ignored
+```
+
+Override `HARBORSQL_CONNECTOR_SMOKE_TYPE_MATRIX_TABLE` or
+`HARBORSQL_CONNECTOR_SMOKE_TYPE_MATRIX_QUERY` when using a different private
+probe table. CI runs local connector coverage and Databricks-backed integration
+coverage as separate steps so failures identify the boundary that broke.
 
 The GitHub Actions workflow expects these repository secrets:
 
