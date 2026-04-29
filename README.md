@@ -187,7 +187,9 @@ Set `HARBORSQL_CONNECTOR_SMOKE_AUTH` to choose the connector authentication path
   is present, otherwise local mode.
 
 OAuth mode reads the workspace host from `HARBORSQL_DATABRICKS_HOST`,
-`DATABRICKS_HOST`, or `BENCH_US_DATABRICKS_HOSTNAME`.
+`DATABRICKS_HOST`, `BENCH_EU_DATABRICKS_HOSTNAME`, or
+`BENCH_US_DATABRICKS_HOSTNAME`. CI uses the EU workspace for the type-matrix
+probe table by default.
 
 The Databricks-backed integration smoke test runs a typed probe query against
 `bench_eu.harborsql_delta_types.delta_type_matrix` by default. It validates
@@ -210,6 +212,7 @@ coverage as separate steps so failures identify the boundary that broke.
 The GitHub Actions workflow expects these repository secrets:
 
 - `BENCH_US_DATABRICKS_HOSTNAME`
+- `BENCH_EU_DATABRICKS_HOSTNAME`
 - `DATABRICKS_ACCOUNT_ID`
 - `TEST_CI_DATABRICKS_CLIENT_ID`
 - `TEST_CI_DATABRICKS_CLIENT_SECRET`

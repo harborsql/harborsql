@@ -15,10 +15,11 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
       RUST_BACKTRACE: 1
+      BENCH_EU_DATABRICKS_HOSTNAME: ${{ secrets.BENCH_EU_DATABRICKS_HOSTNAME }}
       BENCH_US_DATABRICKS_HOSTNAME: ${{ secrets.BENCH_US_DATABRICKS_HOSTNAME }}
       DATABRICKS_ACCOUNT_ID: ${{ secrets.DATABRICKS_ACCOUNT_ID }}
-      DATABRICKS_HOST: ${{ secrets.BENCH_US_DATABRICKS_HOSTNAME }}
-      HARBORSQL_DATABRICKS_HOST: ${{ secrets.BENCH_US_DATABRICKS_HOSTNAME }}
+      DATABRICKS_HOST: ${{ secrets.BENCH_EU_DATABRICKS_HOSTNAME }}
+      HARBORSQL_DATABRICKS_HOST: ${{ secrets.BENCH_EU_DATABRICKS_HOSTNAME }}
       DATABRICKS_CLIENT_ID: ${{ secrets.TEST_CI_DATABRICKS_CLIENT_ID }}
       DATABRICKS_CLIENT_SECRET: ${{ secrets.TEST_CI_DATABRICKS_CLIENT_SECRET }}
       TEST_CI_DATABRICKS_CLIENT_ID: ${{ secrets.TEST_CI_DATABRICKS_CLIENT_ID }}
@@ -68,7 +69,7 @@ jobs:
           HARBORSQL_CONNECTOR_SMOKE_PYTHON: python
 
       - name: Run Databricks connector OAuth type matrix smoke test
-        if: env.TEST_CI_DATABRICKS_CLIENT_ID != '' && env.TEST_CI_DATABRICKS_CLIENT_SECRET != '' && env.BENCH_US_DATABRICKS_HOSTNAME != ''
+        if: env.TEST_CI_DATABRICKS_CLIENT_ID != '' && env.TEST_CI_DATABRICKS_CLIENT_SECRET != '' && env.BENCH_EU_DATABRICKS_HOSTNAME != ''
         run: cargo test --locked --test databricks_connector_smoke python_databricks_sql_connector_can_execute_type_matrix_probe_query -- --ignored
         env:
           HARBORSQL_CONNECTOR_SMOKE_AUTH: oauth
