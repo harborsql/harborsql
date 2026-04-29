@@ -5,8 +5,12 @@ use std::{
 };
 
 use datafusion::arrow::{
-    array::{Array, BooleanArray, Float64Array, Int32Array, Int64Array, StringArray},
-    datatypes::{DataType, Field, Schema},
+    array::{
+        Array, BooleanArray, Date32Array, Date64Array, Float32Array, Float64Array, Int8Array,
+        Int16Array, Int32Array, Int64Array, LargeStringArray, StringArray,
+        TimestampMicrosecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    },
+    datatypes::{DataType, Field, Schema, TimeUnit},
     record_batch::RecordBatch,
 };
 
@@ -223,55 +227,54 @@ async fn service_handles_cancellation_and_invalid_handles() {
 fn row_set_encodes_typed_value_columns() {
     let schema = Arc::new(Schema::new(vec![
         Field::new("flag", DataType::Boolean, true),
-        Field::new("small", DataType::Int32, true),
-        Field::new("big", DataType::Int64, true),
-        Field::new("ratio", DataType::Float64, true),
-        Field::new("name", DataType::Utf8, true),
+        Field::new("i8", DataType::Int8, true),
+        Field::new("i16", DataType::Int16, true),
+        Field::new("i32", DataType::Int32, true),
+        Field::new("i64", DataType::Int64, true),
+        Field::new("u8", DataType::UInt8, true),
+        Field::new("u16", DataType::UInt16, true),
+        Field::new("u32", DataType::UInt32, true),
+        Field::new("u64", DataType::UInt64, true),
+        Field::new("f32", DataType::Float32, true),
+        Field::new("f64", DataType::Float64, true),
+        Field::new("text", DataType::Utf8, true),
+        Field::new("large_text", DataType::LargeUtf8, true),
+        Field::new("date32", DataType::Date32, true),
+        Field::new("date64", DataType::Date64, true),
+        Field::new(
+            "timestamp",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            true,
+        ),
     ]));
     let batch = RecordBatch::try_new(
-        schema,
+        schema.clone(),
         vec![
             Arc::new(BooleanArray::from(vec![Some(true)])),
+            Arc::new(Int8Array::from(vec![Some(-8)])),
+            Arc::new(Int16Array::from(vec![Some(-16)])),
             Arc::new(Int32Array::from(vec![Some(7)])),
             Arc::new(Int64Array::from(vec![Some(8)])),
+            Arc::new(UInt8Array::from(vec![Some(9)])),
+            Arc::new(UInt16Array::from(vec![Some(10)])),
+            Arc::new(UInt32Array::from(vec![Some(11)])),
+            Arc::new(UInt64Array::from(vec![Some(i64::MAX as u64)])),
+            Arc::new(Float32Array::from(vec![Some(1.25)])),
             Arc::new(Float64Array::from(vec![Some(1.5)])),
             Arc::new(StringArray::from(vec![Some("harbor")])),
+            Arc::new(LargeStringArray::from(vec![Some("harbor-large")])),
+            Arc::new(Date32Array::from(vec![Some(1)])),
+            Arc::new(Date64Array::from(vec![Some(86_400_000)])),
+            Arc::new(TimestampMicrosecondArray::from(vec![Some(
+                1_700_000_000_000_000,
+            )])),
         ],
     )
     .unwrap();
-    let result = QueryResult::from_batches(
-        vec![
-            Column {
-                name: "flag".to_string(),
-                data_type: "Boolean".to_string(),
-                nullable: true,
-            },
-            Column {
-                name: "small".to_string(),
-                data_type: "Int32".to_string(),
-                nullable: true,
-            },
-            Column {
-                name: "big".to_string(),
-                data_type: "Int64".to_string(),
-                nullable: true,
-            },
-            Column {
-                name: "ratio".to_string(),
-                data_type: "Float64".to_string(),
-                nullable: true,
-            },
-            Column {
-                name: "name".to_string(),
-                data_type: "Utf8".to_string(),
-                nullable: true,
-            },
-        ],
-        vec![batch],
-    );
+    let result = QueryResult::from_batches(columns_from_schema(&schema), vec![batch]);
     let page = row_page(&result, 0, Some(1));
     let mut writer = Writer::new();
-    write_row_set(&mut writer, &result, &page);
+    write_row_set(&mut writer, &result, &page).unwrap();
 
     let bytes = writer.into_inner();
     let mut reader = Reader::new(&bytes);
@@ -284,8 +287,8 @@ fn row_set_encodes_typed_value_columns() {
         if field_id == 3 {
             assert_eq!(field_type, T_LIST);
             assert_eq!(reader.read_u8().unwrap(), T_STRUCT);
-            assert_eq!(reader.read_i32().unwrap(), 5);
-            for _ in 0..5 {
+            assert_eq!(reader.read_i32().unwrap(), 16);
+            for _ in 0..16 {
                 let (column_type, column_field_id) = reader.read_field_begin().unwrap();
                 encoded_column_fields.push((column_type, column_field_id));
                 reader.skip(column_type).unwrap();
@@ -302,10 +305,66 @@ fn row_set_encodes_typed_value_columns() {
         vec![
             (T_STRUCT, 1),
             (T_STRUCT, 4),
+            (T_STRUCT, 4),
+            (T_STRUCT, 4),
+            (T_STRUCT, 5),
+            (T_STRUCT, 5),
+            (T_STRUCT, 5),
+            (T_STRUCT, 5),
             (T_STRUCT, 5),
             (T_STRUCT, 6),
+            (T_STRUCT, 6),
+            (T_STRUCT, 7),
+            (T_STRUCT, 7),
+            (T_STRUCT, 7),
+            (T_STRUCT, 7),
             (T_STRUCT, 7)
         ]
+    );
+}
+
+#[test]
+fn row_set_rejects_uint64_values_outside_signed_bigint_range() {
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "too_large",
+        DataType::UInt64,
+        true,
+    )]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(UInt64Array::from(vec![Some(u64::MAX)]))],
+    )
+    .unwrap();
+    let result = QueryResult::from_batches(columns_from_schema(&schema), vec![batch]);
+    let page = row_page(&result, 0, Some(1));
+    let mut writer = Writer::new();
+
+    let err = write_row_set(&mut writer, &result, &page)
+        .unwrap_err()
+        .to_string();
+
+    assert!(err.contains("UInt64 result value exceeds signed BIGINT range"));
+}
+
+#[test]
+fn metadata_response_reports_unsupported_result_type() {
+    let result = QueryResult::from_batches_with_data_types(
+        vec![Column {
+            name: "payload".to_string(),
+            data_type: "Binary".to_string(),
+            nullable: true,
+        }],
+        vec![DataType::Binary],
+        Vec::new(),
+    );
+
+    let response = write_get_result_set_metadata_response(1, &result);
+    let (status, message) = read_top_level_status_and_message(&response, "GetResultSetMetadata");
+
+    assert_eq!(status, ERROR_STATUS);
+    assert_eq!(
+        message.as_deref(),
+        Some("UNSUPPORTED_RESULT_TYPE: unsupported result column type")
     );
 }
 
@@ -396,6 +455,18 @@ fn int_result_from_batches(values: &[&[Option<i32>]]) -> QueryResult {
         }],
         batches,
     )
+}
+
+fn columns_from_schema(schema: &Schema) -> Vec<Column> {
+    schema
+        .fields()
+        .iter()
+        .map(|field| Column {
+            name: field.name().clone(),
+            data_type: field.data_type().to_string(),
+            nullable: field.is_nullable(),
+        })
+        .collect()
 }
 
 #[test]
@@ -656,6 +727,10 @@ fn read_operation_status_response(response: &[u8]) -> (i32, i32, bool) {
 }
 
 fn read_top_level_status(response: &[u8], method: &str) -> i32 {
+    read_top_level_status_and_message(response, method).0
+}
+
+fn read_top_level_status_and_message(response: &[u8], method: &str) -> (i32, Option<String>) {
     let mut reader = success_reader(response, method);
     loop {
         let (field_type, field_id) = reader.read_field_begin().unwrap();
@@ -663,14 +738,19 @@ fn read_top_level_status(response: &[u8], method: &str) -> i32 {
             panic!("{method} response did not include status");
         }
         if field_id == 1 && field_type == T_STRUCT {
-            return read_status_code(&mut reader);
+            return read_status(&mut reader);
         }
         reader.skip(field_type).unwrap();
     }
 }
 
 fn read_status_code(reader: &mut Reader<'_>) -> i32 {
+    read_status(reader).0
+}
+
+fn read_status(reader: &mut Reader<'_>) -> (i32, Option<String>) {
     let mut status = None;
+    let mut message = None;
     loop {
         let (field_type, field_id) = reader.read_field_begin().unwrap();
         if field_type == T_STOP {
@@ -678,11 +758,13 @@ fn read_status_code(reader: &mut Reader<'_>) -> i32 {
         }
         if field_id == 1 && field_type == T_I32 {
             status = Some(reader.read_i32().unwrap());
+        } else if field_id == 5 && field_type == T_STRING {
+            message = Some(reader.read_string().unwrap());
         } else {
             reader.skip(field_type).unwrap();
         }
     }
-    status.unwrap()
+    (status.unwrap(), message)
 }
 
 fn success_reader<'a>(response: &'a [u8], method: &str) -> Reader<'a> {

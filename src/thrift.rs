@@ -810,7 +810,10 @@ fn write_get_operation_status_invalid(seqid: i32) -> Vec<u8> {
 
 fn write_get_result_set_metadata_response(seqid: i32, result: &QueryResult) -> Vec<u8> {
     write_success_response("GetResultSetMetadata", seqid, |writer| {
-        write_result_set_metadata_response(writer, result, SUCCESS_STATUS);
+        if let Err(err) = write_result_set_metadata_response(writer, result, SUCCESS_STATUS) {
+            let message = thrift_client_error_message(&err, "thrift result metadata encoding");
+            write_result_set_metadata_response_with_error(writer, ERROR_STATUS, &message);
+        }
     })
 }
 
@@ -842,13 +845,20 @@ fn write_fetch_results_response(
     max_rows: Option<i64>,
 ) -> Vec<u8> {
     write_success_response("FetchResults", seqid, |writer| {
-        write_fetch_results_response_struct(
+        if let Err(err) = write_fetch_results_response_struct(
             writer,
             result,
             include_metadata,
             start_row_offset,
             max_rows,
-        );
+        ) {
+            let message = thrift_client_error_message(&err, "thrift result value encoding");
+            writer.write_field(T_STRUCT, 1, |writer| {
+                write_status(writer, ERROR_STATUS, Some(&message));
+            });
+            writer.write_field(T_BOOL, 2, |writer| writer.write_bool(false));
+            writer.write_stop();
+        }
     })
 }
 
@@ -966,6 +976,11 @@ fn write_status(writer: &mut Writer, status_code: i32, message: Option<&str>) {
         writer.write_field(T_STRING, 6, |writer| writer.write_string(message));
     }
     writer.write_stop();
+}
+
+fn thrift_client_error_message(error: &HarborError, context: &'static str) -> String {
+    error.log_internal(context);
+    error.client_error().status_message()
 }
 
 fn write_session_handle(writer: &mut Writer, guid: &[u8; 16], secret: &[u8; 16]) {

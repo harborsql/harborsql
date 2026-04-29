@@ -21,6 +21,8 @@ pub enum HarborError {
     Unity(String),
     #[error("query execution error: {0}")]
     Query(String),
+    #[error("unsupported result type: {0}")]
+    UnsupportedResultType(String),
     #[error("Databricks Thrift protocol error: {0}")]
     Thrift(String),
     #[error("HTTP client error: {0}")]
@@ -47,9 +49,11 @@ impl HarborError {
             Self::MissingBearerToken => StatusCode::UNAUTHORIZED,
             Self::Config(_) | Self::UnsupportedSql(_) | Self::Thrift(_) => StatusCode::BAD_REQUEST,
             Self::Unity(_) => StatusCode::BAD_GATEWAY,
-            Self::Query(_) | Self::Delta(_) | Self::DataFusion(_) | Self::ArrowJson(_) => {
-                StatusCode::UNPROCESSABLE_ENTITY
-            }
+            Self::Query(_)
+            | Self::UnsupportedResultType(_)
+            | Self::Delta(_)
+            | Self::DataFusion(_)
+            | Self::ArrowJson(_) => StatusCode::UNPROCESSABLE_ENTITY,
             Self::Http(_) | Self::Url(_) | Self::Json(_) | Self::Logger(_) | Self::Io(_) => {
                 StatusCode::INTERNAL_SERVER_ERROR
             }
@@ -65,6 +69,9 @@ impl HarborError {
                 ClientError::new("UNITY_CATALOG_ERROR", "Unity Catalog request failed")
             }
             Self::Query(_) => ClientError::new("QUERY_FAILED", "query execution failed"),
+            Self::UnsupportedResultType(_) => {
+                ClientError::new("UNSUPPORTED_RESULT_TYPE", "unsupported result column type")
+            }
             Self::Thrift(_) => ClientError::new("THRIFT_PROTOCOL_ERROR", "invalid Thrift request"),
             Self::Http(_) => {
                 ClientError::new("UPSTREAM_HTTP_ERROR", "upstream HTTP request failed")

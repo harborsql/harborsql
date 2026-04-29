@@ -16,6 +16,26 @@ This repository is an early proof of concept. The current implementation is inte
 
 It is not production-ready. Important missing pieces include Cloud Fetch, durable or streaming result storage beyond in-memory materialized results, stronger protocol tests, broader SQL compatibility, and production-grade operational controls.
 
+## Result Type Support
+
+HarborSQL encodes Databricks SQL connector result pages directly from Arrow
+arrays. The current Thrift result type matrix is explicit and intentionally
+narrow:
+
+| Arrow/DataFusion type | Thrift result representation |
+| --- | --- |
+| `Boolean` | boolean |
+| `Int8`, `Int16`, `Int32` | int |
+| `Int64`, `UInt8`, `UInt16`, `UInt32` | bigint |
+| `UInt64` | bigint only when the value fits in signed `i64` |
+| `Float32`, `Float64` | double |
+| `Utf8`, `LargeUtf8` | string |
+| `Date32`, `Date64` | date metadata with string values |
+| `Timestamp` | timestamp metadata with string values |
+
+Other Arrow types, including decimal, binary, nested, interval, dictionary, and
+time-only values, return `UNSUPPORTED_RESULT_TYPE` instead of being coerced.
+
 ## How It Works
 
 For each query, HarborSQL:

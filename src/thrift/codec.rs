@@ -225,6 +225,24 @@ impl Writer {
         write_value(self);
     }
 
+    pub(super) fn write_field_result<F>(
+        &mut self,
+        field_type: u8,
+        field_id: i16,
+        write_value: F,
+    ) -> Result<()>
+    where
+        F: FnOnce(&mut Writer) -> Result<()>,
+    {
+        self.buffer.push(field_type);
+        self.write_i16(field_id);
+        write_value(self)
+    }
+
+    pub(super) fn write_raw(&mut self, bytes: &[u8]) {
+        self.buffer.extend(bytes);
+    }
+
     pub(super) fn write_stop(&mut self) {
         self.buffer.push(T_STOP);
     }
