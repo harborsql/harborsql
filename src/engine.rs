@@ -9,11 +9,12 @@ use async_trait::async_trait;
 use datafusion::{
     arrow::{datatypes::DataType, record_batch::RecordBatch},
     catalog::{
-        CatalogProvider, MemoryCatalogProvider, SchemaProvider, memory::MemorySchemaProvider,
+        CatalogProvider, MemoryCatalogProvider, SchemaProvider, TableProvider,
+        memory::MemorySchemaProvider,
     },
+    dataframe::DataFrame,
     prelude::{SessionConfig, SessionContext},
 };
-use deltalake::{logstore::LogStore, open_table_with_storage_options};
 use futures::{StreamExt, stream::BoxStream};
 use object_store::{
     CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
@@ -37,26 +38,46 @@ use url::Url;
 use crate::{
     config::Config,
     error::{HarborError, Result},
-    table_cache::{CachedTable, TableCache, expires_at_from_unity_expiration_ms},
+    table_cache::TableCache,
     udf,
-    unity::{TemporaryTableCredentials, UnityCatalogClient},
+    unity::UnityCatalogClient,
 };
+
+mod catalog;
+mod results;
+mod sql_resolution;
+
+#[cfg(test)]
+use catalog::table_object_store_route;
+use catalog::{DeltaTableOpener, TableOpener, UnityCatalog, load_cached_table};
+use results::{ResultLimits, materialize_stream};
 
 #[derive(Clone)]
 pub struct QueryEngine {
     config: Config,
-    unity: UnityCatalogClient,
+    unity: Arc<dyn UnityCatalog>,
+    table_opener: Arc<dyn TableOpener>,
     table_cache: TableCache,
 }
 
 impl QueryEngine {
     pub fn new(config: Config) -> Self {
+        let unity = Arc::new(UnityCatalogClient::new(
+            config.databricks_host.clone(),
+            config.unity_request_timeout,
+        ));
+        Self::with_dependencies(config, unity, Arc::new(DeltaTableOpener))
+    }
+
+    fn with_dependencies(
+        config: Config,
+        unity: Arc<dyn UnityCatalog>,
+        table_opener: Arc<dyn TableOpener>,
+    ) -> Self {
         let table_cache = TableCache::new(config.table_cache_max_entries, config.table_cache_ttl);
         Self {
-            unity: UnityCatalogClient::new(
-                config.databricks_host.clone(),
-                config.unity_request_timeout,
-            ),
+            unity,
+            table_opener,
             table_cache,
             config,
         }
@@ -90,13 +111,7 @@ impl QueryEngine {
         default_catalog: &str,
         default_schema: &str,
     ) -> Result<QueryResult> {
-        validate_select_only(sql)?;
-        let refs = extract_table_refs(sql, default_catalog, default_schema)?;
-        if refs.is_empty() {
-            return Err(HarborError::UnsupportedSql(
-                "no FROM/JOIN table references were found".into(),
-            ));
-        }
+        let refs = sql_resolution::resolve_query_table_refs(sql, default_catalog, default_schema)?;
 
         let session_config = SessionConfig::new()
             .with_default_catalog_and_schema(default_catalog, default_schema)
@@ -131,6 +146,7 @@ impl QueryEngine {
         for table_ref in refs {
             let full_name = table_ref.full_name();
             let unity = self.unity.clone();
+            let table_opener = self.table_opener.clone();
             let config = self.config.clone();
             let full_name_for_load = full_name.clone();
             let cached_table = self
@@ -140,7 +156,14 @@ impl QueryEngine {
                     &full_name,
                     &self.config.aws_region,
                     || async move {
-                        load_cached_table(&unity, &config, bearer_token, &full_name_for_load).await
+                        load_cached_table(
+                            unity,
+                            table_opener,
+                            config,
+                            bearer_token,
+                            &full_name_for_load,
+                        )
+                        .await
                     },
                 )
                 .await?;
@@ -174,9 +197,7 @@ impl QueryEngine {
                 })
                 .clone();
 
-            schema
-                .register_table(table_ref.table.clone(), cached_table.provider.clone())
-                .map_err(HarborError::DataFusion)?;
+            register_table_provider(&schema, &table_ref.table, cached_table.provider.clone())?;
         }
 
         for (_, (object_store_url, routes)) in object_store_routes {
@@ -187,123 +208,32 @@ impl QueryEngine {
         }
 
         let execution_sql = rewrite_sql_fast_paths(sql)?;
-        let dataframe = ctx.sql(&execution_sql).await?;
-        let mut stream = dataframe.execute_stream().await?;
-        let stream_schema = stream.schema();
-        let fields = stream_schema.fields();
-        let schema = fields
-            .iter()
-            .map(|field| Column {
-                name: field.name().clone(),
-                data_type: field.data_type().to_string(),
-                nullable: field.is_nullable(),
-            })
-            .collect();
-        let data_types = fields
-            .iter()
-            .map(|field| field.data_type().clone())
-            .collect();
-
-        let mut row_count = 0;
-        let mut result_bytes = 0_usize;
-        let mut batches = Vec::new();
-        while let Some(batch) = stream.next().await {
-            let batch = batch?;
-            row_count += batch.num_rows();
-            if let Some(max_rows) = self.config.max_result_rows
-                && row_count > max_rows
-            {
-                return Err(HarborError::Query(format!(
-                    "query returned more than HARBORSQL_MAX_RESULT_ROWS={max_rows}",
-                )));
-            }
-
-            result_bytes = result_bytes.saturating_add(batch.get_array_memory_size());
-            if let Some(max_bytes) = self.config.max_result_bytes
-                && result_bytes > max_bytes
-            {
-                return Err(HarborError::Query(format!(
-                    "query result Arrow pages exceeded HARBORSQL_MAX_RESULT_BYTES={max_bytes}",
-                )));
-            }
-            batches.push(batch);
-        }
-
-        Ok(QueryResult::from_batches_with_data_types(
-            schema, data_types, batches,
-        ))
+        let dataframe = plan_sql(&ctx, &execution_sql).await?;
+        let stream = dataframe.execute_stream().await?;
+        materialize_stream(
+            stream,
+            ResultLimits {
+                max_rows: self.config.max_result_rows,
+                max_bytes: self.config.max_result_bytes,
+            },
+        )
+        .await
     }
 }
 
-async fn load_cached_table(
-    unity: &UnityCatalogClient,
-    config: &Config,
-    bearer_token: &str,
-    full_name: &str,
-) -> Result<CachedTable> {
-    let table = unity.table(bearer_token, full_name).await?;
-    ensure_delta_table(&table)?;
-
-    let credentials = unity
-        .temporary_table_credentials(bearer_token, &table.table_id)
-        .await?;
-    let credential_expires_at = expires_at_from_unity_expiration_ms(
-        credentials.expiration_time,
-        config.table_cache_credential_expiry_skew,
-    );
-    let delta = open_table_with_storage_options(
-        Url::parse(&credentials.url)?,
-        storage_options(&credentials, &config.aws_region),
-    )
-    .await?;
-    let (object_store_url, object_prefix) = table_object_store_route(&credentials.url)?;
-    let object_store = delta.log_store().root_object_store(None);
-    let provider = delta.table_provider().await?;
-
-    Ok(CachedTable::new(
-        provider,
-        object_store_url,
-        object_prefix,
-        object_store,
-        credential_expires_at,
-    ))
+async fn plan_sql(ctx: &SessionContext, sql: &str) -> Result<DataFrame> {
+    Ok(ctx.sql(sql).await?)
 }
 
-fn ensure_delta_table(table: &crate::unity::TableInfo) -> Result<()> {
-    let format_ok = table
-        .data_source_format
-        .as_deref()
-        .is_some_and(|format| format.eq_ignore_ascii_case("DELTA"));
-    let storage_ok = table.storage_location.is_some();
-    if format_ok && storage_ok {
-        return Ok(());
-    }
-
-    Err(HarborError::UnsupportedSql(format!(
-        "table {} is not an externally readable Delta table",
-        table.full_name
-    )))
-}
-
-fn storage_options(
-    credentials: &TemporaryTableCredentials,
-    aws_region: &str,
-) -> HashMap<String, String> {
-    HashMap::from([
-        (
-            "AWS_ACCESS_KEY_ID".to_string(),
-            credentials.aws_temp_credentials.access_key_id.clone(),
-        ),
-        (
-            "AWS_SECRET_ACCESS_KEY".to_string(),
-            credentials.aws_temp_credentials.secret_access_key.clone(),
-        ),
-        (
-            "AWS_SESSION_TOKEN".to_string(),
-            credentials.aws_temp_credentials.session_token.clone(),
-        ),
-        ("AWS_REGION".to_string(), aws_region.to_string()),
-    ])
+fn register_table_provider(
+    schema: &MemorySchemaProvider,
+    table_name: &str,
+    provider: Arc<dyn TableProvider>,
+) -> Result<()> {
+    schema
+        .register_table(table_name.to_string(), provider)
+        .map(|_| ())
+        .map_err(HarborError::DataFusion)
 }
 
 #[derive(Clone)]
@@ -525,27 +455,6 @@ fn no_route_error(location: &str) -> object_store::Error {
             format!("no Unity table credential route matched object path {location}"),
         )),
     }
-}
-
-fn table_object_store_route(table_url: &str) -> Result<(Url, String)> {
-    let parsed = Url::parse(table_url)?;
-    if parsed.host_str().is_none() {
-        return Err(HarborError::Query(format!(
-            "table storage URL has no host: {table_url}"
-        )));
-    }
-
-    let prefix = ObjectPath::from_url_path(parsed.path())
-        .map_err(|err| HarborError::Query(format!("invalid table storage path: {err}")))?
-        .as_ref()
-        .to_string();
-
-    let mut object_store_url = parsed;
-    object_store_url.set_path("");
-    object_store_url.set_query(None);
-    object_store_url.set_fragment(None);
-
-    Ok((object_store_url, prefix))
 }
 
 fn validate_select_only(sql: &str) -> Result<()> {
@@ -1998,6 +1907,27 @@ pub struct Column {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        net::SocketAddr,
+        sync::atomic::{AtomicUsize, Ordering},
+        time::{Duration, Instant},
+    };
+
+    use datafusion::{
+        arrow::{
+            array::{ArrayRef, Int32Array},
+            datatypes::{Field, Schema},
+        },
+        datasource::{MemTable, empty::EmptyTable},
+        physical_plan::{SendableRecordBatchStream, memory::MemoryStream},
+    };
+    use object_store::memory::InMemory;
+
+    use crate::{
+        table_cache::CachedTable,
+        unity::{AwsTempCredentials, TableInfo, TemporaryTableCredentials},
+    };
+
     use super::*;
 
     #[test]
@@ -2229,5 +2159,351 @@ mod tests {
         let sql = "SELECT COUNT(*) FROM hits WHERE URL LIKE '%goo_le%'";
 
         assert_eq!(rewrite_sql_fast_paths(sql).unwrap(), sql);
+    }
+
+    #[tokio::test]
+    async fn load_cached_table_surfaces_unity_table_errors() {
+        let err = expect_cached_table_error(
+            load_cached_table(
+                Arc::new(MockUnity::table_error("table unavailable")),
+                Arc::new(MockTableOpener::ok()),
+                test_config(),
+                "token",
+                "workspace.default.hits",
+            )
+            .await,
+        );
+
+        assert!(matches!(err, HarborError::Unity(message) if message == "table unavailable"));
+    }
+
+    #[tokio::test]
+    async fn load_cached_table_surfaces_credential_errors() {
+        let opener = Arc::new(MockTableOpener::ok());
+        let err = expect_cached_table_error(
+            load_cached_table(
+                Arc::new(MockUnity::credential_error("credentials unavailable")),
+                opener.clone(),
+                test_config(),
+                "token",
+                "workspace.default.hits",
+            )
+            .await,
+        );
+
+        assert!(matches!(err, HarborError::Unity(message) if message == "credentials unavailable"));
+        assert_eq!(opener.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn load_cached_table_rejects_non_delta_tables_before_opening_storage() {
+        let opener = Arc::new(MockTableOpener::ok());
+        let err = expect_cached_table_error(
+            load_cached_table(
+                Arc::new(MockUnity::non_delta()),
+                opener.clone(),
+                test_config(),
+                "token",
+                "workspace.default.hits",
+            )
+            .await,
+        );
+
+        assert!(
+            matches!(err, HarborError::UnsupportedSql(message) if message.contains("not an externally readable Delta table"))
+        );
+        assert_eq!(opener.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn load_cached_table_surfaces_table_opener_errors() {
+        let opener = Arc::new(MockTableOpener::error("delta open failed"));
+        let err = expect_cached_table_error(
+            load_cached_table(
+                Arc::new(MockUnity::delta()),
+                opener.clone(),
+                test_config(),
+                "token",
+                "workspace.default.hits",
+            )
+            .await,
+        );
+
+        assert!(matches!(err, HarborError::Query(message) if message == "delta open failed"));
+        assert_eq!(opener.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn register_table_provider_rejects_duplicate_table() {
+        let schema = MemorySchemaProvider::new();
+        let provider = empty_table_provider();
+        register_table_provider(&schema, "hits", provider.clone()).unwrap();
+
+        let err = register_table_provider(&schema, "hits", provider).unwrap_err();
+
+        assert!(matches!(err, HarborError::DataFusion(_)));
+    }
+
+    #[tokio::test]
+    async fn execute_enforces_result_row_limits_with_injected_table_provider() {
+        let mut config = test_config();
+        config.max_result_rows = Some(1);
+        let engine = QueryEngine::with_dependencies(
+            config,
+            Arc::new(MockUnity::delta()),
+            Arc::new(MockTableOpener::with_provider(mem_table_provider(
+                int_batch(vec![1, 2]),
+            ))),
+        );
+
+        let err = engine
+            .execute("token", "SELECT * FROM hits", "workspace", "default")
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, HarborError::Query(message) if message.contains("HARBORSQL_MAX_RESULT_ROWS=1"))
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_surfaces_datafusion_planning_failures() {
+        let engine = QueryEngine::with_dependencies(
+            test_config(),
+            Arc::new(MockUnity::delta()),
+            Arc::new(MockTableOpener::with_provider(mem_table_provider(
+                int_batch(vec![1]),
+            ))),
+        );
+
+        let err = engine
+            .execute("token", "SELECT missing FROM hits", "workspace", "default")
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, HarborError::DataFusion(_)));
+    }
+
+    #[tokio::test]
+    async fn materialize_stream_preserves_schema_and_rows() {
+        let batch = int_batch(vec![7, 8]);
+        let stream: SendableRecordBatchStream =
+            Box::pin(MemoryStream::try_new(vec![batch], test_schema(), None).unwrap());
+
+        let result = materialize_stream(
+            stream,
+            ResultLimits {
+                max_rows: Some(2),
+                max_bytes: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.row_count, 2);
+        assert_eq!(result.columns[0].name, "id");
+        assert_eq!(result.data_types(), &[DataType::Int32]);
+    }
+
+    enum MockTableResponse {
+        Delta,
+        NonDelta,
+        Error(&'static str),
+    }
+
+    enum MockCredentialResponse {
+        Ok,
+        Error(&'static str),
+    }
+
+    struct MockUnity {
+        table_response: MockTableResponse,
+        credential_response: MockCredentialResponse,
+    }
+
+    impl MockUnity {
+        fn delta() -> Self {
+            Self {
+                table_response: MockTableResponse::Delta,
+                credential_response: MockCredentialResponse::Ok,
+            }
+        }
+
+        fn non_delta() -> Self {
+            Self {
+                table_response: MockTableResponse::NonDelta,
+                credential_response: MockCredentialResponse::Ok,
+            }
+        }
+
+        fn table_error(message: &'static str) -> Self {
+            Self {
+                table_response: MockTableResponse::Error(message),
+                credential_response: MockCredentialResponse::Ok,
+            }
+        }
+
+        fn credential_error(message: &'static str) -> Self {
+            Self {
+                table_response: MockTableResponse::Delta,
+                credential_response: MockCredentialResponse::Error(message),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl UnityCatalog for MockUnity {
+        async fn table(&self, _bearer_token: &str, full_name: &str) -> Result<TableInfo> {
+            match self.table_response {
+                MockTableResponse::Delta => Ok(table_info(full_name, Some("DELTA"), true)),
+                MockTableResponse::NonDelta => Ok(table_info(full_name, Some("PARQUET"), true)),
+                MockTableResponse::Error(message) => Err(HarborError::Unity(message.to_string())),
+            }
+        }
+
+        async fn temporary_table_credentials(
+            &self,
+            _bearer_token: &str,
+            _table_id: &str,
+        ) -> Result<TemporaryTableCredentials> {
+            match self.credential_response {
+                MockCredentialResponse::Ok => Ok(temporary_credentials()),
+                MockCredentialResponse::Error(message) => {
+                    Err(HarborError::Unity(message.to_string()))
+                }
+            }
+        }
+    }
+
+    enum MockOpenResponse {
+        Ok(Arc<dyn TableProvider>),
+        Error(&'static str),
+    }
+
+    struct MockTableOpener {
+        response: MockOpenResponse,
+        calls: AtomicUsize,
+    }
+
+    impl MockTableOpener {
+        fn ok() -> Self {
+            Self::with_provider(empty_table_provider())
+        }
+
+        fn with_provider(provider: Arc<dyn TableProvider>) -> Self {
+            Self {
+                response: MockOpenResponse::Ok(provider),
+                calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn error(message: &'static str) -> Self {
+            Self {
+                response: MockOpenResponse::Error(message),
+                calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TableOpener for MockTableOpener {
+        async fn open(
+            &self,
+            _credentials: &TemporaryTableCredentials,
+            _aws_region: &str,
+            credential_expires_at: Instant,
+        ) -> Result<CachedTable> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            match &self.response {
+                MockOpenResponse::Ok(provider) => Ok(CachedTable::new(
+                    provider.clone(),
+                    Url::parse("s3://bench-bucket").unwrap(),
+                    "ssb/sf10/tables/hits".to_string(),
+                    Arc::new(InMemory::new()),
+                    credential_expires_at,
+                )),
+                MockOpenResponse::Error(message) => Err(HarborError::Query(message.to_string())),
+            }
+        }
+    }
+
+    fn table_info(
+        full_name: &str,
+        data_source_format: Option<&str>,
+        has_storage: bool,
+    ) -> TableInfo {
+        TableInfo {
+            table_id: "table-id".to_string(),
+            full_name: full_name.to_string(),
+            data_source_format: data_source_format.map(str::to_string),
+            storage_location: has_storage.then(|| "s3://bench-bucket/ssb/sf10/tables/hits".into()),
+        }
+    }
+
+    fn temporary_credentials() -> TemporaryTableCredentials {
+        TemporaryTableCredentials {
+            aws_temp_credentials: AwsTempCredentials {
+                access_key_id: "access-key".to_string(),
+                secret_access_key: "secret-key".to_string(),
+                session_token: "session-token".to_string(),
+            },
+            expiration_time: 4_102_444_800_000,
+            url: "s3://bench-bucket/ssb/sf10/tables/hits".to_string(),
+        }
+    }
+
+    fn test_config() -> Config {
+        Config {
+            bind_addr: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+            databricks_host: "https://workspace.cloud.databricks.com".to_string(),
+            default_catalog: "workspace".to_string(),
+            default_schema: "default".to_string(),
+            aws_region: "us-west-2".to_string(),
+            max_result_rows: Some(100),
+            max_result_bytes: Some(usize::MAX),
+            unity_request_timeout: Duration::from_secs(1),
+            query_timeout: Duration::from_secs(30),
+            idle_session_timeout: Duration::from_secs(60),
+            completed_operation_ttl: Duration::from_secs(60),
+            cleanup_interval: Duration::from_secs(60),
+            max_sessions: 16,
+            max_operations: 16,
+            request_body_limit_bytes: 1024 * 1024,
+            parquet_pushdown_filters: true,
+            parquet_reorder_filters: true,
+            target_partitions: 1,
+            skip_partial_aggregation_probe_rows_threshold: 10_000,
+            skip_partial_aggregation_probe_ratio_threshold: 0.8,
+            table_cache_ttl: Duration::ZERO,
+            table_cache_max_entries: 0,
+            table_cache_credential_expiry_skew: Duration::ZERO,
+        }
+    }
+
+    fn empty_table_provider() -> Arc<dyn TableProvider> {
+        Arc::new(EmptyTable::new(Arc::new(Schema::empty())))
+    }
+
+    fn mem_table_provider(batch: RecordBatch) -> Arc<dyn TableProvider> {
+        Arc::new(MemTable::try_new(batch.schema(), vec![vec![batch]]).unwrap())
+    }
+
+    fn int_batch(values: Vec<i32>) -> RecordBatch {
+        RecordBatch::try_new(
+            test_schema(),
+            vec![Arc::new(Int32Array::from(values)) as ArrayRef],
+        )
+        .unwrap()
+    }
+
+    fn test_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]))
+    }
+
+    fn expect_cached_table_error(result: Result<CachedTable>) -> HarborError {
+        match result {
+            Ok(_) => panic!("expected cached table loading to fail"),
+            Err(err) => err,
+        }
     }
 }
