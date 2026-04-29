@@ -7,7 +7,7 @@ use std::{
 use arrow_json::ArrayWriter;
 use async_trait::async_trait;
 use datafusion::{
-    arrow::record_batch::RecordBatch,
+    arrow::{datatypes::DataType, record_batch::RecordBatch},
     catalog::{
         CatalogProvider, MemoryCatalogProvider, SchemaProvider, memory::MemorySchemaProvider,
     },
@@ -189,15 +189,19 @@ impl QueryEngine {
         let execution_sql = rewrite_sql_fast_paths(sql)?;
         let dataframe = ctx.sql(&execution_sql).await?;
         let mut stream = dataframe.execute_stream().await?;
-        let schema = stream
-            .schema()
-            .fields()
+        let stream_schema = stream.schema();
+        let fields = stream_schema.fields();
+        let schema = fields
             .iter()
             .map(|field| Column {
                 name: field.name().clone(),
                 data_type: field.data_type().to_string(),
                 nullable: field.is_nullable(),
             })
+            .collect();
+        let data_types = fields
+            .iter()
+            .map(|field| field.data_type().clone())
             .collect();
 
         let mut row_count = 0;
@@ -225,7 +229,9 @@ impl QueryEngine {
             batches.push(batch);
         }
 
-        Ok(QueryResult::from_batches(schema, batches))
+        Ok(QueryResult::from_batches_with_data_types(
+            schema, data_types, batches,
+        ))
     }
 }
 
@@ -1773,15 +1779,26 @@ impl ResolvedTableRef {
 pub struct QueryResult {
     pub columns: Vec<Column>,
     pub row_count: usize,
+    data_types: Vec<DataType>,
     store: Arc<dyn ResultStore>,
 }
 
 impl QueryResult {
     pub fn from_batches(columns: Vec<Column>, batches: Vec<RecordBatch>) -> Self {
+        let data_types = infer_result_data_types(&columns, &batches);
+        Self::from_batches_with_data_types(columns, data_types, batches)
+    }
+
+    pub fn from_batches_with_data_types(
+        columns: Vec<Column>,
+        data_types: Vec<DataType>,
+        batches: Vec<RecordBatch>,
+    ) -> Self {
         let store = Arc::new(InlineResultStore::new(batches));
         Self {
             columns,
             row_count: store.row_count(),
+            data_types,
             store,
         }
     }
@@ -1794,6 +1811,10 @@ impl QueryResult {
         self.store.page(start_row_offset, limit)
     }
 
+    pub fn data_types(&self) -> &[DataType] {
+        &self.data_types
+    }
+
     fn rows_json(&self) -> Result<serde_json::Value> {
         self.store.rows_json()
     }
@@ -1804,10 +1825,48 @@ impl fmt::Debug for QueryResult {
         formatter
             .debug_struct("QueryResult")
             .field("columns", &self.columns)
+            .field("data_types", &self.data_types)
             .field("row_count", &self.row_count)
             .field("store_kind", &self.store.kind())
             .field("retained_bytes", &self.store.retained_bytes())
             .finish()
+    }
+}
+
+fn infer_result_data_types(columns: &[Column], batches: &[RecordBatch]) -> Vec<DataType> {
+    if let Some(batch) = batches.first() {
+        return batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.data_type().clone())
+            .collect();
+    }
+
+    columns
+        .iter()
+        .map(|column| parse_column_data_type(&column.data_type).unwrap_or(DataType::Null))
+        .collect()
+}
+
+fn parse_column_data_type(value: &str) -> Option<DataType> {
+    match value.to_ascii_lowercase().as_str() {
+        "boolean" | "bool" => Some(DataType::Boolean),
+        "int8" => Some(DataType::Int8),
+        "int16" => Some(DataType::Int16),
+        "int32" => Some(DataType::Int32),
+        "int64" => Some(DataType::Int64),
+        "uint8" => Some(DataType::UInt8),
+        "uint16" => Some(DataType::UInt16),
+        "uint32" => Some(DataType::UInt32),
+        "uint64" => Some(DataType::UInt64),
+        "float32" => Some(DataType::Float32),
+        "float64" => Some(DataType::Float64),
+        "utf8" => Some(DataType::Utf8),
+        "largeutf8" | "large_utf8" => Some(DataType::LargeUtf8),
+        "date32" | "date32[day]" => Some(DataType::Date32),
+        "date64" | "date64[ms]" | "date64[millisecond]" => Some(DataType::Date64),
+        _ => None,
     }
 }
 
