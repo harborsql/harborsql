@@ -1,14 +1,24 @@
-use std::{collections::HashMap, sync::Arc, time::Instant};
+use std::{
+    any::Any,
+    collections::{BTreeSet, HashMap},
+    fmt,
+    sync::{Arc, Mutex, MutexGuard},
+    time::Instant,
+};
 
 use async_trait::async_trait;
+use datafusion::{
+    catalog::{CatalogProvider, CatalogProviderList, SchemaProvider, TableProvider},
+    error::DataFusionError,
+};
 use deltalake::{logstore::LogStore, open_table_with_storage_options};
-use object_store::path::Path as ObjectPath;
+use object_store::{ObjectStore, path::Path as ObjectPath};
 use url::Url;
 
 use crate::{
     config::Config,
     error::{HarborError, Result},
-    table_cache::{CachedTable, expires_at_from_unity_expiration_ms},
+    table_cache::{CachedTable, TableCache, expires_at_from_unity_expiration_ms},
     unity::{TableInfo, TemporaryTableCredentials, UnityCatalogClient},
 };
 
@@ -35,6 +45,213 @@ impl UnityCatalog for UnityCatalogClient {
         table_id: &str,
     ) -> Result<TemporaryTableCredentials> {
         UnityCatalogClient::temporary_table_credentials(self, bearer_token, table_id).await
+    }
+}
+
+#[derive(Clone)]
+pub(super) struct UnityCatalogProviderList {
+    unity: Arc<dyn UnityCatalog>,
+    table_opener: Arc<dyn TableOpener>,
+    config: Config,
+    bearer_token: Arc<str>,
+    table_cache: TableCache,
+    routes: ObjectStoreRouteRegistry,
+    catalogs: Arc<Mutex<HashMap<String, Arc<dyn CatalogProvider>>>>,
+}
+
+impl UnityCatalogProviderList {
+    pub(super) fn new(
+        unity: Arc<dyn UnityCatalog>,
+        table_opener: Arc<dyn TableOpener>,
+        config: Config,
+        bearer_token: &str,
+        table_cache: TableCache,
+        routes: ObjectStoreRouteRegistry,
+    ) -> Self {
+        Self {
+            unity,
+            table_opener,
+            config,
+            bearer_token: Arc::from(bearer_token),
+            table_cache,
+            routes,
+            catalogs: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+}
+
+impl fmt::Debug for UnityCatalogProviderList {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("UnityCatalogProviderList")
+            .field("catalogs", &self.catalog_names())
+            .finish_non_exhaustive()
+    }
+}
+
+impl CatalogProviderList for UnityCatalogProviderList {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn register_catalog(
+        &self,
+        name: String,
+        catalog: Arc<dyn CatalogProvider>,
+    ) -> Option<Arc<dyn CatalogProvider>> {
+        lock_unchecked(&self.catalogs).insert(name, catalog)
+    }
+
+    fn catalog_names(&self) -> Vec<String> {
+        lock_unchecked(&self.catalogs).keys().cloned().collect()
+    }
+
+    fn catalog(&self, name: &str) -> Option<Arc<dyn CatalogProvider>> {
+        let mut catalogs = lock_unchecked(&self.catalogs);
+        if let Some(catalog) = catalogs.get(name) {
+            return Some(catalog.clone());
+        }
+
+        let catalog = Arc::new(UnityCatalogProvider {
+            catalog_name: name.to_string(),
+            unity: self.unity.clone(),
+            table_opener: self.table_opener.clone(),
+            config: self.config.clone(),
+            bearer_token: self.bearer_token.clone(),
+            table_cache: self.table_cache.clone(),
+            routes: self.routes.clone(),
+            schemas: Mutex::new(HashMap::new()),
+        });
+        catalogs.insert(name.to_string(), catalog.clone());
+        Some(catalog)
+    }
+}
+
+struct UnityCatalogProvider {
+    catalog_name: String,
+    unity: Arc<dyn UnityCatalog>,
+    table_opener: Arc<dyn TableOpener>,
+    config: Config,
+    bearer_token: Arc<str>,
+    table_cache: TableCache,
+    routes: ObjectStoreRouteRegistry,
+    schemas: Mutex<HashMap<String, Arc<dyn SchemaProvider>>>,
+}
+
+impl fmt::Debug for UnityCatalogProvider {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("UnityCatalogProvider")
+            .field("catalog_name", &self.catalog_name)
+            .field("schemas", &self.schema_names())
+            .finish_non_exhaustive()
+    }
+}
+
+impl CatalogProvider for UnityCatalogProvider {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn schema_names(&self) -> Vec<String> {
+        lock_unchecked(&self.schemas).keys().cloned().collect()
+    }
+
+    fn schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
+        let mut schemas = lock_unchecked(&self.schemas);
+        if let Some(schema) = schemas.get(name) {
+            return Some(schema.clone());
+        }
+
+        let schema = Arc::new(UnitySchemaProvider {
+            catalog_name: self.catalog_name.clone(),
+            schema_name: name.to_string(),
+            unity: self.unity.clone(),
+            table_opener: self.table_opener.clone(),
+            config: self.config.clone(),
+            bearer_token: self.bearer_token.clone(),
+            table_cache: self.table_cache.clone(),
+            routes: self.routes.clone(),
+            known_tables: Mutex::new(BTreeSet::new()),
+        });
+        schemas.insert(name.to_string(), schema.clone());
+        Some(schema)
+    }
+}
+
+struct UnitySchemaProvider {
+    catalog_name: String,
+    schema_name: String,
+    unity: Arc<dyn UnityCatalog>,
+    table_opener: Arc<dyn TableOpener>,
+    config: Config,
+    bearer_token: Arc<str>,
+    table_cache: TableCache,
+    routes: ObjectStoreRouteRegistry,
+    known_tables: Mutex<BTreeSet<String>>,
+}
+
+impl fmt::Debug for UnitySchemaProvider {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("UnitySchemaProvider")
+            .field("catalog_name", &self.catalog_name)
+            .field("schema_name", &self.schema_name)
+            .field("known_tables", &self.table_names())
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait]
+impl SchemaProvider for UnitySchemaProvider {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn table_names(&self) -> Vec<String> {
+        lock_unchecked(&self.known_tables).iter().cloned().collect()
+    }
+
+    async fn table(
+        &self,
+        name: &str,
+    ) -> datafusion::error::Result<Option<Arc<dyn TableProvider>>, DataFusionError> {
+        let full_name = format!("{}.{}.{}", self.catalog_name, self.schema_name, name);
+        let unity = self.unity.clone();
+        let table_opener = self.table_opener.clone();
+        let config = self.config.clone();
+        let bearer_token = self.bearer_token.clone();
+        let bearer_token_for_load = bearer_token.clone();
+        let full_name_for_load = full_name.clone();
+        let cached_table = self
+            .table_cache
+            .get_or_load(
+                &bearer_token,
+                &full_name,
+                &self.config.aws_region,
+                || async move {
+                    load_cached_table(
+                        unity,
+                        table_opener,
+                        config,
+                        &bearer_token_for_load,
+                        &full_name_for_load,
+                    )
+                    .await
+                },
+            )
+            .await
+            .map_err(to_datafusion_error)?;
+
+        self.routes
+            .record(&cached_table)
+            .map_err(to_datafusion_error)?;
+        lock_unchecked(&self.known_tables).insert(name.to_string());
+        Ok(Some(cached_table.provider.clone()))
+    }
+
+    fn table_exist(&self, name: &str) -> bool {
+        lock_unchecked(&self.known_tables).contains(name)
     }
 }
 
@@ -157,4 +374,58 @@ pub(super) fn table_object_store_route(table_url: &str) -> Result<(Url, String)>
     object_store_url.set_fragment(None);
 
     Ok((object_store_url, prefix))
+}
+
+#[derive(Clone)]
+pub(super) struct ObjectStoreRoute {
+    pub(super) prefix: String,
+    pub(super) store: Arc<dyn ObjectStore>,
+}
+
+impl fmt::Debug for ObjectStoreRoute {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ObjectStoreRoute")
+            .field("prefix", &self.prefix)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Default)]
+pub(super) struct ObjectStoreRouteRegistry {
+    routes: Arc<Mutex<HashMap<String, (Url, Vec<ObjectStoreRoute>)>>>,
+}
+
+impl ObjectStoreRouteRegistry {
+    pub(super) fn record(&self, cached_table: &CachedTable) -> Result<()> {
+        lock_checked(&self.routes)?
+            .entry(cached_table.object_store_url.to_string())
+            .or_insert_with(|| (cached_table.object_store_url.clone(), Vec::new()))
+            .1
+            .push(ObjectStoreRoute {
+                prefix: cached_table.object_prefix.clone(),
+                store: cached_table.object_store.clone(),
+            });
+        Ok(())
+    }
+
+    pub(super) fn routes(&self) -> Result<Vec<(Url, Vec<ObjectStoreRoute>)>> {
+        Ok(lock_checked(&self.routes)?.values().cloned().collect())
+    }
+}
+
+fn to_datafusion_error(error: HarborError) -> DataFusionError {
+    DataFusionError::External(Box::new(error))
+}
+
+fn lock_checked<T>(mutex: &Mutex<T>) -> Result<MutexGuard<'_, T>> {
+    mutex
+        .lock()
+        .map_err(|_| HarborError::Query("Unity catalog provider lock was poisoned".into()))
+}
+
+fn lock_unchecked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .expect("Unity catalog provider lock should not be poisoned")
 }
