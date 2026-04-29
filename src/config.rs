@@ -20,6 +20,7 @@ pub const DEFAULT_TABLE_CACHE_TTL_SECONDS: u64 = 300;
 pub const DEFAULT_TABLE_CACHE_MAX_ENTRIES: usize = 1024;
 pub const TABLE_CACHE_CREDENTIAL_EXPIRY_SKEW_SECONDS: u64 = 60;
 pub const DEFAULT_UNSAFE_ALLOW_HTTP_DATABRICKS_HOST: bool = false;
+pub const DEFAULT_UNSAFE_LOG_SQL: bool = false;
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -46,6 +47,7 @@ pub struct Config {
     pub table_cache_ttl: Duration,
     pub table_cache_max_entries: usize,
     pub table_cache_credential_expiry_skew: Duration,
+    pub unsafe_log_sql: bool,
 }
 
 impl Config {
@@ -74,6 +76,7 @@ impl Config {
             "HARBORSQL_UNSAFE_ALLOW_HTTP_DATABRICKS_HOST",
             DEFAULT_UNSAFE_ALLOW_HTTP_DATABRICKS_HOST,
         )?;
+        let unsafe_log_sql = parse_bool_env("HARBORSQL_UNSAFE_LOG_SQL", DEFAULT_UNSAFE_LOG_SQL)?;
         let default_target_partitions = default_target_partitions();
 
         Ok(Self {
@@ -145,6 +148,7 @@ impl Config {
             table_cache_credential_expiry_skew: Duration::from_secs(
                 TABLE_CACHE_CREDENTIAL_EXPIRY_SKEW_SECONDS,
             ),
+            unsafe_log_sql,
         })
     }
 }

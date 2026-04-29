@@ -1,6 +1,7 @@
 mod config;
 mod engine;
 mod error;
+mod observability;
 mod server;
 mod table_cache;
 mod thrift;
@@ -22,6 +23,7 @@ async fn main() -> Result<()> {
         .init();
 
     let config = Config::from_env()?;
+    observability::init(config.unsafe_log_sql);
     let engine = QueryEngine::new(config.clone());
 
     let mut args = env::args().skip(1);

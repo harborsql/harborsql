@@ -1,4 +1,4 @@
-use std::{error::Error, fmt, sync::Arc};
+use std::{error::Error, fmt, sync::Arc, time::Instant};
 
 use arrow_json::ArrayWriter;
 use async_trait::async_trait;
@@ -27,10 +27,13 @@ use sqlparser::{
     parser::Parser,
 };
 use tokio::time::timeout;
+use tracing::{Instrument, field};
+use uuid::Uuid;
 
 use crate::{
     config::Config,
     error::{HarborError, Result},
+    observability,
     table_cache::TableCache,
     udf,
     unity::UnityCatalogClient,
@@ -85,18 +88,89 @@ impl QueryEngine {
         default_catalog: &str,
         default_schema: &str,
     ) -> Result<QueryResult> {
-        match timeout(
+        self.execute_with_query_id(None, bearer_token, sql, default_catalog, default_schema)
+            .await
+    }
+
+    pub async fn execute_with_query_id(
+        &self,
+        query_id: Option<&str>,
+        bearer_token: &str,
+        sql: &str,
+        default_catalog: &str,
+        default_schema: &str,
+    ) -> Result<QueryResult> {
+        let generated_query_id;
+        let query_id = match query_id {
+            Some(query_id) => query_id,
+            None => {
+                generated_query_id = Uuid::new_v4().to_string();
+                &generated_query_id
+            }
+        };
+        let sql_observation = observability::get().sql_observation(sql);
+        let catalog_hash = observability::stable_hash(default_catalog);
+        let schema_hash = observability::stable_hash(default_schema);
+        let span = tracing::info_span!(
+            "query",
+            query_id = %query_id,
+            catalog_hash = %catalog_hash,
+            schema_hash = %schema_hash,
+            sql_hash = %sql_observation.hash,
+            sql_len = sql_observation.len,
+            sql = field::Empty,
+        );
+        if let Some(sql) = sql_observation.text.as_deref() {
+            span.record("sql", field::display(sql));
+        }
+
+        observability::get()
+            .metrics()
+            .increment("harborsql_queries_started_total");
+        let started = Instant::now();
+        let timeout_result = timeout(
             self.config.query_timeout,
             self.execute_inner(bearer_token, sql, default_catalog, default_schema),
         )
+        .instrument(span)
         .await
-        {
-            Ok(result) => result,
-            Err(_) => Err(HarborError::Query(format!(
+        .unwrap_or_else(|_| {
+            Err(HarborError::Query(format!(
                 "query exceeded HARBORSQL_QUERY_TIMEOUT_SECONDS={}",
                 self.config.query_timeout.as_secs()
-            ))),
+            )))
+        });
+
+        let duration = started.elapsed();
+        observability::get()
+            .metrics()
+            .observe_duration("query_total", duration);
+        match &timeout_result {
+            Ok(result) => {
+                observability::get()
+                    .metrics()
+                    .increment("harborsql_queries_succeeded_total");
+                tracing::info!(
+                    duration_ms = duration.as_millis() as u64,
+                    row_count = result.row_count,
+                    "query completed"
+                );
+            }
+            Err(error) => {
+                observability::get()
+                    .metrics()
+                    .increment("harborsql_queries_failed_total");
+                let client_error = error.client_error();
+                tracing::warn!(
+                    duration_ms = duration.as_millis() as u64,
+                    error_code = client_error.code,
+                    internal_error = %error.redacted_internal_message(),
+                    "query failed"
+                );
+            }
         }
+
+        timeout_result
     }
 
     async fn execute_inner(
@@ -143,14 +217,27 @@ impl QueryEngine {
         )));
 
         let execution_sql = rewrite_sql_fast_paths(sql);
-        let dataframe = plan_sql(&ctx, &execution_sql).await?;
+        let plan_started = Instant::now();
+        let dataframe = plan_sql(&ctx, &execution_sql)
+            .instrument(tracing::info_span!("datafusion_planning"))
+            .await?;
+        observability::get()
+            .metrics()
+            .observe_duration("datafusion_planning", plan_started.elapsed());
         for (object_store_url, routes) in object_store_routes.routes()? {
             ctx.register_object_store(
                 &object_store_url,
                 Arc::new(PrefixRoutingObjectStore::new(routes)),
             );
         }
-        let stream = dataframe.execute_stream().await?;
+        let execution_started = Instant::now();
+        let stream = dataframe
+            .execute_stream()
+            .instrument(tracing::info_span!("datafusion_execution"))
+            .await?;
+        observability::get()
+            .metrics()
+            .observe_duration("datafusion_execute_stream", execution_started.elapsed());
         materialize_stream(
             stream,
             ResultLimits {
@@ -158,6 +245,7 @@ impl QueryEngine {
                 max_bytes: self.config.max_result_bytes,
             },
         )
+        .instrument(tracing::info_span!("result_materialization"))
         .await
     }
 }
@@ -1587,6 +1675,7 @@ mod tests {
             table_cache_ttl: Duration::ZERO,
             table_cache_max_entries: 0,
             table_cache_credential_expiry_skew: Duration::ZERO,
+            unsafe_log_sql: false,
         }
     }
 

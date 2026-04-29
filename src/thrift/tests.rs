@@ -608,6 +608,7 @@ fn test_config() -> Config {
         table_cache_ttl: Duration::from_secs(60),
         table_cache_max_entries: 16,
         table_cache_credential_expiry_skew: Duration::from_secs(1),
+        unsafe_log_sql: false,
     }
 }
 

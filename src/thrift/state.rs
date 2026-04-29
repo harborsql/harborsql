@@ -45,6 +45,10 @@ pub(super) struct OperationState {
 }
 
 impl OperationState {
+    pub(super) fn is_active(&self) -> bool {
+        self.state.is_active()
+    }
+
     pub(super) fn has_finished_task(&self) -> bool {
         matches!(&self.state, OperationExecution::Running { task, .. } if task.is_finished())
     }
@@ -128,6 +132,10 @@ pub(super) enum OperationExecution {
 }
 
 impl OperationExecution {
+    pub(super) fn is_active(&self) -> bool {
+        matches!(self, Self::Running { .. } | Self::Refreshing { .. })
+    }
+
     pub(super) fn from_completion(completion: OperationCompletion) -> Self {
         let completed_at = Instant::now();
         match completion.result {
