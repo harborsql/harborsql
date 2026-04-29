@@ -179,6 +179,7 @@ fn databricks_host() -> String {
 fn configured_databricks_host() -> Option<String> {
     optional_env("HARBORSQL_DATABRICKS_HOST")
         .or_else(|| optional_env("DATABRICKS_HOST"))
+        .or_else(|| optional_env("BENCH_EU_DATABRICKS_HOSTNAME"))
         .or_else(|| optional_env("BENCH_US_DATABRICKS_HOSTNAME"))
 }
 
