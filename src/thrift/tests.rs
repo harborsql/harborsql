@@ -1,0 +1,696 @@
+use std::{
+    net::SocketAddr,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+use datafusion::arrow::{
+    array::{Array, BooleanArray, Float64Array, Int32Array, Int64Array, StringArray},
+    datatypes::{DataType, Field, Schema},
+    record_batch::RecordBatch,
+};
+
+use crate::{engine::Column, error::ClientError};
+
+use super::codec::{MAX_CONTAINER_ELEMENTS, MAX_SKIP_DEPTH};
+use super::result_encoding::{null_bitset, row_page, write_row_set};
+use super::*;
+
+const GOLDEN_OPEN_SESSION_REQUEST: &[u8] = &[
+    0x80, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x0b, b'O', b'p', b'e', b'n', b'S', b'e', b's', b's',
+    b'i', b'o', b'n', 0x00, 0x00, 0x00, 0x07, 0x0c, 0x00, 0x01, 0x0c, 0x05, 0x04, 0x0b, 0x00, 0x01,
+    0x00, 0x00, 0x00, 0x04, b'm', b'a', b'i', b'n', 0x0b, 0x00, 0x02, 0x00, 0x00, 0x00, 0x07, b'd',
+    b'e', b'f', b'a', b'u', b'l', b't', 0x00, 0x00, 0x00,
+];
+
+#[test]
+fn golden_open_session_request_decodes() {
+    let message = decode_message(GOLDEN_OPEN_SESSION_REQUEST).unwrap();
+
+    assert_eq!(message.name, "OpenSession");
+    assert_eq!(message.message_type, T_MESSAGE_CALL);
+    assert_eq!(message.seqid, 7);
+
+    let request = read_args(message.payload, read_open_session_req).unwrap();
+    assert_eq!(request.catalog.as_deref(), Some("main"));
+    assert_eq!(request.schema.as_deref(), Some("default"));
+}
+
+#[test]
+fn skip_rejects_large_containers() {
+    let mut bytes = vec![T_I32];
+    bytes.extend(((MAX_CONTAINER_ELEMENTS + 1) as i32).to_be_bytes());
+
+    let err = Reader::new(&bytes).skip(T_LIST).unwrap_err().to_string();
+
+    assert!(err.contains("size exceeds maximum"));
+}
+
+#[test]
+fn skip_rejects_stop_as_container_element_type() {
+    let mut bytes = vec![T_STOP];
+    bytes.extend(0_i32.to_be_bytes());
+
+    let err = Reader::new(&bytes).skip(T_LIST).unwrap_err().to_string();
+
+    assert!(err.contains("invalid Thrift list/set element type"));
+}
+
+#[test]
+fn skip_rejects_stop_as_map_key_or_value_type() {
+    let mut bytes = vec![T_STOP, T_I32];
+    bytes.extend(0_i32.to_be_bytes());
+
+    let err = Reader::new(&bytes).skip(T_MAP).unwrap_err().to_string();
+
+    assert!(err.contains("invalid Thrift map key type"));
+}
+
+#[test]
+fn skip_rejects_excessive_nesting_depth() {
+    let mut bytes = Vec::new();
+    for _ in 0..=MAX_SKIP_DEPTH {
+        bytes.push(T_LIST);
+        bytes.extend(1_i32.to_be_bytes());
+    }
+    bytes.push(T_I32);
+    bytes.extend(1_i32.to_be_bytes());
+    bytes.extend(42_i32.to_be_bytes());
+
+    let err = Reader::new(&bytes).skip(T_LIST).unwrap_err().to_string();
+
+    assert!(err.contains("nesting depth exceeds maximum"));
+}
+
+#[tokio::test]
+async fn service_handles_open_execute_status_metadata_fetch_and_close() {
+    let config = test_config();
+    let service = DatabricksThriftService::new(config.clone(), QueryEngine::new(config));
+    let token = "test-token";
+
+    let open_response = service
+        .handle(token, &open_session_call(1, "main", "default"))
+        .await
+        .unwrap();
+    let session = read_handle_response(&open_response, "OpenSession", 3, read_session_handle);
+
+    let execute_response = service
+        .handle(token, &execute_statement_call(2, &session, "SET"))
+        .await
+        .unwrap();
+    let operation = read_handle_response(
+        &execute_response,
+        "ExecuteStatement",
+        2,
+        read_operation_handle,
+    );
+
+    let mut state = RUNNING_STATE;
+    for _ in 0..20 {
+        let status_response = service
+            .handle(token, &operation_call("GetOperationStatus", 3, &operation))
+            .await
+            .unwrap();
+        let (status_code, operation_state, has_result_set) =
+            read_operation_status_response(&status_response);
+        assert_eq!(status_code, SUCCESS_STATUS);
+        state = operation_state;
+        if state == FINISHED_STATE {
+            assert!(has_result_set);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(state, FINISHED_STATE);
+
+    let metadata_response = service
+        .handle(
+            token,
+            &operation_call("GetResultSetMetadata", 4, &operation),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        read_top_level_status(&metadata_response, "GetResultSetMetadata"),
+        SUCCESS_STATUS
+    );
+
+    let fetch_response = service
+        .handle(token, &fetch_results_call(5, &operation, 0, 10))
+        .await
+        .unwrap();
+    assert_eq!(
+        read_top_level_status(&fetch_response, "FetchResults"),
+        SUCCESS_STATUS
+    );
+
+    let close_operation_response = service
+        .handle(token, &operation_call("CloseOperation", 6, &operation))
+        .await
+        .unwrap();
+    assert_eq!(
+        read_top_level_status(&close_operation_response, "CloseOperation"),
+        SUCCESS_STATUS
+    );
+
+    let close_session_response = service
+        .handle(token, &close_session_call(7, &session))
+        .await
+        .unwrap();
+    assert_eq!(
+        read_top_level_status(&close_session_response, "CloseSession"),
+        SUCCESS_STATUS
+    );
+}
+
+#[tokio::test]
+async fn service_handles_cancellation_and_invalid_handles() {
+    let config = test_config();
+    let service = DatabricksThriftService::new(config.clone(), QueryEngine::new(config));
+    let token = "test-token";
+    let operation_id = Uuid::new_v4();
+    let secret = Uuid::new_v4();
+    let task = tokio::spawn(futures::future::pending::<OperationCompletion>());
+    let operation = Handle {
+        id: operation_id.to_string(),
+        secret: *secret.as_bytes(),
+    };
+
+    service.operations.write().await.insert(
+        operation.id.clone(),
+        OperationState {
+            secret: operation.secret,
+            session_id: "session".to_string(),
+            token_fingerprint: token_fingerprint(token),
+            state: OperationExecution::Running {
+                started: Instant::now(),
+                task,
+            },
+        },
+    );
+
+    let cancel_response = service
+        .handle(token, &operation_call("CancelOperation", 1, &operation))
+        .await
+        .unwrap();
+    assert_eq!(
+        read_top_level_status(&cancel_response, "CancelOperation"),
+        SUCCESS_STATUS
+    );
+    let stored_state = service
+        .operations
+        .read()
+        .await
+        .get(&operation.id)
+        .map(|operation| operation.state.operation_state());
+    assert_eq!(stored_state, Some(CANCELED_STATE));
+
+    let invalid = Handle {
+        id: Uuid::new_v4().to_string(),
+        secret: *Uuid::new_v4().as_bytes(),
+    };
+    let invalid_response = service
+        .handle(token, &operation_call("GetOperationStatus", 2, &invalid))
+        .await
+        .unwrap();
+    assert_eq!(
+        read_top_level_status(&invalid_response, "GetOperationStatus"),
+        INVALID_HANDLE_STATUS
+    );
+}
+
+#[test]
+fn row_set_encodes_typed_value_columns() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("flag", DataType::Boolean, true),
+        Field::new("small", DataType::Int32, true),
+        Field::new("big", DataType::Int64, true),
+        Field::new("ratio", DataType::Float64, true),
+        Field::new("name", DataType::Utf8, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(BooleanArray::from(vec![Some(true)])),
+            Arc::new(Int32Array::from(vec![Some(7)])),
+            Arc::new(Int64Array::from(vec![Some(8)])),
+            Arc::new(Float64Array::from(vec![Some(1.5)])),
+            Arc::new(StringArray::from(vec![Some("harbor")])),
+        ],
+    )
+    .unwrap();
+    let result = QueryResult::from_batches(
+        vec![
+            Column {
+                name: "flag".to_string(),
+                data_type: "Boolean".to_string(),
+                nullable: true,
+            },
+            Column {
+                name: "small".to_string(),
+                data_type: "Int32".to_string(),
+                nullable: true,
+            },
+            Column {
+                name: "big".to_string(),
+                data_type: "Int64".to_string(),
+                nullable: true,
+            },
+            Column {
+                name: "ratio".to_string(),
+                data_type: "Float64".to_string(),
+                nullable: true,
+            },
+            Column {
+                name: "name".to_string(),
+                data_type: "Utf8".to_string(),
+                nullable: true,
+            },
+        ],
+        vec![batch],
+    );
+    let page = row_page(&result, 0, Some(1));
+    let mut writer = Writer::new();
+    write_row_set(&mut writer, &result, &page);
+
+    let bytes = writer.into_inner();
+    let mut reader = Reader::new(&bytes);
+    let mut encoded_column_fields = Vec::new();
+    loop {
+        let (field_type, field_id) = reader.read_field_begin().unwrap();
+        if field_type == T_STOP {
+            break;
+        }
+        if field_id == 3 {
+            assert_eq!(field_type, T_LIST);
+            assert_eq!(reader.read_u8().unwrap(), T_STRUCT);
+            assert_eq!(reader.read_i32().unwrap(), 5);
+            for _ in 0..5 {
+                let (column_type, column_field_id) = reader.read_field_begin().unwrap();
+                encoded_column_fields.push((column_type, column_field_id));
+                reader.skip(column_type).unwrap();
+                let (stop, _) = reader.read_field_begin().unwrap();
+                assert_eq!(stop, T_STOP);
+            }
+        } else {
+            reader.skip(field_type).unwrap();
+        }
+    }
+
+    assert_eq!(
+        encoded_column_fields,
+        vec![
+            (T_STRUCT, 1),
+            (T_STRUCT, 4),
+            (T_STRUCT, 5),
+            (T_STRUCT, 6),
+            (T_STRUCT, 7)
+        ]
+    );
+}
+
+#[test]
+fn row_page_respects_offset_and_limit() {
+    let result = int_result(&[Some(1), Some(2), Some(3)]);
+
+    let page = row_page(&result, 1, Some(1));
+
+    assert_eq!(page.start_row_offset, 1);
+    assert_eq!(page.row_count, 1);
+    let ids = page.batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    assert_eq!(ids.value(0), 2);
+    assert!(page.has_more_rows);
+}
+
+#[test]
+fn row_page_clamps_negative_offset_and_large_limit() {
+    let result = int_result(&[Some(1), Some(2)]);
+
+    let page = row_page(&result, -10, Some((MAX_FETCH_ROWS + 100) as i64));
+
+    assert_eq!(page.start_row_offset, 0);
+    assert_eq!(page.row_count, 2);
+    assert!(!page.has_more_rows);
+}
+
+#[test]
+fn row_page_can_span_record_batches() {
+    let result = int_result_from_batches(&[&[Some(1), Some(2)], &[Some(3), Some(4)]]);
+
+    let page = row_page(&result, 1, Some(2));
+
+    assert_eq!(page.start_row_offset, 1);
+    assert_eq!(page.row_count, 2);
+    assert_eq!(page.batches.len(), 2);
+    let first = page.batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    let second = page.batches[1]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    assert_eq!(first.value(0), 2);
+    assert_eq!(second.value(0), 3);
+    assert!(page.has_more_rows);
+}
+
+#[test]
+fn null_bitset_reads_arrow_nulls() {
+    let result = int_result(&[Some(1), None, Some(3), None, Some(5)]);
+    let page = row_page(&result, 0, Some(5));
+
+    assert_eq!(
+        null_bitset(&page.batches, 0, page.row_count),
+        vec![0b0000_1010]
+    );
+}
+
+fn int_result(values: &[Option<i32>]) -> QueryResult {
+    int_result_from_batches(&[values])
+}
+
+fn int_result_from_batches(values: &[&[Option<i32>]]) -> QueryResult {
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, true)]));
+    let batches = values
+        .iter()
+        .map(|values| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int32Array::from(values.to_vec()))],
+            )
+            .unwrap()
+        })
+        .collect();
+    QueryResult::from_batches(
+        vec![Column {
+            name: "id".to_string(),
+            data_type: "Int32".to_string(),
+            nullable: true,
+        }],
+        batches,
+    )
+}
+
+#[test]
+fn handle_identifier_reads_guid_and_secret() {
+    let guid = Uuid::new_v4();
+    let secret = Uuid::new_v4();
+    let mut writer = Writer::new();
+    write_handle_identifier(&mut writer, guid.as_bytes(), secret.as_bytes());
+
+    let bytes = writer.into_inner();
+    let mut reader = Reader::new(&bytes);
+    let handle = read_handle_identifier(&mut reader).unwrap().unwrap();
+
+    assert_eq!(handle.id, guid.to_string());
+    assert_eq!(handle.secret, *secret.as_bytes());
+}
+
+#[test]
+fn handle_identifier_without_secret_is_invalid() {
+    let guid = Uuid::new_v4();
+    let mut writer = Writer::new();
+    writer.write_field(T_STRING, 1, |writer| writer.write_binary(guid.as_bytes()));
+    writer.write_stop();
+
+    let bytes = writer.into_inner();
+    let mut reader = Reader::new(&bytes);
+    let handle = read_handle_identifier(&mut reader).unwrap();
+
+    assert!(handle.is_none());
+}
+
+#[tokio::test]
+async fn cancel_marks_running_operation_canceled() {
+    let task = tokio::spawn(futures::future::pending::<OperationCompletion>());
+    let mut operation = OperationState {
+        secret: [0; 16],
+        session_id: "session".to_string(),
+        token_fingerprint: [0; 32],
+        state: OperationExecution::Running {
+            started: Instant::now(),
+            task,
+        },
+    };
+
+    operation.cancel();
+
+    assert_eq!(operation.state.operation_state(), CANCELED_STATE);
+    assert_eq!(operation.state.history_status(), "CANCELED");
+}
+
+#[test]
+fn cancel_keeps_finished_operation_finished() {
+    let mut operation = OperationState {
+        secret: [0; 16],
+        session_id: "session".to_string(),
+        token_fingerprint: [0; 32],
+        state: OperationExecution::Finished {
+            result: Arc::new(QueryResult::empty()),
+            duration_ms: 5,
+            completed_at: Instant::now(),
+        },
+    };
+
+    operation.cancel();
+
+    assert_eq!(operation.state.operation_state(), FINISHED_STATE);
+    assert_eq!(operation.state.history_status(), "FINISHED");
+}
+
+#[test]
+fn failed_operation_reports_client_error_message() {
+    let operation = OperationExecution::from_completion(OperationCompletion {
+        duration_ms: 5,
+        result: Err(ClientError::new("QUERY_FAILED", "query execution failed")),
+    });
+
+    assert_eq!(operation.operation_state(), ERROR_STATE);
+    assert_eq!(
+        operation.error_message().as_deref(),
+        Some("QUERY_FAILED: query execution failed")
+    );
+}
+
+#[test]
+fn completed_operation_expires_after_ttl() {
+    let operation = OperationState {
+        secret: [0; 16],
+        session_id: "session".to_string(),
+        token_fingerprint: [0; 32],
+        state: OperationExecution::Finished {
+            result: Arc::new(QueryResult::empty()),
+            duration_ms: 5,
+            completed_at: Instant::now() - Duration::from_secs(30),
+        },
+    };
+
+    assert!(operation.is_expired(Instant::now(), Duration::from_secs(10)));
+}
+
+#[tokio::test]
+async fn running_operation_does_not_expire_by_completed_ttl() {
+    let task = tokio::spawn(futures::future::pending::<OperationCompletion>());
+    let operation = OperationState {
+        secret: [0; 16],
+        session_id: "session".to_string(),
+        token_fingerprint: [0; 32],
+        state: OperationExecution::Running {
+            started: Instant::now() - Duration::from_secs(30),
+            task,
+        },
+    };
+
+    assert!(!operation.is_expired(Instant::now(), Duration::from_secs(10)));
+    operation.abort();
+}
+
+fn test_config() -> Config {
+    Config {
+        bind_addr: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+        databricks_host: "https://example.com".to_string(),
+        default_catalog: "main".to_string(),
+        default_schema: "default".to_string(),
+        aws_region: "us-west-2".to_string(),
+        max_result_rows: Some(100),
+        max_result_bytes: Some(1024 * 1024),
+        unity_request_timeout: Duration::from_secs(1),
+        query_timeout: Duration::from_secs(1),
+        idle_session_timeout: Duration::from_secs(60),
+        completed_operation_ttl: Duration::from_secs(60),
+        cleanup_interval: Duration::from_secs(60),
+        max_sessions: 16,
+        max_operations: 16,
+        request_body_limit_bytes: 1024 * 1024,
+        parquet_pushdown_filters: true,
+        parquet_reorder_filters: true,
+        target_partitions: 2,
+        skip_partial_aggregation_probe_rows_threshold: 10_000,
+        skip_partial_aggregation_probe_ratio_threshold: 0.8,
+        table_cache_ttl: Duration::from_secs(60),
+        table_cache_max_entries: 16,
+        table_cache_credential_expiry_skew: Duration::from_secs(1),
+    }
+}
+
+fn open_session_call(seqid: i32, catalog: &str, schema: &str) -> Vec<u8> {
+    call("OpenSession", seqid, |writer| {
+        writer.write_field(T_STRUCT, 1284, |writer| {
+            write_namespace(writer, catalog, schema)
+        });
+    })
+}
+
+fn close_session_call(seqid: i32, session: &Handle) -> Vec<u8> {
+    call("CloseSession", seqid, |writer| {
+        writer.write_field(T_STRUCT, 1, |writer| {
+            write_session_handle_value(writer, session)
+        });
+    })
+}
+
+fn execute_statement_call(seqid: i32, session: &Handle, statement: &str) -> Vec<u8> {
+    call("ExecuteStatement", seqid, |writer| {
+        writer.write_field(T_STRUCT, 1, |writer| {
+            write_session_handle_value(writer, session)
+        });
+        writer.write_field(T_STRING, 2, |writer| writer.write_string(statement));
+    })
+}
+
+fn operation_call(method: &str, seqid: i32, operation: &Handle) -> Vec<u8> {
+    call(method, seqid, |writer| {
+        writer.write_field(T_STRUCT, 1, |writer| {
+            write_operation_handle_value(writer, operation)
+        });
+    })
+}
+
+fn fetch_results_call(seqid: i32, operation: &Handle, start: i64, max_rows: i64) -> Vec<u8> {
+    call("FetchResults", seqid, |writer| {
+        writer.write_field(T_STRUCT, 1, |writer| {
+            write_operation_handle_value(writer, operation)
+        });
+        writer.write_field(T_I64, 3, |writer| writer.write_i64(max_rows));
+        writer.write_field(T_I64, 1282, |writer| writer.write_i64(start));
+    })
+}
+
+fn call(method: &str, seqid: i32, write_req: impl FnOnce(&mut Writer)) -> Vec<u8> {
+    let mut writer = Writer::new();
+    writer.write_message_begin(method, T_MESSAGE_CALL, seqid);
+    writer.write_field(T_STRUCT, 1, |writer| {
+        write_req(writer);
+        writer.write_stop();
+    });
+    writer.write_stop();
+    writer.into_inner()
+}
+
+fn write_session_handle_value(writer: &mut Writer, handle: &Handle) {
+    let id = Uuid::parse_str(&handle.id).unwrap();
+    write_session_handle(writer, id.as_bytes(), &handle.secret);
+}
+
+fn write_operation_handle_value(writer: &mut Writer, handle: &Handle) {
+    let id = Uuid::parse_str(&handle.id).unwrap();
+    write_operation_handle(writer, id.as_bytes(), &handle.secret, true);
+}
+
+fn read_handle_response(
+    response: &[u8],
+    method: &str,
+    handle_field_id: i16,
+    read_handle: fn(&mut Reader<'_>) -> Result<Option<Handle>>,
+) -> Handle {
+    let mut reader = success_reader(response, method);
+    let mut status = None;
+    let mut handle = None;
+    loop {
+        let (field_type, field_id) = reader.read_field_begin().unwrap();
+        if field_type == T_STOP {
+            break;
+        }
+        if field_id == 1 && field_type == T_STRUCT {
+            status = Some(read_status_code(&mut reader));
+        } else if field_id == handle_field_id && field_type == T_STRUCT {
+            handle = read_handle(&mut reader).unwrap();
+        } else {
+            reader.skip(field_type).unwrap();
+        }
+    }
+
+    assert_eq!(status, Some(SUCCESS_STATUS));
+    handle.unwrap()
+}
+
+fn read_operation_status_response(response: &[u8]) -> (i32, i32, bool) {
+    let mut reader = success_reader(response, "GetOperationStatus");
+    let mut status = None;
+    let mut state = None;
+    let mut has_result_set = None;
+    loop {
+        let (field_type, field_id) = reader.read_field_begin().unwrap();
+        if field_type == T_STOP {
+            break;
+        }
+        match (field_id, field_type) {
+            (1, T_STRUCT) => status = Some(read_status_code(&mut reader)),
+            (2, T_I32) => state = Some(reader.read_i32().unwrap()),
+            (9, T_BOOL) => has_result_set = Some(reader.read_u8().unwrap() != 0),
+            _ => reader.skip(field_type).unwrap(),
+        }
+    }
+    (
+        status.unwrap(),
+        state.unwrap_or_default(),
+        has_result_set.unwrap_or(false),
+    )
+}
+
+fn read_top_level_status(response: &[u8], method: &str) -> i32 {
+    let mut reader = success_reader(response, method);
+    loop {
+        let (field_type, field_id) = reader.read_field_begin().unwrap();
+        if field_type == T_STOP {
+            panic!("{method} response did not include status");
+        }
+        if field_id == 1 && field_type == T_STRUCT {
+            return read_status_code(&mut reader);
+        }
+        reader.skip(field_type).unwrap();
+    }
+}
+
+fn read_status_code(reader: &mut Reader<'_>) -> i32 {
+    let mut status = None;
+    loop {
+        let (field_type, field_id) = reader.read_field_begin().unwrap();
+        if field_type == T_STOP {
+            break;
+        }
+        if field_id == 1 && field_type == T_I32 {
+            status = Some(reader.read_i32().unwrap());
+        } else {
+            reader.skip(field_type).unwrap();
+        }
+    }
+    status.unwrap()
+}
+
+fn success_reader<'a>(response: &'a [u8], method: &str) -> Reader<'a> {
+    let message = decode_message(response).unwrap();
+    assert_eq!(message.name, method);
+    assert_eq!(message.message_type, T_MESSAGE_REPLY);
+    let mut reader = Reader::new(message.payload);
+    let (field_type, field_id) = reader.read_field_begin().unwrap();
+    assert_eq!((field_type, field_id), (T_STRUCT, 0));
+    reader
+}
