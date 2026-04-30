@@ -209,8 +209,18 @@ Override `HARBORSQL_CONNECTOR_SMOKE_TYPE_MATRIX_TABLE` or
 probe table. CI runs local connector coverage and Databricks-backed integration
 coverage as separate steps so failures identify the boundary that broke.
 
-The GitHub Actions workflow expects these repository secrets for the required
-OAuth-backed integration smoke:
+The GitHub Actions workflow always runs the local connector smoke test. The
+Databricks-backed integration smoke is opt-in; set the repository variable
+`DATABRICKS_CONNECTOR_SMOKE_ENABLED=true` after the test principal has access to
+the probe table. For the default table, the principal needs:
+
+```sql
+GRANT USE CATALOG ON CATALOG bench_eu TO `<service-principal-application-id>`;
+GRANT USE SCHEMA ON SCHEMA bench_eu.harborsql_delta_types TO `<service-principal-application-id>`;
+GRANT SELECT ON TABLE bench_eu.harborsql_delta_types.delta_type_matrix TO `<service-principal-application-id>`;
+```
+
+OAuth-backed integration smoke uses these repository secrets:
 
 - `BENCH_US_DATABRICKS_HOSTNAME`
 - `BENCH_EU_DATABRICKS_HOSTNAME`
