@@ -209,14 +209,21 @@ Override `HARBORSQL_CONNECTOR_SMOKE_TYPE_MATRIX_TABLE` or
 probe table. CI runs local connector coverage and Databricks-backed integration
 coverage as separate steps so failures identify the boundary that broke.
 
-The GitHub Actions workflow expects these repository secrets:
+The GitHub Actions workflow expects these repository secrets for the required
+OAuth-backed integration smoke:
 
 - `BENCH_US_DATABRICKS_HOSTNAME`
 - `BENCH_EU_DATABRICKS_HOSTNAME`
 - `DATABRICKS_ACCOUNT_ID`
 - `TEST_CI_DATABRICKS_CLIENT_ID`
 - `TEST_CI_DATABRICKS_CLIENT_SECRET`
+
+PAT-backed integration smoke is optional and only runs when both of these
+repository secrets are set. The PAT must belong to the configured workspace and
+must be able to read the type-matrix table through Unity Catalog:
+
 - `TEST_CI_DATABRICKS_PAT`
+- `TEST_CI_DATABRICKS_PAT_HOSTNAME`
 
 ## Release Publishing
 
