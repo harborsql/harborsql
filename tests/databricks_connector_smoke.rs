@@ -1,6 +1,8 @@
 use std::{
+    fs::{self, File},
     io::{Read, Write},
     net::{SocketAddr, TcpListener, TcpStream},
+    path::PathBuf,
     process::{Child, Command, Stdio},
     thread,
     time::{Duration, Instant},
@@ -108,10 +110,21 @@ fn run_connector_smoke(smoke: ConnectorSmoke) {
 
 struct HarborSqlServer {
     child: Child,
+    log_path: PathBuf,
 }
 
 impl HarborSqlServer {
     fn spawn(bind_addr: SocketAddr) -> Self {
+        let log_path = std::env::temp_dir().join(format!(
+            "harborsql-connector-smoke-{}-{}.log",
+            std::process::id(),
+            bind_addr.port()
+        ));
+        let log_file = File::create(&log_path).expect("failed to create HarborSQL smoke log file");
+        let log_file_for_stderr = log_file
+            .try_clone()
+            .expect("failed to clone HarborSQL smoke log file");
+
         let child = Command::new(env!("CARGO_BIN_EXE_harborsql"))
             .arg("server")
             .env("HARBORSQL_BIND_ADDR", bind_addr.to_string())
@@ -119,26 +132,24 @@ impl HarborSqlServer {
             .env("HARBORSQL_DEFAULT_CATALOG", configured_connector_catalog())
             .env("HARBORSQL_DEFAULT_SCHEMA", configured_connector_schema())
             .env("RUST_LOG", "harborsql=debug")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stdout(Stdio::from(log_file))
+            .stderr(Stdio::from(log_file_for_stderr))
             .spawn()
             .expect("failed to start HarborSQL server");
 
-        Self { child }
+        Self { child, log_path }
     }
 
     fn stop_and_read_output(&mut self) -> String {
         let _ = self.child.kill();
         let _ = self.child.wait();
 
-        let mut output = String::new();
-        if let Some(mut stdout) = self.child.stdout.take() {
-            let _ = stdout.read_to_string(&mut output);
-        }
-        if let Some(mut stderr) = self.child.stderr.take() {
-            let _ = stderr.read_to_string(&mut output);
-        }
-        output
+        fs::read_to_string(&self.log_path).unwrap_or_else(|err| {
+            format!(
+                "failed to read HarborSQL smoke log {}: {err}",
+                self.log_path.display()
+            )
+        })
     }
 }
 
@@ -146,6 +157,7 @@ impl Drop for HarborSqlServer {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        let _ = fs::remove_file(&self.log_path);
     }
 }
 
