@@ -7,7 +7,7 @@ use std::{
 use datafusion::arrow::{
     array::{
         Array, BooleanArray, Date32Array, Date64Array, Float32Array, Float64Array, Int8Array,
-        Int16Array, Int32Array, Int64Array, LargeStringArray, StringArray,
+        Int16Array, Int32Array, Int64Array, LargeStringArray, StringArray, StringViewArray,
         TimestampMicrosecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
     },
     datatypes::{DataType, Field, Schema, TimeUnit},
@@ -271,6 +271,7 @@ fn row_set_encodes_typed_value_columns() {
         Field::new("f64", DataType::Float64, true),
         Field::new("text", DataType::Utf8, true),
         Field::new("large_text", DataType::LargeUtf8, true),
+        Field::new("text_view", DataType::Utf8View, true),
         Field::new("date32", DataType::Date32, true),
         Field::new("date64", DataType::Date64, true),
         Field::new(
@@ -295,6 +296,7 @@ fn row_set_encodes_typed_value_columns() {
             Arc::new(Float64Array::from(vec![Some(1.5)])),
             Arc::new(StringArray::from(vec![Some("harbor")])),
             Arc::new(LargeStringArray::from(vec![Some("harbor-large")])),
+            Arc::new(StringViewArray::from(vec![Some("harbor-view")])),
             Arc::new(Date32Array::from(vec![Some(1)])),
             Arc::new(Date64Array::from(vec![Some(86_400_000)])),
             Arc::new(TimestampMicrosecondArray::from(vec![Some(
@@ -319,8 +321,8 @@ fn row_set_encodes_typed_value_columns() {
         if field_id == 3 {
             assert_eq!(field_type, T_LIST);
             assert_eq!(reader.read_u8().unwrap(), T_STRUCT);
-            assert_eq!(reader.read_i32().unwrap(), 16);
-            for _ in 0..16 {
+            assert_eq!(reader.read_i32().unwrap(), 17);
+            for _ in 0..17 {
                 let (column_type, column_field_id) = reader.read_field_begin().unwrap();
                 encoded_column_fields.push((column_type, column_field_id));
                 reader.skip(column_type).unwrap();
@@ -346,6 +348,7 @@ fn row_set_encodes_typed_value_columns() {
             (T_STRUCT, 5),
             (T_STRUCT, 6),
             (T_STRUCT, 6),
+            (T_STRUCT, 7),
             (T_STRUCT, 7),
             (T_STRUCT, 7),
             (T_STRUCT, 7),
@@ -397,6 +400,7 @@ fn fetch_response_encodes_typed_values_and_pagination() {
             DecodedColumn::I64(vec![9]),
             DecodedColumn::F64(vec![1.5]),
             DecodedColumn::String(vec!["alpha".to_string()]),
+            DecodedColumn::String(vec!["alpha-view".to_string()]),
         ]
     );
 
@@ -415,6 +419,7 @@ fn fetch_response_encodes_typed_values_and_pagination() {
             DecodedColumn::I64(vec![10]),
             DecodedColumn::F64(vec![2.5]),
             DecodedColumn::String(vec!["beta".to_string()]),
+            DecodedColumn::String(vec!["beta-view".to_string()]),
         ]
     );
 }
@@ -537,6 +542,7 @@ fn typed_pagination_result() -> QueryResult {
         Field::new("i64", DataType::Int64, true),
         Field::new("f64", DataType::Float64, true),
         Field::new("text", DataType::Utf8, true),
+        Field::new("text_view", DataType::Utf8View, true),
     ]));
     let batch = RecordBatch::try_new(
         schema.clone(),
@@ -546,6 +552,10 @@ fn typed_pagination_result() -> QueryResult {
             Arc::new(Int64Array::from(vec![Some(9), Some(10)])),
             Arc::new(Float64Array::from(vec![Some(1.5), Some(2.5)])),
             Arc::new(StringArray::from(vec![Some("alpha"), Some("beta")])),
+            Arc::new(StringViewArray::from(vec![
+                Some("alpha-view"),
+                Some("beta-view"),
+            ])),
         ],
     )
     .unwrap();
