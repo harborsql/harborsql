@@ -90,12 +90,19 @@ fn run_connector_smoke(smoke: ConnectorSmoke) {
         .output()
         .expect("failed to launch Python connector smoke test");
 
+    let server_stderr = if output.status.success() {
+        String::new()
+    } else {
+        server.stop_and_read_stderr()
+    };
+
     assert!(
         output.status.success(),
-        "Python connector smoke test failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
+        "Python connector smoke test failed with status {:?}\nstdout:\n{}\nstderr:\n{}\nHarborSQL stderr:\n{}",
         output.status.code(),
         String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+        String::from_utf8_lossy(&output.stderr),
+        server_stderr
     );
 }
 
@@ -118,6 +125,18 @@ impl HarborSqlServer {
             .expect("failed to start HarborSQL server");
 
         Self { child }
+    }
+
+    fn stop_and_read_stderr(&mut self) -> String {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+
+        let Some(mut stderr) = self.child.stderr.take() else {
+            return String::new();
+        };
+        let mut output = String::new();
+        let _ = stderr.read_to_string(&mut output);
+        output
     }
 }
 
