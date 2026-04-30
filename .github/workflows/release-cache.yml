@@ -1,0 +1,75 @@
+name: Release Cache
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - rust-toolchain
+      - rust-toolchain.toml
+      - .cargo/**
+      - .github/scripts/rust-cache-key.py
+      - .github/workflows/release.yml
+      - .github/workflows/release-cache.yml
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+
+jobs:
+  build-binaries:
+    name: Warm ${{ matrix.label }} release cache
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: Linux x86_64
+            runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            fast_linker: "true"
+          - label: macOS Apple Silicon
+            runner: macos-15
+            target: aarch64-apple-darwin
+            fast_linker: "false"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Compute Rust dependency cache key
+        id: rust-cache-key
+        shell: bash
+        run: python3 .github/scripts/rust-cache-key.py >> "${GITHUB_OUTPUT}"
+
+      - name: Cache Cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}-${{ steps.rust-cache-key.outputs.dependency_hash }}
+          add-rust-environment-hash-key: "false"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Install fast Linux linker
+        if: matrix.fast_linker == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang mold
+
+      - name: Build release binary
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.fast_linker == 'true' && 'clang' || '' }}
+          RUSTFLAGS: ${{ matrix.fast_linker == 'true' && '-C link-arg=-fuse-ld=mold' || '' }}
+        run: cargo build --release --locked --bin harborsql --target ${{ matrix.target }}
