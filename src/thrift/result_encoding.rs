@@ -1,8 +1,8 @@
 use datafusion::arrow::{
     array::{
         Array, ArrayRef, BooleanArray, Date32Array, Date64Array, Float32Array, Float64Array,
-        Int8Array, Int16Array, Int32Array, Int64Array, LargeStringArray, StringArray, UInt8Array,
-        UInt16Array, UInt32Array, UInt64Array,
+        Int8Array, Int16Array, Int32Array, Int64Array, LargeStringArray, StringArray,
+        StringViewArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
     },
     datatypes::DataType,
     record_batch::RecordBatch,
@@ -321,7 +321,9 @@ fn column_encoder(data_type: &DataType) -> Result<ColumnEncoder> {
         | DataType::UInt32
         | DataType::UInt64 => (BIGINT_TYPE, PhysicalType::I64),
         DataType::Float32 | DataType::Float64 => (DOUBLE_TYPE, PhysicalType::F64),
-        DataType::Utf8 | DataType::LargeUtf8 => (STRING_TYPE, PhysicalType::String),
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
+            (STRING_TYPE, PhysicalType::String)
+        }
         DataType::Date32 | DataType::Date64 => (DATE_TYPE, PhysicalType::String),
         DataType::Timestamp(_, _) => (TIMESTAMP_TYPE, PhysicalType::String),
         other => {
@@ -474,6 +476,12 @@ fn arrow_value_to_string(array: &dyn Array, row: usize) -> Result<String> {
             .ok_or_else(|| unexpected_value_type(array.data_type(), "LargeUtf8"))?
             .value(row)
             .to_string(),
+        DataType::Utf8View => array
+            .as_any()
+            .downcast_ref::<StringViewArray>()
+            .ok_or_else(|| unexpected_value_type(array.data_type(), "Utf8View"))?
+            .value(row)
+            .to_string(),
         DataType::Date32 => {
             let _ = array
                 .as_any()
@@ -498,7 +506,7 @@ fn arrow_value_to_string(array: &dyn Array, row: usize) -> Result<String> {
         other => {
             return Err(unexpected_value_type(
                 other,
-                "Utf8/LargeUtf8/Date/Timestamp",
+                "Utf8/LargeUtf8/Utf8View/Date/Timestamp",
             ));
         }
     };
