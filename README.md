@@ -212,11 +212,14 @@ coverage as separate steps so failures identify the boundary that broke.
 The GitHub Actions workflow always runs the local connector smoke test. The
 Databricks-backed integration smoke is opt-in; set the repository variable
 `DATABRICKS_CONNECTOR_SMOKE_ENABLED=true` after the test principal has access to
-the probe table. For the default table, the principal needs:
+the probe table. The default CI probe table is backed by the EU S3 bucket, so
+the workflow sets `HARBORSQL_AWS_REGION=eu-west-3`. For the default table, the
+principal needs:
 
 ```sql
 GRANT USE CATALOG ON CATALOG bench_eu TO `<service-principal-application-id>`;
 GRANT USE SCHEMA ON SCHEMA bench_eu.harborsql_delta_types TO `<service-principal-application-id>`;
+GRANT EXTERNAL USE SCHEMA ON SCHEMA bench_eu.harborsql_delta_types TO `<service-principal-application-id>`;
 GRANT SELECT ON TABLE bench_eu.harborsql_delta_types.delta_type_matrix TO `<service-principal-application-id>`;
 ```
 
