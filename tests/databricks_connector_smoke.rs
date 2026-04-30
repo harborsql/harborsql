@@ -93,7 +93,7 @@ fn run_connector_smoke(smoke: ConnectorSmoke) {
     let server_stderr = if output.status.success() {
         String::new()
     } else {
-        server.stop_and_read_stderr()
+        server.stop_and_read_output()
     };
 
     assert!(
@@ -119,7 +119,7 @@ impl HarborSqlServer {
             .env("HARBORSQL_DEFAULT_CATALOG", configured_connector_catalog())
             .env("HARBORSQL_DEFAULT_SCHEMA", configured_connector_schema())
             .env("RUST_LOG", "harborsql=debug")
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .expect("failed to start HarborSQL server");
@@ -127,15 +127,17 @@ impl HarborSqlServer {
         Self { child }
     }
 
-    fn stop_and_read_stderr(&mut self) -> String {
+    fn stop_and_read_output(&mut self) -> String {
         let _ = self.child.kill();
         let _ = self.child.wait();
 
-        let Some(mut stderr) = self.child.stderr.take() else {
-            return String::new();
-        };
         let mut output = String::new();
-        let _ = stderr.read_to_string(&mut output);
+        if let Some(mut stdout) = self.child.stdout.take() {
+            let _ = stdout.read_to_string(&mut output);
+        }
+        if let Some(mut stderr) = self.child.stderr.take() {
+            let _ = stderr.read_to_string(&mut output);
+        }
         output
     }
 }
@@ -291,6 +293,13 @@ connect_kwargs = dict(
 if auth_mode not in ("auto", "local", "oauth", "pat"):
     raise AssertionError(f"unsupported smoke auth mode: {{auth_mode}}")
 
+def disable_local_token_federation():
+    try:
+        from databricks.sql.auth.token_federation import TokenFederationProvider
+        TokenFederationProvider._should_exchange_token = lambda self, access_token: False
+    except Exception:
+        pass
+
 if auth_mode == "local":
     connect_kwargs["access_token"] = "local-token"
 elif auth_mode == "pat":
@@ -298,6 +307,7 @@ elif auth_mode == "pat":
         raise AssertionError("PAT smoke test requires DATABRICKS_TOKEN or TEST_CI_DATABRICKS_PAT")
     connect_kwargs["access_token"] = pat_token
 elif auth_mode == "oauth" or client_id or client_secret:
+    disable_local_token_federation()
     missing = [
         name
         for name, value in [
