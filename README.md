@@ -44,7 +44,8 @@ Unity temporary credentials expire.
 
 ## Requirements
 
-- Rust `1.91+`
+- Docker, for the published container image
+- Rust `1.91+`, for running from source
 - Access to a Databricks workspace with Unity Catalog enabled
 - A Unity Catalog Delta table that can vend temporary table credentials to
   external clients
@@ -53,13 +54,29 @@ Unity temporary credentials expire.
 
 ## Quick Start
 
-Run the server:
+Run the published Docker image:
+
+```bash
+export TAG="<version>"
+
+docker run --rm \
+  -p 127.0.0.1:1992:1992 \
+  -e HARBORSQL_BIND_ADDR="0.0.0.0:1992" \
+  -e HARBORSQL_DATABRICKS_HOST="https://<workspace-host>" \
+  ghcr.io/harborsql/harborsql:$TAG
+```
+
+`HARBORSQL_BIND_ADDR=0.0.0.0:1992` makes HarborSQL listen on the
+container interface. The `-p 127.0.0.1:1992:1992` mapping exposes it only on
+host localhost.
+
+Add `HARBORSQL_DEFAULT_CATALOG`, `HARBORSQL_DEFAULT_SCHEMA`, or
+`HARBORSQL_AWS_REGION` only when the defaults do not match your workspace.
+
+Run the server from source:
 
 ```bash
 export HARBORSQL_DATABRICKS_HOST="https://<workspace-host>"
-export HARBORSQL_DEFAULT_CATALOG="<catalog>"
-export HARBORSQL_DEFAULT_SCHEMA="<schema>"
-export HARBORSQL_AWS_REGION="<aws-region>"
 
 cargo run -- server
 ```
@@ -73,6 +90,16 @@ export HARBORSQL_DATABRICKS_HOST="https://<workspace-host>"
 export DATABRICKS_TOKEN="<token>"
 
 cargo run -- query --sql "SELECT COUNT(*) FROM <catalog>.<schema>.<table>"
+```
+
+Run the same one-off query with Docker:
+
+```bash
+docker run --rm \
+  -e HARBORSQL_DATABRICKS_HOST="https://<workspace-host>" \
+  -e DATABRICKS_TOKEN="<token>" \
+  ghcr.io/harborsql/harborsql:$TAG \
+  query --sql "SELECT COUNT(*) FROM <catalog>.<schema>.<table>"
 ```
 
 Production deployments should serve HarborSQL over HTTPS, or behind a
