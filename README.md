@@ -44,32 +44,26 @@ Unity temporary credentials expire.
 
 ## Requirements
 
+HarborSQL assumes you already have a working Databricks workspace with Unity
+Catalog Delta tables and users or service principals that can read those
+tables.
+
+To migrate that workload to HarborSQL, you need:
+
 - A HarborSQL runtime:
   - Docker image: [`ghcr.io/harborsql/harborsql:<tag>`](https://github.com/orgs/harborsql/packages/container/package/harborsql)
   - Binary archives from [GitHub Releases](https://github.com/harborsql/harborsql/releases) or [`ghcr.io/harborsql/harborsql-binaries:<tag>`](https://github.com/orgs/harborsql/packages/container/package/harborsql-binaries)
   - Rust `1.91+` only when running from source
-- A Databricks workspace with Unity Catalog external data access enabled.
-- A Databricks user or service principal token sent by the client to HarborSQL.
-- Unity Catalog privileges for the principal on each schema/table you want to query.
-
-For each queried schema, grant the external-engine credential vending privilege:
+- One extra Unity Catalog grant on each schema you want to query from HarborSQL:
 
 ```sql
 GRANT EXTERNAL USE SCHEMA ON SCHEMA <catalog>.<schema> TO `<principal>`;
 ```
 
-The same principal also needs the normal Unity Catalog read privileges:
-
-```sql
-GRANT USE CATALOG ON CATALOG <catalog> TO `<principal>`;
-GRANT USE SCHEMA ON SCHEMA <catalog>.<schema> TO `<principal>`;
-GRANT SELECT ON TABLE <catalog>.<schema>.<table> TO `<principal>`;
-```
-
-`SELECT` can also be inherited from a schema or catalog grant. HarborSQL does
-not need static cloud credentials; Unity Catalog vends temporary table
-credentials at query time. The HarborSQL process only needs network access to
-the Databricks workspace and the underlying object storage endpoints.
+Your existing Unity Catalog read permissions still apply. HarborSQL does not
+need static cloud credentials; Unity Catalog vends temporary table credentials
+at query time. See the documentation site for the full Unity Catalog grant
+model.
 
 ## Quick Start
 
