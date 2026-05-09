@@ -2529,7 +2529,7 @@ dependencies = [
 
 [[package]]
 name = "harborsql"
-version = "0.1.2-rc.1"
+version = "0.1.2"
 dependencies = [
  "arrow-json",
  "async-trait",
