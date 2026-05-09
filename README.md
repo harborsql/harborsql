@@ -53,7 +53,6 @@ To migrate that workload to HarborSQL, you need:
 - A HarborSQL runtime:
   - Docker image: [`ghcr.io/harborsql/harborsql:<tag>`](https://github.com/orgs/harborsql/packages/container/package/harborsql)
   - Binary archives from [GitHub Releases](https://github.com/harborsql/harborsql/releases) or [`ghcr.io/harborsql/harborsql-binaries:<tag>`](https://github.com/orgs/harborsql/packages/container/package/harborsql-binaries)
-  - Rust `1.91+` only when running from source
 - One extra Unity Catalog grant on each schema you want to query from HarborSQL:
 
 ```sql
