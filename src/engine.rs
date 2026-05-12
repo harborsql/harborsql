@@ -19,9 +19,10 @@ use object_store::{
 use serde::{Serialize, Serializer, ser::SerializeStruct};
 use sqlparser::{
     ast::{
-        DateTimeField, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArgumentList,
-        FunctionArguments, GroupByExpr, Ident, ObjectName, ObjectNamePart, OrderBy, OrderByKind,
-        Query, Select, SelectItem, SetExpr, Statement as SqlStatement, UnaryOperator, Value,
+        BinaryOperator, DateTimeField, DuplicateTreatment, Expr, Function, FunctionArg,
+        FunctionArgExpr, FunctionArgumentList, FunctionArguments, GroupByExpr, Ident, ObjectName,
+        ObjectNamePart, OrderBy, OrderByKind, Query, Select, SelectItem, SetExpr,
+        Statement as SqlStatement, UnaryOperator, Value,
     },
     dialect::GenericDialect,
     parser::Parser,
@@ -222,6 +223,9 @@ impl QueryEngine {
                 databricks_count_star_alias_rewrite: self
                     .config
                     .databricks_count_star_alias_rewrite,
+                databricks_expression_alias_rewrite: self
+                    .config
+                    .databricks_expression_alias_rewrite,
             },
         );
         let plan_started = Instant::now();
@@ -529,12 +533,14 @@ fn no_route_error(location: &str) -> object_store::Error {
 #[derive(Clone, Copy, Debug)]
 struct RewriteOptions {
     databricks_count_star_alias_rewrite: bool,
+    databricks_expression_alias_rewrite: bool,
 }
 
 impl Default for RewriteOptions {
     fn default() -> Self {
         Self {
             databricks_count_star_alias_rewrite: true,
+            databricks_expression_alias_rewrite: true,
         }
     }
 }
@@ -641,12 +647,11 @@ fn rewrite_select_fast_paths(select: &mut Select, options: RewriteOptions) -> bo
         match item {
             SelectItem::UnnamedExpr(expr) => {
                 changed |= rewrite_expr_fast_paths(expr, options);
-                if options.databricks_count_star_alias_rewrite && is_count_wildcard_projection(expr)
-                {
+                if let Some(alias) = databricks_projection_alias(expr, options) {
                     let aliased_expr = expr.clone();
                     *item = SelectItem::ExprWithAlias {
                         expr: aliased_expr,
-                        alias: Ident::with_quote('"', "count(1)"),
+                        alias: Ident::with_quote('"', alias),
                     };
                     changed = true;
                 }
@@ -793,6 +798,123 @@ fn is_count_wildcard_projection(expr: &Expr) -> bool {
         Expr::Function(function) => is_count_wildcard_function(function),
         Expr::Nested(expr) => is_count_wildcard_projection(expr),
         _ => false,
+    }
+}
+
+fn databricks_projection_alias(expr: &Expr, options: RewriteOptions) -> Option<String> {
+    if options.databricks_count_star_alias_rewrite && is_count_wildcard_projection(expr) {
+        return Some("count(1)".to_string());
+    }
+    if options.databricks_expression_alias_rewrite && should_alias_databricks_expression(expr) {
+        return Some(databricks_expr_name(expr));
+    }
+    None
+}
+
+fn should_alias_databricks_expression(expr: &Expr) -> bool {
+    match expr {
+        Expr::Function(_) | Expr::BinaryOp { .. } | Expr::Value(_) => true,
+        Expr::Nested(expr) => should_alias_databricks_expression(expr),
+        _ => false,
+    }
+}
+
+fn databricks_expr_name(expr: &Expr) -> String {
+    match expr {
+        Expr::Identifier(ident) => ident.value.clone(),
+        Expr::CompoundIdentifier(idents) => idents
+            .iter()
+            .map(|ident| ident.value.as_str())
+            .collect::<Vec<_>>()
+            .join("."),
+        Expr::Value(value) => databricks_value_name(&value.value),
+        Expr::BinaryOp { left, op, right } => {
+            format!(
+                "({} {} {})",
+                databricks_expr_name(left),
+                databricks_binary_operator_name(op),
+                databricks_expr_name(right)
+            )
+        }
+        Expr::Function(function) => databricks_function_name(function),
+        Expr::Nested(expr) => format!("({})", databricks_expr_name(expr)),
+        Expr::UnaryOp { op, expr } => format!("{op}{}", databricks_expr_name(expr)),
+        _ => expr.to_string(),
+    }
+}
+
+fn databricks_value_name(value: &Value) -> String {
+    match value {
+        Value::Number(value, _) => value.clone(),
+        _ => value.to_string(),
+    }
+}
+
+fn databricks_binary_operator_name(op: &BinaryOperator) -> String {
+    match op {
+        BinaryOperator::Plus => "+".to_string(),
+        BinaryOperator::Minus => "-".to_string(),
+        BinaryOperator::Multiply => "*".to_string(),
+        BinaryOperator::Divide => "/".to_string(),
+        BinaryOperator::Modulo => "%".to_string(),
+        _ => op.to_string(),
+    }
+}
+
+fn databricks_function_name(function: &Function) -> String {
+    if let Some(args) = databricks_function_argument_list_name(function) {
+        format!("{}({args})", function.name.to_string().to_ascii_lowercase())
+    } else {
+        function.to_string()
+    }
+}
+
+fn databricks_function_argument_list_name(function: &Function) -> Option<String> {
+    if function.uses_odbc_syntax
+        || !matches!(function.parameters, FunctionArguments::None)
+        || function.filter.is_some()
+        || function.null_treatment.is_some()
+        || function.over.is_some()
+        || !function.within_group.is_empty()
+    {
+        return None;
+    }
+
+    let FunctionArguments::List(FunctionArgumentList {
+        duplicate_treatment,
+        args,
+        clauses,
+    }) = &function.args
+    else {
+        return None;
+    };
+    if !clauses.is_empty() {
+        return None;
+    }
+
+    let mut rendered_args = String::new();
+    if let Some(duplicate_treatment) = duplicate_treatment {
+        match duplicate_treatment {
+            DuplicateTreatment::Distinct => rendered_args.push_str("DISTINCT "),
+            DuplicateTreatment::All => rendered_args.push_str("ALL "),
+        }
+    }
+    rendered_args.push_str(
+        &args
+            .iter()
+            .map(databricks_function_arg_name)
+            .collect::<Vec<_>>()
+            .join(", "),
+    );
+    Some(rendered_args)
+}
+
+fn databricks_function_arg_name(arg: &FunctionArg) -> String {
+    match arg {
+        FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => databricks_expr_name(expr),
+        FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => "*".to_string(),
+        FunctionArg::Unnamed(FunctionArgExpr::QualifiedWildcard(name)) => format!("{name}.*"),
+        _ => arg.to_string(),
     }
 }
 
@@ -1307,6 +1429,39 @@ mod tests {
             sql,
             RewriteOptions {
                 databricks_count_star_alias_rewrite: false,
+                databricks_expression_alias_rewrite: true,
+            },
+        );
+
+        assert_eq!(rewritten, r#"SELECT COUNT(*) AS "count(*)" FROM hits"#);
+    }
+
+    #[test]
+    fn aliases_unaliased_expression_projections_for_databricks_metadata() {
+        let rewritten =
+            rewrite_sql_fast_paths("SELECT 1, ClientIP - 1, SUM(ResolutionWidth + 2) FROM hits");
+
+        assert_eq!(
+            rewritten,
+            r#"SELECT 1 AS "1", ClientIP - 1 AS "(ClientIP - 1)", SUM(ResolutionWidth + 2) AS "sum((ResolutionWidth + 2))" FROM hits"#
+        );
+    }
+
+    #[test]
+    fn preserves_explicit_expression_aliases() {
+        let sql = "SELECT 1 AS one, SUM(ResolutionWidth + 2) AS total FROM hits";
+
+        assert_eq!(rewrite_sql_fast_paths(sql), sql);
+    }
+
+    #[test]
+    fn can_disable_databricks_expression_projection_alias_rewrite() {
+        let sql = "SELECT 1, ClientIP - 1, SUM(ResolutionWidth + 2) FROM hits";
+        let rewritten = rewrite_sql_fast_paths_with_options(
+            sql,
+            RewriteOptions {
+                databricks_count_star_alias_rewrite: true,
+                databricks_expression_alias_rewrite: false,
             },
         );
 
@@ -1354,7 +1509,16 @@ mod tests {
     #[test]
     fn leaves_complex_regexp_replace_unchanged() {
         let sql = "SELECT REGEXP_REPLACE(Referer, 'foo', 'bar') FROM hits";
-        assert_eq!(rewrite_sql_fast_paths(sql), sql);
+        assert_eq!(
+            rewrite_sql_fast_paths_with_options(
+                sql,
+                RewriteOptions {
+                    databricks_count_star_alias_rewrite: true,
+                    databricks_expression_alias_rewrite: false,
+                },
+            ),
+            sql
+        );
     }
 
     #[test]
@@ -1514,6 +1678,54 @@ mod tests {
 
         assert_eq!(result.columns[0].name, "count(*)");
         assert_eq!(result.row_count, 1);
+    }
+
+    #[tokio::test]
+    async fn execute_aliases_unaliased_expression_column_names_by_default() {
+        let engine = QueryEngine::with_dependencies(
+            test_config(),
+            Arc::new(MockUnity::delta()),
+            Arc::new(MockTableOpener::with_provider(mem_table_provider(
+                int_batch(vec![1, 2]),
+            ))),
+        );
+
+        let literal_result = engine
+            .execute("token", "SELECT 1", "workspace", "default")
+            .await
+            .unwrap();
+        assert_eq!(literal_result.columns[0].name, "1");
+
+        let aggregate_result = engine
+            .execute(
+                "token",
+                "SELECT SUM(id + 2) FROM hits",
+                "workspace",
+                "default",
+            )
+            .await
+            .unwrap();
+        assert_eq!(aggregate_result.columns[0].name, "sum((id + 2))");
+    }
+
+    #[tokio::test]
+    async fn execute_can_disable_expression_column_name_alias_rewrite() {
+        let mut config = test_config();
+        config.databricks_expression_alias_rewrite = false;
+        let engine = QueryEngine::with_dependencies(
+            config,
+            Arc::new(MockUnity::delta()),
+            Arc::new(MockTableOpener::with_provider(mem_table_provider(
+                int_batch(vec![1, 2]),
+            ))),
+        );
+
+        let result = engine
+            .execute("token", "SELECT 1", "workspace", "default")
+            .await
+            .unwrap();
+
+        assert_eq!(result.columns[0].name, "Int64(1)");
     }
 
     #[tokio::test]
@@ -1819,6 +2031,7 @@ mod tests {
             table_cache_max_entries: 0,
             table_cache_credential_expiry_skew: Duration::ZERO,
             databricks_count_star_alias_rewrite: true,
+            databricks_expression_alias_rewrite: true,
             unsafe_log_sql: false,
         }
     }
