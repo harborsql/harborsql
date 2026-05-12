@@ -216,7 +216,14 @@ impl QueryEngine {
             object_store_routes.clone(),
         )));
 
-        let execution_sql = rewrite_sql_fast_paths(sql);
+        let execution_sql = rewrite_sql_fast_paths_with_options(
+            sql,
+            RewriteOptions {
+                databricks_count_star_alias_rewrite: self
+                    .config
+                    .databricks_count_star_alias_rewrite,
+            },
+        );
         let plan_started = Instant::now();
         let dataframe = plan_sql(&ctx, &execution_sql)
             .instrument(tracing::info_span!("datafusion_planning"))
@@ -519,7 +526,25 @@ fn no_route_error(location: &str) -> object_store::Error {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct RewriteOptions {
+    databricks_count_star_alias_rewrite: bool,
+}
+
+impl Default for RewriteOptions {
+    fn default() -> Self {
+        Self {
+            databricks_count_star_alias_rewrite: true,
+        }
+    }
+}
+
+#[cfg(test)]
 fn rewrite_sql_fast_paths(sql: &str) -> String {
+    rewrite_sql_fast_paths_with_options(sql, RewriteOptions::default())
+}
+
+fn rewrite_sql_fast_paths_with_options(sql: &str, options: RewriteOptions) -> String {
     let dialect = GenericDialect {};
     let Ok(mut statements) = Parser::parse_sql(&dialect, sql) else {
         return sql.to_string();
@@ -530,7 +555,7 @@ fn rewrite_sql_fast_paths(sql: &str) -> String {
     let mut changed = false;
 
     if let Some(statement) = statements.first_mut() {
-        changed = rewrite_statement_fast_paths(statement);
+        changed = rewrite_statement_fast_paths(statement, options);
     }
 
     if changed {
@@ -560,96 +585,109 @@ fn is_read_only_query_statement(statement: &SqlStatement) -> bool {
     }
 }
 
-fn rewrite_statement_fast_paths(statement: &mut SqlStatement) -> bool {
+fn rewrite_statement_fast_paths(statement: &mut SqlStatement, options: RewriteOptions) -> bool {
     match statement {
-        SqlStatement::Query(query) => rewrite_query_fast_paths(query),
-        SqlStatement::Explain { statement, .. } => rewrite_statement_fast_paths(statement),
+        SqlStatement::Query(query) => rewrite_query_fast_paths(query, options),
+        SqlStatement::Explain { statement, .. } => rewrite_statement_fast_paths(statement, options),
         _ => false,
     }
 }
 
-fn rewrite_query_fast_paths(query: &mut Query) -> bool {
+fn rewrite_query_fast_paths(query: &mut Query, options: RewriteOptions) -> bool {
     let mut changed = false;
     if let Some(with) = &mut query.with {
         for cte in &mut with.cte_tables {
-            changed |= rewrite_query_fast_paths(&mut cte.query);
+            changed |= rewrite_query_fast_paths(&mut cte.query, options);
         }
     }
     changed |= match query.body.as_mut() {
-        SetExpr::Select(select) => rewrite_select_fast_paths(select),
-        SetExpr::Query(query) => rewrite_query_fast_paths(query),
+        SetExpr::Select(select) => rewrite_select_fast_paths(select, options),
+        SetExpr::Query(query) => rewrite_query_fast_paths(query, options),
         SetExpr::SetOperation { left, right, .. } => {
-            rewrite_set_expr_fast_paths(left) | rewrite_set_expr_fast_paths(right)
+            rewrite_set_expr_fast_paths(left, options) | rewrite_set_expr_fast_paths(right, options)
         }
         _ => false,
     };
     if let Some(order_by) = &mut query.order_by {
-        changed |= rewrite_order_by_fast_paths(order_by);
+        changed |= rewrite_order_by_fast_paths(order_by, options);
     }
     changed
 }
 
-fn rewrite_set_expr_fast_paths(set_expr: &mut SetExpr) -> bool {
+fn rewrite_set_expr_fast_paths(set_expr: &mut SetExpr, options: RewriteOptions) -> bool {
     match set_expr {
-        SetExpr::Select(select) => rewrite_select_fast_paths(select),
-        SetExpr::Query(query) => rewrite_query_fast_paths(query),
+        SetExpr::Select(select) => rewrite_select_fast_paths(select, options),
+        SetExpr::Query(query) => rewrite_query_fast_paths(query, options),
         SetExpr::SetOperation { left, right, .. } => {
-            rewrite_set_expr_fast_paths(left) | rewrite_set_expr_fast_paths(right)
+            rewrite_set_expr_fast_paths(left, options) | rewrite_set_expr_fast_paths(right, options)
         }
         _ => false,
     }
 }
 
-fn rewrite_order_by_fast_paths(order_by: &mut OrderBy) -> bool {
+fn rewrite_order_by_fast_paths(order_by: &mut OrderBy, options: RewriteOptions) -> bool {
     if let OrderByKind::Expressions(expressions) = &mut order_by.kind {
         expressions.iter_mut().fold(false, |changed, expression| {
-            changed | rewrite_expr_fast_paths(&mut expression.expr)
+            changed | rewrite_expr_fast_paths(&mut expression.expr, options)
         })
     } else {
         false
     }
 }
 
-fn rewrite_select_fast_paths(select: &mut Select) -> bool {
+fn rewrite_select_fast_paths(select: &mut Select, options: RewriteOptions) -> bool {
     let mut changed = false;
     for item in &mut select.projection {
-        let expr = match item {
-            SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => expr,
+        match item {
+            SelectItem::UnnamedExpr(expr) => {
+                changed |= rewrite_expr_fast_paths(expr, options);
+                if options.databricks_count_star_alias_rewrite && is_count_wildcard_projection(expr)
+                {
+                    let aliased_expr = expr.clone();
+                    *item = SelectItem::ExprWithAlias {
+                        expr: aliased_expr,
+                        alias: Ident::with_quote('"', "count(1)"),
+                    };
+                    changed = true;
+                }
+            }
+            SelectItem::ExprWithAlias { expr, .. } => {
+                changed |= rewrite_expr_fast_paths(expr, options);
+            }
             SelectItem::QualifiedWildcard(_, _) | SelectItem::Wildcard(_) => continue,
-        };
-        changed |= rewrite_expr_fast_paths(expr);
+        }
     }
     if let Some(selection) = &mut select.selection {
-        changed |= rewrite_expr_fast_paths(selection);
+        changed |= rewrite_expr_fast_paths(selection, options);
     }
     if let Some(prewhere) = &mut select.prewhere {
-        changed |= rewrite_expr_fast_paths(prewhere);
+        changed |= rewrite_expr_fast_paths(prewhere, options);
     }
     if let GroupByExpr::Expressions(expressions, _) = &mut select.group_by {
         for expression in &mut *expressions {
-            changed |= rewrite_expr_fast_paths(expression);
+            changed |= rewrite_expr_fast_paths(expression, options);
         }
     }
     for expression in &mut select.cluster_by {
-        changed |= rewrite_expr_fast_paths(expression);
+        changed |= rewrite_expr_fast_paths(expression, options);
     }
     for expression in &mut select.distribute_by {
-        changed |= rewrite_expr_fast_paths(expression);
+        changed |= rewrite_expr_fast_paths(expression, options);
     }
     for order_by in &mut select.sort_by {
-        changed |= rewrite_expr_fast_paths(&mut order_by.expr);
+        changed |= rewrite_expr_fast_paths(&mut order_by.expr, options);
     }
     if let Some(having) = &mut select.having {
-        changed |= rewrite_expr_fast_paths(having);
+        changed |= rewrite_expr_fast_paths(having, options);
     }
     if let Some(qualify) = &mut select.qualify {
-        changed |= rewrite_expr_fast_paths(qualify);
+        changed |= rewrite_expr_fast_paths(qualify, options);
     }
     changed
 }
 
-fn rewrite_expr_fast_paths(expr: &mut Expr) -> bool {
-    if rewrite_leaf_expr_fast_paths(expr) {
+fn rewrite_expr_fast_paths(expr: &mut Expr, options: RewriteOptions) -> bool {
+    if rewrite_leaf_expr_fast_paths(expr, options) {
         return true;
     }
 
@@ -657,7 +695,7 @@ fn rewrite_expr_fast_paths(expr: &mut Expr) -> bool {
         Expr::BinaryOp { left, right, .. }
         | Expr::IsDistinctFrom(left, right)
         | Expr::IsNotDistinctFrom(left, right) => {
-            rewrite_expr_fast_paths(left) | rewrite_expr_fast_paths(right)
+            rewrite_expr_fast_paths(left, options) | rewrite_expr_fast_paths(right, options)
         }
         Expr::UnaryOp { expr, .. }
         | Expr::IsFalse(expr)
@@ -670,12 +708,12 @@ fn rewrite_expr_fast_paths(expr: &mut Expr) -> bool {
         | Expr::IsNotUnknown(expr)
         | Expr::Nested(expr)
         | Expr::OuterJoin(expr)
-        | Expr::Prior(expr) => rewrite_expr_fast_paths(expr),
+        | Expr::Prior(expr) => rewrite_expr_fast_paths(expr, options),
         _ => false,
     }
 }
 
-fn rewrite_leaf_expr_fast_paths(expr: &mut Expr) -> bool {
+fn rewrite_leaf_expr_fast_paths(expr: &mut Expr, options: RewriteOptions) -> bool {
     match expr {
         Expr::Extract {
             field: DateTimeField::Minute | DateTimeField::Minutes,
@@ -692,7 +730,7 @@ fn rewrite_leaf_expr_fast_paths(expr: &mut Expr) -> bool {
                 *expr = regexp_replace_capture_expr(source, pattern, capture_index);
                 true
             } else {
-                rewrite_function_fast_paths(function)
+                rewrite_function_fast_paths(function, options)
             }
         }
         Expr::Like {
@@ -729,25 +767,62 @@ fn extract_minute_expr(source: Expr) -> Expr {
     })
 }
 
-fn rewrite_function_fast_paths(function: &mut Function) -> bool {
+fn rewrite_function_fast_paths(function: &mut Function, options: RewriteOptions) -> bool {
     let mut changed = false;
     if let FunctionArguments::List(FunctionArgumentList { args, .. }) = &mut function.args {
         for arg in args {
-            changed |= rewrite_function_arg_fast_paths(arg);
+            changed |= rewrite_function_arg_fast_paths(arg, options);
         }
     }
     changed
 }
 
-fn rewrite_function_arg_fast_paths(arg: &mut FunctionArg) -> bool {
+fn rewrite_function_arg_fast_paths(arg: &mut FunctionArg, options: RewriteOptions) -> bool {
     match arg {
         FunctionArg::Named { arg, .. }
         | FunctionArg::ExprNamed { arg, .. }
         | FunctionArg::Unnamed(arg) => match arg {
-            FunctionArgExpr::Expr(expr) => rewrite_expr_fast_paths(expr),
+            FunctionArgExpr::Expr(expr) => rewrite_expr_fast_paths(expr, options),
             FunctionArgExpr::QualifiedWildcard(_) | FunctionArgExpr::Wildcard => false,
         },
     }
+}
+
+fn is_count_wildcard_projection(expr: &Expr) -> bool {
+    match expr {
+        Expr::Function(function) => is_count_wildcard_function(function),
+        Expr::Nested(expr) => is_count_wildcard_projection(expr),
+        _ => false,
+    }
+}
+
+fn is_count_wildcard_function(function: &Function) -> bool {
+    if !function_name_eq(function, "count")
+        || function.uses_odbc_syntax
+        || !matches!(function.parameters, FunctionArguments::None)
+        || function.filter.is_some()
+        || function.null_treatment.is_some()
+        || function.over.is_some()
+        || !function.within_group.is_empty()
+    {
+        return false;
+    }
+
+    let FunctionArguments::List(FunctionArgumentList {
+        duplicate_treatment: None,
+        args,
+        clauses,
+    }) = &function.args
+    else {
+        return false;
+    };
+
+    clauses.is_empty()
+        && args.len() == 1
+        && matches!(
+            args.first(),
+            Some(FunctionArg::Unnamed(FunctionArgExpr::Wildcard))
+        )
 }
 
 fn regexp_replace_capture_fast_path_args(function: &Function) -> Option<(Expr, String, u64)> {
@@ -1205,9 +1280,37 @@ mod tests {
             "SELECT COUNT(*) FROM hits WHERE URL LIKE '%google%' AND URL NOT LIKE '%.google.%'",
         );
 
+        assert!(rewritten.contains(r#"COUNT(*) AS "count(1)""#));
         assert!(rewritten.contains("contains(URL, 'google')"));
         assert!(rewritten.contains("NOT contains(URL, '.google.')"));
         assert!(!rewritten.contains(" LIKE "));
+    }
+
+    #[test]
+    fn aliases_unaliased_count_wildcard_projection_for_databricks_metadata() {
+        let rewritten = rewrite_sql_fast_paths("SELECT COUNT(*) FROM hits");
+
+        assert_eq!(rewritten, r#"SELECT COUNT(*) AS "count(1)" FROM hits"#);
+    }
+
+    #[test]
+    fn preserves_explicit_count_wildcard_aliases() {
+        let sql = "SELECT COUNT(*) AS c FROM hits";
+
+        assert_eq!(rewrite_sql_fast_paths(sql), sql);
+    }
+
+    #[test]
+    fn can_disable_databricks_count_wildcard_projection_alias_rewrite() {
+        let sql = "SELECT COUNT(*) FROM hits";
+        let rewritten = rewrite_sql_fast_paths_with_options(
+            sql,
+            RewriteOptions {
+                databricks_count_star_alias_rewrite: false,
+            },
+        );
+
+        assert_eq!(rewritten, sql);
     }
 
     #[test]
@@ -1256,7 +1359,7 @@ mod tests {
 
     #[test]
     fn leaves_complex_like_predicates_unchanged() {
-        let sql = "SELECT COUNT(*) FROM hits WHERE URL LIKE '%goo_le%'";
+        let sql = "SELECT URL FROM hits WHERE URL LIKE '%goo_le%'";
 
         assert_eq!(rewrite_sql_fast_paths(sql), sql);
     }
@@ -1371,6 +1474,46 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(err, HarborError::DataFusion(_)));
+    }
+
+    #[tokio::test]
+    async fn execute_aliases_unaliased_count_wildcard_column_name_by_default() {
+        let engine = QueryEngine::with_dependencies(
+            test_config(),
+            Arc::new(MockUnity::delta()),
+            Arc::new(MockTableOpener::with_provider(mem_table_provider(
+                int_batch(vec![1, 2]),
+            ))),
+        );
+
+        let result = engine
+            .execute("token", "SELECT COUNT(*) FROM hits", "workspace", "default")
+            .await
+            .unwrap();
+
+        assert_eq!(result.columns[0].name, "count(1)");
+        assert_eq!(result.row_count, 1);
+    }
+
+    #[tokio::test]
+    async fn execute_can_disable_count_wildcard_column_name_alias_rewrite() {
+        let mut config = test_config();
+        config.databricks_count_star_alias_rewrite = false;
+        let engine = QueryEngine::with_dependencies(
+            config,
+            Arc::new(MockUnity::delta()),
+            Arc::new(MockTableOpener::with_provider(mem_table_provider(
+                int_batch(vec![1, 2]),
+            ))),
+        );
+
+        let result = engine
+            .execute("token", "SELECT COUNT(*) FROM hits", "workspace", "default")
+            .await
+            .unwrap();
+
+        assert_eq!(result.columns[0].name, "count(*)");
+        assert_eq!(result.row_count, 1);
     }
 
     #[tokio::test]
@@ -1675,6 +1818,7 @@ mod tests {
             table_cache_ttl: Duration::ZERO,
             table_cache_max_entries: 0,
             table_cache_credential_expiry_skew: Duration::ZERO,
+            databricks_count_star_alias_rewrite: true,
             unsafe_log_sql: false,
         }
     }
