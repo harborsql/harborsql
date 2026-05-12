@@ -21,6 +21,7 @@ pub const DEFAULT_TABLE_CACHE_MAX_ENTRIES: usize = 1024;
 pub const TABLE_CACHE_CREDENTIAL_EXPIRY_SKEW_SECONDS: u64 = 60;
 pub const DEFAULT_UNSAFE_ALLOW_HTTP_DATABRICKS_HOST: bool = false;
 pub const DEFAULT_UNSAFE_LOG_SQL: bool = false;
+pub const DEFAULT_DATABRICKS_COUNT_STAR_ALIAS_REWRITE: bool = true;
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -47,6 +48,7 @@ pub struct Config {
     pub table_cache_ttl: Duration,
     pub table_cache_max_entries: usize,
     pub table_cache_credential_expiry_skew: Duration,
+    pub databricks_count_star_alias_rewrite: bool,
     pub unsafe_log_sql: bool,
 }
 
@@ -148,6 +150,10 @@ impl Config {
             table_cache_credential_expiry_skew: Duration::from_secs(
                 TABLE_CACHE_CREDENTIAL_EXPIRY_SKEW_SECONDS,
             ),
+            databricks_count_star_alias_rewrite: parse_bool_env(
+                "HARBORSQL_DATABRICKS_COUNT_STAR_ALIAS_REWRITE",
+                DEFAULT_DATABRICKS_COUNT_STAR_ALIAS_REWRITE,
+            )?,
             unsafe_log_sql,
         })
     }
