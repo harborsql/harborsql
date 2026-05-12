@@ -202,6 +202,7 @@ Automation and coding-agent notes live in [AGENTS.md](AGENTS.md).
 - [Connector smoke tests](docs/ci-smoke-tests.md)
 - [Release publishing](docs/release.md)
 - [Benchmark policy](docs/benchmarks.md)
+- [REGEXP_REPLACE line-break compatibility finding](docs/regexp-replace-linebreak-compatibility.md)
 - [Security policy](SECURITY.md)
 
 ## Releases
