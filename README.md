@@ -148,6 +148,7 @@ HarborSQL reads configuration from environment variables:
 | `HARBORSQL_TABLE_CACHE_TTL_SECONDS` | no | `300` | Maximum lifetime for token-scoped cached table providers; set to `0` to disable |
 | `HARBORSQL_TABLE_CACHE_MAX_ENTRIES` | no | `1024` | Maximum token/table/region cache entries; set to `0` to disable |
 | `HARBORSQL_DATABRICKS_COUNT_STAR_ALIAS_REWRITE` | no | `true` | Alias unaliased `COUNT(*)` projections as `count(1)` to match Databricks SQL Warehouse column metadata; set to `false` to disable |
+| `HARBORSQL_DATABRICKS_EXPRESSION_ALIAS_REWRITE` | no | `true` | Alias unaliased expression projections with Databricks-style names to avoid DataFusion-specific typed literal metadata; set to `false` to disable |
 | `HARBORSQL_UNSAFE_LOG_SQL` | no | `false` | Include redacted SQL text in internal tracing spans for controlled debugging; SQL is omitted from logs by default |
 | `DATABRICKS_TOKEN` | query mode only | none | Token used by `harborsql query --sql ...` |
 

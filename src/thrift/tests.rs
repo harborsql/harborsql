@@ -886,6 +886,7 @@ fn test_config() -> Config {
         table_cache_max_entries: 16,
         table_cache_credential_expiry_skew: Duration::from_secs(1),
         databricks_count_star_alias_rewrite: true,
+        databricks_expression_alias_rewrite: true,
         unsafe_log_sql: false,
     }
 }
