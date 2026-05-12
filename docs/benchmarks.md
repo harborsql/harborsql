@@ -26,3 +26,10 @@ cargo test --release --locked --all-targets
 If public benchmark summaries are added later, keep them aggregated and scrubbed
 so they do not reveal private workspace, storage, credential, or network
 topology details.
+
+Compatibility findings that explain benchmark correctness differences can live
+in this repository when they describe HarborSQL/DataFusion behavior rather than
+private benchmark infrastructure. See
+[`regexp-replace-linebreak-compatibility.md`](regexp-replace-linebreak-compatibility.md)
+for the ClickBench Q29 `REGEXP_REPLACE` line-break finding and workaround
+options.
