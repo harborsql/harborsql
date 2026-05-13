@@ -128,6 +128,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
@@ -173,6 +175,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
@@ -192,7 +196,9 @@ jobs:
           save-if: "false"
 
       - name: Discard cached HarborSQL artifacts
-        run: cargo clean --release --target ${{ matrix.target }} --package harborsql
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo clean --release --target "${TARGET}" --package harborsql
 
       - name: Install fast Linux linker
         if: matrix.fast_linker == 'true'
@@ -204,21 +210,26 @@ jobs:
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.fast_linker == 'true' && 'clang' || '' }}
           RUSTFLAGS: ${{ matrix.fast_linker == 'true' && '-C link-arg=-fuse-ld=mold' || '' }}
-        run: cargo build --release --locked --bin harborsql --target ${{ matrix.target }}
+          TARGET: ${{ matrix.target }}
+        run: cargo build --release --locked --bin harborsql --target "${TARGET}"
 
       - name: Package binary
         shell: bash
+        env:
+          ARTIFACT: ${{ matrix.artifact }}
+          BINARY: ${{ matrix.binary }}
+          TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
-          package_dir="dist/${{ matrix.artifact }}"
-          binary_path="target/${{ matrix.target }}/release/${{ matrix.binary }}"
+          package_dir="dist/${ARTIFACT}"
+          binary_path="target/${TARGET}/release/${BINARY}"
 
           mkdir -p "${package_dir}"
           cp "${binary_path}" "${package_dir}/harborsql"
           chmod 0755 "${package_dir}/harborsql"
 
-          tar -C "${package_dir}" -czf "dist/${{ matrix.artifact }}.tar.gz" harborsql
-          shasum -a 256 "dist/${{ matrix.artifact }}.tar.gz" > "dist/${{ matrix.artifact }}.tar.gz.sha256"
+          tar -C "${package_dir}" -czf "dist/${ARTIFACT}.tar.gz" harborsql
+          shasum -a 256 "dist/${ARTIFACT}.tar.gz" > "dist/${ARTIFACT}.tar.gz.sha256"
 
       - name: Upload binary artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -239,12 +250,16 @@ jobs:
       - build-binaries
     if: always() && needs.prepare.result == 'success' && needs.build-binaries.result == 'success'
     permissions:
+      attestations: write
       contents: read
+      id-token: write
       packages: write
     timeout-minutes: 45
     steps:
       - name: Check out repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
 
       - name: Download Linux binary
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
@@ -262,6 +277,9 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
+      - name: Prepare security metadata directory
+        run: mkdir -p dist/security
+
       - name: Log in to GitHub Container Registry
         if: needs.prepare.outputs.publish == 'true'
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
@@ -275,13 +293,107 @@ jobs:
         with:
           context: dist/docker
           file: ./Dockerfile
+          load: true
           platforms: linux/amd64
-          push: ${{ needs.prepare.outputs.publish == 'true' }}
+          push: false
           tags: ${{ needs.prepare.outputs.image_tags }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.version=${{ needs.prepare.outputs.package_tag }}
             org.opencontainers.image.description=HarborSQL external SQL query engine
+
+      - name: Scan image for fixable vulnerabilities
+        uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7.4.0
+        with:
+          image: ${{ needs.prepare.outputs.image_ref }}:${{ needs.prepare.outputs.package_tag }}
+          fail-build: "true"
+          severity-cutoff: high
+          only-fixed: "true"
+          output-format: sarif
+          output-file: dist/security/harborsql-image-${{ needs.prepare.outputs.package_tag }}.grype.sarif
+
+      - name: Generate image SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          image: ${{ needs.prepare.outputs.image_ref }}:${{ needs.prepare.outputs.package_tag }}
+          format: spdx-json
+          output-file: dist/security/harborsql-image-${{ needs.prepare.outputs.package_tag }}.sbom.spdx.json
+          upload-artifact: "false"
+          upload-release-assets: "false"
+
+      - name: Push image
+        if: needs.prepare.outputs.publish == 'true'
+        id: push-image
+        shell: bash
+        env:
+          IMAGE_REF: ${{ needs.prepare.outputs.image_ref }}
+          IMAGE_TAGS: ${{ needs.prepare.outputs.image_tags }}
+          PACKAGE_TAG: ${{ needs.prepare.outputs.package_tag }}
+        run: |
+          set -euo pipefail
+          while IFS= read -r tag; do
+            if [[ -n "${tag}" ]]; then
+              docker push "${tag}"
+            fi
+          done <<< "${IMAGE_TAGS}"
+
+          digest="$(docker buildx imagetools inspect "${IMAGE_REF}:${PACKAGE_TAG}" --format '{{.Manifest.Digest}}')"
+          if [[ -z "${digest}" ]]; then
+            echo "::error::Unable to resolve pushed image digest for ${IMAGE_REF}:${PACKAGE_TAG}."
+            exit 1
+          fi
+          echo "digest=${digest}" >> "${GITHUB_OUTPUT}"
+
+      - name: Install cosign
+        if: needs.prepare.outputs.publish == 'true'
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Sign image
+        if: needs.prepare.outputs.publish == 'true'
+        shell: bash
+        env:
+          IMAGE_REF: ${{ needs.prepare.outputs.image_ref }}
+          IMAGE_DIGEST: ${{ steps.push-image.outputs.digest }}
+        run: cosign sign --yes "${IMAGE_REF}@${IMAGE_DIGEST}"
+
+      - name: Attach image SBOM with cosign
+        if: needs.prepare.outputs.publish == 'true'
+        shell: bash
+        env:
+          IMAGE_REF: ${{ needs.prepare.outputs.image_ref }}
+          IMAGE_DIGEST: ${{ steps.push-image.outputs.digest }}
+          PACKAGE_TAG: ${{ needs.prepare.outputs.package_tag }}
+        run: |
+          cosign attest \
+            --yes \
+            --predicate "dist/security/harborsql-image-${PACKAGE_TAG}.sbom.spdx.json" \
+            --type spdxjson \
+            "${IMAGE_REF}@${IMAGE_DIGEST}"
+
+      - name: Attest image build provenance
+        if: needs.prepare.outputs.publish == 'true' && (github.event.repository.private == false || vars.ENABLE_GITHUB_ATTESTATIONS == 'true')
+        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4.1.0
+        with:
+          subject-name: ${{ needs.prepare.outputs.image_ref }}
+          subject-digest: ${{ steps.push-image.outputs.digest }}
+          push-to-registry: true
+
+      - name: Attest image SBOM
+        if: needs.prepare.outputs.publish == 'true' && (github.event.repository.private == false || vars.ENABLE_GITHUB_ATTESTATIONS == 'true')
+        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4.1.0
+        with:
+          subject-name: ${{ needs.prepare.outputs.image_ref }}
+          subject-digest: ${{ steps.push-image.outputs.digest }}
+          sbom-path: dist/security/harborsql-image-${{ needs.prepare.outputs.package_tag }}.sbom.spdx.json
+          push-to-registry: true
+
+      - name: Upload image security metadata
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: image-security-metadata
+          path: dist/security/*
+          if-no-files-found: error
+          retention-days: 14
 
   publish-binaries:
     name: Publish native binary packages
@@ -290,17 +402,84 @@ jobs:
     needs:
       - prepare
       - build-binaries
-    if: always() && needs.prepare.result == 'success' && needs.build-binaries.result == 'success' && needs.prepare.outputs.publish == 'true'
+      - publish-image
+    if: always() && needs.prepare.result == 'success' && needs.build-binaries.result == 'success' && needs.publish-image.result == 'success' && needs.prepare.outputs.publish == 'true'
     permissions:
+      attestations: write
       contents: write
+      id-token: write
       packages: write
     timeout-minutes: 30
     steps:
-      - name: Download binary artifacts
+      - name: Download release artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
+          pattern: harborsql-*
           path: dist/artifacts
           merge-multiple: true
+
+      - name: Generate binary SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          path: dist/artifacts
+          format: spdx-json
+          output-file: dist/artifacts/harborsql-binaries-${{ needs.prepare.outputs.package_tag }}.sbom.spdx.json
+          upload-artifact: "false"
+          upload-release-assets: "false"
+
+      - name: Generate binary provenance subjects
+        shell: bash
+        env:
+          BUILD_MACOS: ${{ needs.prepare.outputs.build_macos }}
+          PACKAGE_TAG: ${{ needs.prepare.outputs.package_tag }}
+        run: |
+          set -euo pipefail
+          subjects=(
+            dist/artifacts/harborsql-linux-x86_64.tar.gz
+            dist/artifacts/harborsql-linux-x86_64.tar.gz.sha256
+            "dist/artifacts/harborsql-binaries-${PACKAGE_TAG}.sbom.spdx.json"
+          )
+          if [[ "${BUILD_MACOS}" == "true" ]]; then
+            subjects+=(
+              dist/artifacts/harborsql-macos-arm64.tar.gz
+              dist/artifacts/harborsql-macos-arm64.tar.gz.sha256
+            )
+          fi
+          sha256sum "${subjects[@]}" > "dist/artifacts/harborsql-binaries-${PACKAGE_TAG}.provenance.sha256"
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Sign binary release artifacts
+        shell: bash
+        env:
+          PACKAGE_TAG: ${{ needs.prepare.outputs.package_tag }}
+        run: |
+          set -euo pipefail
+          artifacts=(
+            dist/artifacts/harborsql-linux-x86_64.tar.gz
+            "dist/artifacts/harborsql-binaries-${PACKAGE_TAG}.sbom.spdx.json"
+            "dist/artifacts/harborsql-binaries-${PACKAGE_TAG}.provenance.sha256"
+          )
+          if [[ -f dist/artifacts/harborsql-macos-arm64.tar.gz ]]; then
+            artifacts+=(dist/artifacts/harborsql-macos-arm64.tar.gz)
+          fi
+          for artifact in "${artifacts[@]}"; do
+            cosign sign-blob --yes --bundle "${artifact}.sigstore.json" "${artifact}"
+          done
+
+      - name: Attest binary build provenance
+        if: github.event.repository.private == false || vars.ENABLE_GITHUB_ATTESTATIONS == 'true'
+        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4.1.0
+        with:
+          subject-checksums: dist/artifacts/harborsql-binaries-${{ needs.prepare.outputs.package_tag }}.provenance.sha256
+
+      - name: Attest binary SBOM
+        if: github.event.repository.private == false || vars.ENABLE_GITHUB_ATTESTATIONS == 'true'
+        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4.1.0
+        with:
+          subject-checksums: dist/artifacts/harborsql-binaries-${{ needs.prepare.outputs.package_tag }}.provenance.sha256
+          sbom-path: dist/artifacts/harborsql-binaries-${{ needs.prepare.outputs.package_tag }}.sbom.spdx.json
 
       - name: Install ORAS
         uses: oras-project/setup-oras@22ce207df3b08e061f537244349aac6ae1d214f6 # v1
@@ -313,46 +492,75 @@ jobs:
 
       - name: Push binary archive package
         shell: bash
+        env:
+          BINARIES_REF: ${{ needs.prepare.outputs.binaries_ref }}
+          BUILD_MACOS: ${{ needs.prepare.outputs.build_macos }}
+          PACKAGE_TAG: ${{ needs.prepare.outputs.package_tag }}
+          REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
           artifacts=(
             dist/artifacts/harborsql-linux-x86_64.tar.gz:application/gzip
             dist/artifacts/harborsql-linux-x86_64.tar.gz.sha256:text/plain
+            dist/artifacts/harborsql-linux-x86_64.tar.gz.sigstore.json:application/vnd.dev.sigstore.bundle+json
+            "dist/artifacts/harborsql-binaries-${PACKAGE_TAG}.sbom.spdx.json:application/spdx+json"
+            "dist/artifacts/harborsql-binaries-${PACKAGE_TAG}.sbom.spdx.json.sigstore.json:application/vnd.dev.sigstore.bundle+json"
+            "dist/artifacts/harborsql-binaries-${PACKAGE_TAG}.provenance.sha256:text/plain"
+            "dist/artifacts/harborsql-binaries-${PACKAGE_TAG}.provenance.sha256.sigstore.json:application/vnd.dev.sigstore.bundle+json"
           )
-          if [[ "${{ needs.prepare.outputs.build_macos }}" == "true" ]]; then
+          if [[ "${BUILD_MACOS}" == "true" ]]; then
             artifacts+=(
               dist/artifacts/harborsql-macos-arm64.tar.gz:application/gzip
               dist/artifacts/harborsql-macos-arm64.tar.gz.sha256:text/plain
+              dist/artifacts/harborsql-macos-arm64.tar.gz.sigstore.json:application/vnd.dev.sigstore.bundle+json
             )
           fi
 
-          oras push "${{ needs.prepare.outputs.binaries_ref }}:${{ needs.prepare.outputs.package_tag }}" \
+          oras push "${BINARIES_REF}:${PACKAGE_TAG}" \
             --artifact-type application/vnd.harborsql.binaries.v1+tar \
-            --annotation "org.opencontainers.image.source=https://github.com/${{ github.repository }}" \
-            --annotation "org.opencontainers.image.version=${{ needs.prepare.outputs.package_tag }}" \
+            --annotation "org.opencontainers.image.source=https://github.com/${REPOSITORY}" \
+            --annotation "org.opencontainers.image.version=${PACKAGE_TAG}" \
             "${artifacts[@]}"
 
       - name: Push latest binary archive package
         if: needs.prepare.outputs.publish_latest == 'true'
         shell: bash
+        env:
+          BINARIES_REF: ${{ needs.prepare.outputs.binaries_ref }}
+          PACKAGE_TAG: ${{ needs.prepare.outputs.package_tag }}
+          REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
           artifacts=(
             dist/artifacts/harborsql-linux-x86_64.tar.gz:application/gzip
             dist/artifacts/harborsql-linux-x86_64.tar.gz.sha256:text/plain
+            dist/artifacts/harborsql-linux-x86_64.tar.gz.sigstore.json:application/vnd.dev.sigstore.bundle+json
             dist/artifacts/harborsql-macos-arm64.tar.gz:application/gzip
             dist/artifacts/harborsql-macos-arm64.tar.gz.sha256:text/plain
+            dist/artifacts/harborsql-macos-arm64.tar.gz.sigstore.json:application/vnd.dev.sigstore.bundle+json
+            "dist/artifacts/harborsql-binaries-${PACKAGE_TAG}.sbom.spdx.json:application/spdx+json"
+            "dist/artifacts/harborsql-binaries-${PACKAGE_TAG}.sbom.spdx.json.sigstore.json:application/vnd.dev.sigstore.bundle+json"
+            "dist/artifacts/harborsql-binaries-${PACKAGE_TAG}.provenance.sha256:text/plain"
+            "dist/artifacts/harborsql-binaries-${PACKAGE_TAG}.provenance.sha256.sigstore.json:application/vnd.dev.sigstore.bundle+json"
           )
 
-          oras push "${{ needs.prepare.outputs.binaries_ref }}:latest" \
+          oras push "${BINARIES_REF}:latest" \
             --artifact-type application/vnd.harborsql.binaries.v1+tar \
-            --annotation "org.opencontainers.image.source=https://github.com/${{ github.repository }}" \
-            --annotation "org.opencontainers.image.version=${{ needs.prepare.outputs.package_tag }}" \
+            --annotation "org.opencontainers.image.source=https://github.com/${REPOSITORY}" \
+            --annotation "org.opencontainers.image.version=${PACKAGE_TAG}" \
             "${artifacts[@]}"
+
+      - name: Download image security metadata
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: image-security-metadata
+          path: dist/artifacts
 
       - name: Upload binaries to GitHub release
         if: github.event_name == 'release'
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "${{ needs.prepare.outputs.package_tag }}" dist/artifacts/* --repo "${{ github.repository }}"
+          PACKAGE_TAG: ${{ needs.prepare.outputs.package_tag }}
+          REPOSITORY: ${{ github.repository }}
+        run: gh release upload "${PACKAGE_TAG}" dist/artifacts/* --repo "${REPOSITORY}"
