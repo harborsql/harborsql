@@ -25,6 +25,13 @@ Publishing jobs use the `release` GitHub environment and all workflow actions
 are pinned to commit SHAs. GitHub release asset uploads do not use `--clobber`;
 reruns fail instead of replacing existing release assets.
 
+The release workflow scans the container image with Grype before pushing it,
+publishes SPDX SBOMs for the image and native binary package, signs release
+artifacts with keyless Sigstore/cosign, and signs the pushed image digest. For
+public repositories, or private repositories with `ENABLE_GITHUB_ATTESTATIONS`
+set after enabling GitHub artifact attestations for the plan, the workflow also
+creates GitHub provenance and SBOM attestations.
+
 ```bash
 docker pull ghcr.io/<owner>/harborsql:<tag>
 oras pull ghcr.io/<owner>/harborsql-binaries:<tag>
