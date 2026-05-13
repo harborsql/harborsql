@@ -15,6 +15,16 @@ artifact by default; add `[build-macos]` to the prerelease notes to include it.
 The Docker image is built from the already-compiled Linux binary, so the
 release build does not compile the Rust code again inside Docker.
 
+Release builds restore Rust caches but do not save them. The separate
+`Release Cache` workflow warms dependency caches from trusted `main` and
+scheduled runs. Before compiling publishable artifacts, the release workflow
+removes cached HarborSQL package outputs so dependencies stay cached while the
+first-party binary is rebuilt from the checked-out release source.
+
+Publishing jobs use the `release` GitHub environment and all workflow actions
+are pinned to commit SHAs. GitHub release asset uploads do not use `--clobber`;
+reruns fail instead of replacing existing release assets.
+
 ```bash
 docker pull ghcr.io/<owner>/harborsql:<tag>
 oras pull ghcr.io/<owner>/harborsql-binaries:<tag>
