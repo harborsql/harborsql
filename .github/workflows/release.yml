@@ -55,6 +55,13 @@ jobs:
       - name: Resolve package metadata
         id: meta
         shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_BUILD_MACOS: ${{ inputs.build_macos }}
+          INPUT_PACKAGE_TAG: ${{ inputs.package_tag }}
+          INPUT_PUBLISH: ${{ inputs.publish }}
+          RELEASE_BODY_HAS_BUILD_MACOS: ${{ contains(github.event.release.body, '[build-macos]') }}
+          RELEASE_IS_PRERELEASE: ${{ github.event.release.prerelease }}
         run: |
           set -euo pipefail
 
@@ -64,24 +71,24 @@ jobs:
           publish_latest="false"
           build_macos="false"
 
-          if [[ "${{ github.event_name }}" == "release" ]]; then
+          if [[ "${EVENT_NAME}" == "release" ]]; then
             package_tag="${GITHUB_REF_NAME}"
             publish="true"
-            if [[ "${{ github.event.release.prerelease }}" != "true" ]]; then
+            if [[ "${RELEASE_IS_PRERELEASE}" != "true" ]]; then
               publish_latest="true"
               build_macos="true"
-            elif [[ "${{ contains(github.event.release.body, '[build-macos]') }}" == "true" ]]; then
+            elif [[ "${RELEASE_BODY_HAS_BUILD_MACOS}" == "true" ]]; then
               build_macos="true"
             fi
           else
-            package_tag="${{ inputs.package_tag }}"
+            package_tag="${INPUT_PACKAGE_TAG}"
             if [[ -z "${package_tag}" ]]; then
               package_tag="sha-${GITHUB_SHA::12}"
             fi
-            if [[ "${{ inputs.publish }}" == "true" ]]; then
+            if [[ "${INPUT_PUBLISH}" == "true" ]]; then
               publish="true"
             fi
-            if [[ "${{ inputs.build_macos }}" == "true" ]]; then
+            if [[ "${INPUT_BUILD_MACOS}" == "true" ]]; then
               build_macos="true"
             fi
           fi
@@ -120,15 +127,25 @@ jobs:
     timeout-minutes: 90
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - name: Compute Rust dependency cache key
+        id: rust-cache-key
+        shell: bash
+        run: python3 .github/scripts/rust-cache-key.py >> "${GITHUB_OUTPUT}"
 
       - name: Cache Cargo build
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
-          key: pre-release
+          shared-key: pre-release-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust-cache-key.outputs.dependency_hash }}
+          add-rust-environment-hash-key: "false"
+          save-if: "false"
+
+      - name: Discard cached HarborSQL artifacts
+        run: cargo clean --release --package harborsql
 
       - name: Run benchmark command
         shell: bash
@@ -155,10 +172,10 @@ jobs:
       matrix: ${{ fromJson(needs.prepare.outputs.binary_matrix) }}
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           targets: ${{ matrix.target }}
 
@@ -168,11 +185,14 @@ jobs:
         run: python3 .github/scripts/rust-cache-key.py >> "${GITHUB_OUTPUT}"
 
       - name: Cache Cargo build
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: release-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}-${{ steps.rust-cache-key.outputs.dependency_hash }}
           add-rust-environment-hash-key: "false"
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: "false"
+
+      - name: Discard cached HarborSQL artifacts
+        run: cargo clean --release --target ${{ matrix.target }} --package harborsql
 
       - name: Install fast Linux linker
         if: matrix.fast_linker == 'true'
@@ -201,7 +221,7 @@ jobs:
           shasum -a 256 "dist/${{ matrix.artifact }}.tar.gz" > "dist/${{ matrix.artifact }}.tar.gz.sha256"
 
       - name: Upload binary artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ matrix.artifact }}
           path: |
@@ -213,6 +233,7 @@ jobs:
   publish-image:
     name: Build and publish Docker image
     runs-on: ubuntu-24.04
+    environment: release
     needs:
       - prepare
       - build-binaries
@@ -223,10 +244,10 @@ jobs:
     timeout-minutes: 45
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Download Linux binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: harborsql-linux-x86_64
           path: dist/linux-x86_64
@@ -239,18 +260,18 @@ jobs:
           tar -xzf dist/linux-x86_64/harborsql-linux-x86_64.tar.gz -C dist/docker
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: Log in to GitHub Container Registry
         if: needs.prepare.outputs.publish == 'true'
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: dist/docker
           file: ./Dockerfile
@@ -265,6 +286,7 @@ jobs:
   publish-binaries:
     name: Publish native binary packages
     runs-on: ubuntu-24.04
+    environment: release
     needs:
       - prepare
       - build-binaries
@@ -275,13 +297,13 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Download binary artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: dist/artifacts
           merge-multiple: true
 
       - name: Install ORAS
-        uses: oras-project/setup-oras@v1
+        uses: oras-project/setup-oras@22ce207df3b08e061f537244349aac6ae1d214f6 # v1
 
       - name: Log in to GitHub Container Registry
         shell: bash
@@ -333,4 +355,4 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "${{ needs.prepare.outputs.package_tag }}" dist/artifacts/* --repo "${{ github.repository }}" --clobber
+        run: gh release upload "${{ needs.prepare.outputs.package_tag }}" dist/artifacts/* --repo "${{ github.repository }}"
