@@ -12,8 +12,10 @@ For non-prerelease GitHub releases, the macOS artifact is mandatory and the
 workflow also updates the `latest` tags. GitHub prereleases skip the macOS
 artifact by default; add `[build-macos]` to the prerelease notes to include it.
 
-The Docker image is built from the already-compiled Linux binary, so the
-release build does not compile the Rust code again inside Docker.
+The release workflow runs the pre-release benchmark gate before building
+publishable artifacts. The Docker image is built from the already-compiled
+Linux binary, so the release build does not compile the Rust code again inside
+Docker.
 
 Release builds restore Rust caches but do not save them. The separate
 `Release Cache` workflow warms dependency caches from trusted `main` and
@@ -38,9 +40,9 @@ oras pull ghcr.io/<owner>/harborsql-binaries:<tag>
 ```
 
 To run the release validation without publishing, use the `Release` workflow's
-manual `workflow_dispatch` trigger with `publish` disabled. The manual trigger
-also has a `build_macos` option when a prerelease candidate needs the macOS
-binary.
+manual `workflow_dispatch` trigger with `publish` disabled and
+`run_benchmarks` enabled. The manual trigger also has a `build_macos` option
+when a prerelease candidate needs the macOS binary.
 
 The default pre-release benchmark gate is:
 
@@ -49,7 +51,9 @@ cargo test --release --locked --all-targets
 ```
 
 Override `benchmark_command` in the manual workflow run if the benchmark suite
-lives in another repository or needs a different command.
+lives in another repository or needs a different command. Published GitHub
+release events always run the default benchmark command because release events
+do not carry manual workflow inputs.
 
 GitHub Packages may create the first GHCR package as private. If this
 repository is public and the images should be public, change the package
