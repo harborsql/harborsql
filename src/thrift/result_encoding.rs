@@ -1,11 +1,18 @@
 use datafusion::arrow::{
     array::{
-        Array, ArrayRef, BooleanArray, Date32Array, Date64Array, Float32Array, Float64Array,
-        Int8Array, Int16Array, Int32Array, Int64Array, LargeStringArray, StringArray,
-        StringViewArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+        Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Date64Array, FixedSizeBinaryArray,
+        FixedSizeListArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
+        Int64Array, LargeBinaryArray, LargeListArray, LargeStringArray, ListArray, MapArray,
+        StringArray, StringViewArray, StructArray, TimestampMicrosecondArray,
+        TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
+        UInt16Array, UInt32Array, UInt64Array,
     },
-    datatypes::DataType,
+    datatypes::{DataType, TimeUnit},
     record_batch::RecordBatch,
+    temporal_conversions::{
+        date32_to_datetime, date64_to_datetime, timestamp_ms_to_datetime, timestamp_ns_to_datetime,
+        timestamp_s_to_datetime, timestamp_us_to_datetime,
+    },
     util::display::array_value_to_string,
 };
 
@@ -108,22 +115,41 @@ fn write_table_schema(writer: &mut Writer, columns: &[Column], encoders: &[Colum
 fn write_column_desc(writer: &mut Writer, column: &Column, encoder: &ColumnEncoder, position: i32) {
     writer.write_field(T_STRING, 1, |writer| writer.write_string(&column.name));
     writer.write_field(T_STRUCT, 2, |writer| {
-        write_type_desc(writer, encoder.schema_type);
+        write_type_desc(writer, encoder);
     });
     writer.write_field(T_I32, 3, |writer| writer.write_i32(position));
     writer.write_stop();
 }
 
-fn write_type_desc(writer: &mut Writer, type_id: i32) {
+fn write_type_desc(writer: &mut Writer, encoder: &ColumnEncoder) {
     writer.write_field(T_LIST, 1, |writer| {
         writer.write_list_begin(T_STRUCT, 1);
         writer.write_field(T_STRUCT, 1, |writer| {
-            writer.write_field(T_I32, 1, |writer| writer.write_i32(type_id));
+            writer.write_field(T_I32, 1, |writer| writer.write_i32(encoder.schema_type));
+            if let Some((precision, scale)) = encoder.decimal {
+                write_decimal_type_qualifiers(writer, precision, scale);
+            }
             writer.write_stop();
         });
         writer.write_stop();
     });
     writer.write_stop();
+}
+
+fn write_decimal_type_qualifiers(writer: &mut Writer, precision: i32, scale: i32) {
+    writer.write_field(T_STRUCT, 2, |writer| {
+        writer.write_field(T_MAP, 1, |writer| {
+            writer.write_raw(&[T_STRING, T_STRUCT]);
+            writer.write_i32(2);
+            writer.write_string("precision");
+            writer.write_field(T_I32, 1, |writer| writer.write_i32(precision));
+            writer.write_stop();
+            writer.write_string("scale");
+            writer.write_field(T_I32, 1, |writer| writer.write_i32(scale));
+            writer.write_stop();
+        });
+        writer.write_stop();
+    });
 }
 
 #[cfg(test)]
@@ -210,6 +236,14 @@ fn write_column(
                 )?))
             })
         })?,
+        PhysicalType::Binary => writer.write_field_result(T_STRUCT, 8, |writer| {
+            write_column_values(writer, T_STRING, page, column_index, |array, row| {
+                Ok(ThriftValue::Binary(arrow_value_to_binary(
+                    array.as_ref(),
+                    row,
+                )?))
+            })
+        })?,
     }
     writer.write_stop();
     Ok(())
@@ -241,6 +275,7 @@ where
                     ThriftValue::I64(value) => writer.write_i64(value),
                     ThriftValue::F64(value) => writer.write_double(value),
                     ThriftValue::String(value) => writer.write_string(&value),
+                    ThriftValue::Binary(value) => writer.write_binary(&value),
                 }
             }
         }
@@ -276,6 +311,7 @@ pub(super) fn null_bitset(
 struct ColumnEncoder {
     schema_type: i32,
     physical_type: PhysicalType,
+    decimal: Option<(i32, i32)>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -285,6 +321,7 @@ enum PhysicalType {
     I64,
     F64,
     String,
+    Binary,
 }
 
 enum ThriftValue {
@@ -293,6 +330,7 @@ enum ThriftValue {
     I64(i64),
     F64(f64),
     String(String),
+    Binary(Vec<u8>),
 }
 
 fn column_encoders(result: &QueryResult) -> Result<Vec<ColumnEncoder>> {
@@ -314,27 +352,50 @@ fn column_encoders(result: &QueryResult) -> Result<Vec<ColumnEncoder>> {
 fn column_encoder(data_type: &DataType) -> Result<ColumnEncoder> {
     let (schema_type, physical_type) = match data_type {
         DataType::Boolean => (BOOLEAN_TYPE, PhysicalType::Bool),
-        DataType::Int8 | DataType::Int16 | DataType::Int32 => (INT_TYPE, PhysicalType::I32),
+        DataType::Int8 => (TINYINT_TYPE, PhysicalType::I32),
+        DataType::Int16 => (SMALLINT_TYPE, PhysicalType::I32),
+        DataType::Int32 => (INT_TYPE, PhysicalType::I32),
         DataType::Int64
         | DataType::UInt8
         | DataType::UInt16
         | DataType::UInt32
         | DataType::UInt64 => (BIGINT_TYPE, PhysicalType::I64),
-        DataType::Float32 | DataType::Float64 => (DOUBLE_TYPE, PhysicalType::F64),
+        DataType::Float32 => (FLOAT_TYPE, PhysicalType::F64),
+        DataType::Float64 => (DOUBLE_TYPE, PhysicalType::F64),
         DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
             (STRING_TYPE, PhysicalType::String)
         }
         DataType::Date32 | DataType::Date64 => (DATE_TYPE, PhysicalType::String),
         DataType::Timestamp(_, _) => (TIMESTAMP_TYPE, PhysicalType::String),
+        DataType::Binary | DataType::LargeBinary | DataType::FixedSizeBinary(_) => {
+            (BINARY_TYPE, PhysicalType::Binary)
+        }
+        DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => {
+            (DECIMAL_TYPE, PhysicalType::String)
+        }
+        DataType::List(_)
+        | DataType::LargeList(_)
+        | DataType::FixedSizeList(_, _)
+        | DataType::ListView(_)
+        | DataType::LargeListView(_) => (ARRAY_TYPE, PhysicalType::String),
+        DataType::Map(_, _) => (MAP_TYPE, PhysicalType::String),
+        DataType::Struct(_) => (STRUCT_TYPE, PhysicalType::String),
         other => {
             return Err(HarborError::UnsupportedResultType(format!(
                 "unsupported Arrow result type `{other}`"
             )));
         }
     };
+    let decimal = match data_type {
+        DataType::Decimal128(precision, scale) | DataType::Decimal256(precision, scale) => {
+            Some((i32::from(*precision), i32::from(*scale)))
+        }
+        _ => None,
+    };
     Ok(ColumnEncoder {
         schema_type,
         physical_type,
+        decimal,
     })
 }
 
@@ -503,14 +564,255 @@ fn arrow_value_to_string(array: &dyn Array, row: usize) -> Result<String> {
         DataType::Timestamp(_, _) => array_value_to_string(array, row).map_err(|err| {
             HarborError::UnsupportedResultType(format!("failed to format Timestamp value: {err}"))
         })?,
+        DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => {
+            databricks_display_value(array, row)?
+        }
+        DataType::List(_)
+        | DataType::LargeList(_)
+        | DataType::FixedSizeList(_, _)
+        | DataType::ListView(_)
+        | DataType::LargeListView(_)
+        | DataType::Map(_, _)
+        | DataType::Struct(_) => databricks_display_value(array, row)?,
         other => {
             return Err(unexpected_value_type(
                 other,
-                "Utf8/LargeUtf8/Utf8View/Date/Timestamp",
+                "Utf8/LargeUtf8/Utf8View/Date/Timestamp/Decimal/List/Map/Struct",
             ));
         }
     };
     Ok(value)
+}
+
+fn arrow_value_to_binary(array: &dyn Array, row: usize) -> Result<Vec<u8>> {
+    if array.is_null(row) {
+        return Ok(Vec::new());
+    }
+
+    let value = match array.data_type() {
+        DataType::Binary => array
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .ok_or_else(|| unexpected_value_type(array.data_type(), "Binary"))?
+            .value(row)
+            .to_vec(),
+        DataType::LargeBinary => array
+            .as_any()
+            .downcast_ref::<LargeBinaryArray>()
+            .ok_or_else(|| unexpected_value_type(array.data_type(), "LargeBinary"))?
+            .value(row)
+            .to_vec(),
+        DataType::FixedSizeBinary(_) => array
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .ok_or_else(|| unexpected_value_type(array.data_type(), "FixedSizeBinary"))?
+            .value(row)
+            .to_vec(),
+        other => {
+            return Err(unexpected_value_type(
+                other,
+                "Binary/LargeBinary/FixedSizeBinary",
+            ));
+        }
+    };
+    Ok(value)
+}
+
+fn databricks_display_value(array: &dyn Array, row: usize) -> Result<String> {
+    if array.is_null(row) {
+        return Ok("null".to_string());
+    }
+
+    let value = match array.data_type() {
+        DataType::Boolean => arrow_value_to_bool(array, row)?.to_string(),
+        DataType::Int8 | DataType::Int16 | DataType::Int32 => {
+            arrow_value_to_i32(array, row)?.to_string()
+        }
+        DataType::Int64
+        | DataType::UInt8
+        | DataType::UInt16
+        | DataType::UInt32
+        | DataType::UInt64 => arrow_value_to_i64(array, row)?.to_string(),
+        DataType::Float32 | DataType::Float64 => arrow_value_to_f64(array, row)?.to_string(),
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
+            serde_json::to_string(&arrow_value_to_string(array, row)?)?
+        }
+        DataType::Date32 | DataType::Date64 => format_date_value(array, row)?,
+        DataType::Timestamp(_, _) => format_timestamp_value(array, row)?,
+        DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => {
+            array_value_to_string(array, row).map_err(|err| {
+                HarborError::UnsupportedResultType(format!("failed to format Decimal value: {err}"))
+            })?
+        }
+        DataType::Binary | DataType::LargeBinary | DataType::FixedSizeBinary(_) => {
+            serde_json::to_string(&arrow_value_to_binary(array, row)?)?
+        }
+        DataType::List(_) => {
+            let array = array
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .ok_or_else(|| unexpected_value_type(array.data_type(), "List"))?;
+            databricks_display_list(array.value(row).as_ref())?
+        }
+        DataType::LargeList(_) => {
+            let array = array
+                .as_any()
+                .downcast_ref::<LargeListArray>()
+                .ok_or_else(|| unexpected_value_type(array.data_type(), "LargeList"))?;
+            databricks_display_list(array.value(row).as_ref())?
+        }
+        DataType::FixedSizeList(_, _) => {
+            let array = array
+                .as_any()
+                .downcast_ref::<FixedSizeListArray>()
+                .ok_or_else(|| unexpected_value_type(array.data_type(), "FixedSizeList"))?;
+            databricks_display_list(array.value(row).as_ref())?
+        }
+        DataType::Map(_, _) => {
+            let array = array
+                .as_any()
+                .downcast_ref::<MapArray>()
+                .ok_or_else(|| unexpected_value_type(array.data_type(), "Map"))?;
+            databricks_display_map(&array.value(row))?
+        }
+        DataType::Struct(_) => {
+            let array = array
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .ok_or_else(|| unexpected_value_type(array.data_type(), "Struct"))?;
+            databricks_display_struct(array, row)?
+        }
+        other => {
+            return Err(unexpected_value_type(
+                other,
+                "Databricks display-compatible Arrow type",
+            ));
+        }
+    };
+    Ok(value)
+}
+
+fn databricks_display_list(values: &dyn Array) -> Result<String> {
+    let values = (0..values.len())
+        .map(|row| databricks_display_value(values, row))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(format!("[{}]", values.join(",")))
+}
+
+fn databricks_display_map(entries: &StructArray) -> Result<String> {
+    let keys = entries.column(0);
+    let values = entries.column(1);
+    let mut pairs = (0..entries.len())
+        .map(|row| {
+            let key = if keys.is_null(row) {
+                "null".to_string()
+            } else {
+                match keys.data_type() {
+                    DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
+                        arrow_value_to_string(keys.as_ref(), row)?
+                    }
+                    _ => databricks_display_value(keys.as_ref(), row)?,
+                }
+            };
+            let value = databricks_display_value(values.as_ref(), row)?;
+            Ok((key, value))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    pairs.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let rendered = pairs
+        .into_iter()
+        .map(|(key, value)| Ok(format!("{}:{}", serde_json::to_string(&key)?, value)))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(format!("{{{}}}", rendered.join(",")))
+}
+
+fn databricks_display_struct(array: &StructArray, row: usize) -> Result<String> {
+    let rendered = array
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(index, field)| {
+            Ok(format!(
+                "{}:{}",
+                serde_json::to_string(field.name())?,
+                databricks_display_value(array.column(index).as_ref(), row)?
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(format!("{{{}}}", rendered.join(",")))
+}
+
+fn format_date_value(array: &dyn Array, row: usize) -> Result<String> {
+    let value = match array.data_type() {
+        DataType::Date32 => {
+            let days = array
+                .as_any()
+                .downcast_ref::<Date32Array>()
+                .ok_or_else(|| unexpected_value_type(array.data_type(), "Date32"))?
+                .value(row);
+            date32_to_datetime(days)
+        }
+        DataType::Date64 => {
+            let millis = array
+                .as_any()
+                .downcast_ref::<Date64Array>()
+                .ok_or_else(|| unexpected_value_type(array.data_type(), "Date64"))?
+                .value(row);
+            date64_to_datetime(millis)
+        }
+        other => return Err(unexpected_value_type(other, "Date32/Date64")),
+    };
+    value
+        .map(|date_time| date_time.date().to_string())
+        .ok_or_else(|| {
+            HarborError::UnsupportedResultType(format!(
+                "date value at row {row} is outside supported range"
+            ))
+        })
+}
+
+fn format_timestamp_value(array: &dyn Array, row: usize) -> Result<String> {
+    let value = match array.data_type() {
+        DataType::Timestamp(TimeUnit::Second, _) => {
+            let seconds = array
+                .as_any()
+                .downcast_ref::<TimestampSecondArray>()
+                .ok_or_else(|| unexpected_value_type(array.data_type(), "TimestampSecond"))?
+                .value(row);
+            timestamp_s_to_datetime(seconds)
+        }
+        DataType::Timestamp(TimeUnit::Millisecond, _) => {
+            let millis = array
+                .as_any()
+                .downcast_ref::<TimestampMillisecondArray>()
+                .ok_or_else(|| unexpected_value_type(array.data_type(), "TimestampMillisecond"))?
+                .value(row);
+            timestamp_ms_to_datetime(millis)
+        }
+        DataType::Timestamp(TimeUnit::Microsecond, _) => {
+            let micros = array
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .ok_or_else(|| unexpected_value_type(array.data_type(), "TimestampMicrosecond"))?
+                .value(row);
+            timestamp_us_to_datetime(micros)
+        }
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+            let nanos = array
+                .as_any()
+                .downcast_ref::<TimestampNanosecondArray>()
+                .ok_or_else(|| unexpected_value_type(array.data_type(), "TimestampNanosecond"))?
+                .value(row);
+            timestamp_ns_to_datetime(nanos)
+        }
+        other => return Err(unexpected_value_type(other, "Timestamp")),
+    };
+    value.map(|date_time| date_time.to_string()).ok_or_else(|| {
+        HarborError::UnsupportedResultType(format!(
+            "timestamp value at row {row} is outside supported range"
+        ))
+    })
 }
 
 fn unexpected_value_type(actual: &DataType, expected: &str) -> HarborError {

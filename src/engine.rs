@@ -19,10 +19,11 @@ use object_store::{
 use serde::{Serialize, Serializer, ser::SerializeStruct};
 use sqlparser::{
     ast::{
-        BinaryOperator, DateTimeField, DuplicateTreatment, Expr, Function, FunctionArg,
-        FunctionArgExpr, FunctionArgumentList, FunctionArguments, GroupByExpr, Ident, ObjectName,
-        ObjectNamePart, OrderBy, OrderByKind, Query, Select, SelectItem, SetExpr,
-        Statement as SqlStatement, UnaryOperator, Value,
+        AccessExpr, BinaryOperator, CaseWhen, DateTimeField, DuplicateTreatment, Expr, Function,
+        FunctionArg, FunctionArgExpr, FunctionArgumentList, FunctionArguments, GroupByExpr, Ident,
+        ObjectName, ObjectNamePart, OrderBy, OrderByKind, Query, Select, SelectItem, SetExpr,
+        Statement as SqlStatement, Subscript, UnaryOperator, Value,
+        helpers::attached_token::AttachedToken,
     },
     dialect::GenericDialect,
     parser::Parser,
@@ -714,6 +715,17 @@ fn rewrite_expr_fast_paths(expr: &mut Expr, options: RewriteOptions) -> bool {
         | Expr::Nested(expr)
         | Expr::OuterJoin(expr)
         | Expr::Prior(expr) => rewrite_expr_fast_paths(expr, options),
+        Expr::CompoundFieldAccess { root, access_chain } => {
+            let root_is_databricks_get = is_databricks_get_array_expr(root);
+            let mut changed = rewrite_expr_fast_paths(root, options);
+            if root_is_databricks_get {
+                changed |= rewrite_dot_accesses_as_named_field_subscripts(access_chain);
+            }
+            for access in access_chain {
+                changed |= rewrite_access_expr_fast_paths(access, options);
+            }
+            changed
+        }
         _ => false,
     }
 }
@@ -729,13 +741,17 @@ fn rewrite_leaf_expr_fast_paths(expr: &mut Expr, options: RewriteOptions) -> boo
             true
         }
         Expr::Function(function) => {
-            if let Some((source, pattern, capture_index)) =
+            let changed_args = rewrite_function_fast_paths(function, options);
+            if let Some((array, index)) = databricks_get_array_args(function) {
+                *expr = array_element_expr(array, index);
+                true
+            } else if let Some((source, pattern, capture_index)) =
                 regexp_replace_capture_fast_path_args(function)
             {
                 *expr = regexp_replace_capture_expr(source, pattern, capture_index);
                 true
             } else {
-                rewrite_function_fast_paths(function, options)
+                changed_args
             }
         }
         Expr::Like {
@@ -753,6 +769,54 @@ fn rewrite_leaf_expr_fast_paths(expr: &mut Expr, options: RewriteOptions) -> boo
         }
         _ => false,
     }
+}
+
+fn rewrite_access_expr_fast_paths(access: &mut AccessExpr, options: RewriteOptions) -> bool {
+    match access {
+        AccessExpr::Dot(expr) => rewrite_expr_fast_paths(expr, options),
+        AccessExpr::Subscript(subscript) => rewrite_subscript_fast_paths(subscript, options),
+    }
+}
+
+fn rewrite_subscript_fast_paths(subscript: &mut Subscript, options: RewriteOptions) -> bool {
+    match subscript {
+        Subscript::Index { index } => rewrite_expr_fast_paths(index, options),
+        Subscript::Slice {
+            lower_bound,
+            upper_bound,
+            stride,
+        } => {
+            let mut changed = false;
+            if let Some(lower_bound) = lower_bound {
+                changed |= rewrite_expr_fast_paths(lower_bound, options);
+            }
+            if let Some(upper_bound) = upper_bound {
+                changed |= rewrite_expr_fast_paths(upper_bound, options);
+            }
+            if let Some(stride) = stride {
+                changed |= rewrite_expr_fast_paths(stride, options);
+            }
+            changed
+        }
+    }
+}
+
+fn is_databricks_get_array_expr(expr: &Expr) -> bool {
+    matches!(expr, Expr::Function(function) if databricks_get_array_args(function).is_some())
+}
+
+fn rewrite_dot_accesses_as_named_field_subscripts(access_chain: &mut [AccessExpr]) -> bool {
+    let mut changed = false;
+    for access in access_chain {
+        if let AccessExpr::Dot(Expr::Identifier(ident)) = access {
+            let field_name = ident.value.clone();
+            *access = AccessExpr::Subscript(Subscript::Index {
+                index: single_quoted_string_expr(field_name),
+            });
+            changed = true;
+        }
+    }
+    changed
 }
 
 fn extract_minute_expr(source: Expr) -> Expr {
@@ -978,6 +1042,35 @@ fn regexp_replace_capture_fast_path_args(function: &Function) -> Option<(Expr, S
     Some((source, pattern, capture_index))
 }
 
+fn databricks_get_array_args(function: &Function) -> Option<(Expr, Expr)> {
+    if !function_name_eq(function, "get")
+        || function.uses_odbc_syntax
+        || !matches!(function.parameters, FunctionArguments::None)
+        || function.filter.is_some()
+        || function.null_treatment.is_some()
+        || function.over.is_some()
+        || !function.within_group.is_empty()
+    {
+        return None;
+    }
+
+    let FunctionArguments::List(FunctionArgumentList {
+        duplicate_treatment: None,
+        args,
+        clauses,
+    }) = &function.args
+    else {
+        return None;
+    };
+    if args.len() != 2 || !clauses.is_empty() {
+        return None;
+    }
+
+    let array = function_arg_expr(args.first()?)?.clone();
+    let index = function_arg_expr(args.get(1)?)?.clone();
+    Some((array, index))
+}
+
 fn function_name_eq(function: &Function, expected: &str) -> bool {
     if function.name.0.len() != 1 {
         return false;
@@ -1007,6 +1100,57 @@ fn capture_replacement_index(replacement: &str) -> Option<u64> {
         return None;
     }
     digits.parse().ok()
+}
+
+fn array_element_expr(array: Expr, zero_based_index: Expr) -> Expr {
+    Expr::Function(Function {
+        name: ObjectName::from(Ident::new("array_element")),
+        uses_odbc_syntax: false,
+        parameters: FunctionArguments::None,
+        args: FunctionArguments::List(FunctionArgumentList {
+            duplicate_treatment: None,
+            args: vec![
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(array)),
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(databricks_get_array_index_expr(
+                    zero_based_index,
+                ))),
+            ],
+            clauses: vec![],
+        }),
+        filter: None,
+        null_treatment: None,
+        over: None,
+        within_group: vec![],
+    })
+}
+
+fn databricks_get_array_index_expr(index: Expr) -> Expr {
+    Expr::Case {
+        case_token: AttachedToken::empty(),
+        end_token: AttachedToken::empty(),
+        operand: None,
+        conditions: vec![CaseWhen {
+            condition: Expr::BinaryOp {
+                left: Box::new(index.clone()),
+                op: BinaryOperator::Lt,
+                right: Box::new(number_expr("0")),
+            },
+            result: number_expr("0"),
+        }],
+        else_result: Some(Box::new(Expr::BinaryOp {
+            left: Box::new(index),
+            op: BinaryOperator::Plus,
+            right: Box::new(number_expr("1")),
+        })),
+    }
+}
+
+fn number_expr(value: &str) -> Expr {
+    Expr::Value(Value::Number(value.to_string(), false).into())
+}
+
+fn single_quoted_string_expr(value: String) -> Expr {
+    Expr::Value(Value::SingleQuotedString(value).into())
 }
 
 fn regexp_replace_capture_expr(source: Expr, pattern: String, capture_index: u64) -> Expr {
@@ -1317,8 +1461,11 @@ mod tests {
 
     use datafusion::{
         arrow::{
-            array::{ArrayRef, Int32Array},
-            datatypes::{Field, Schema},
+            array::{
+                Array, ArrayRef, Date32Array, Decimal128Builder, Int32Array, Int32Builder,
+                ListBuilder, MapBuilder, StringArray, StringBuilder, StructArray, StructBuilder,
+            },
+            datatypes::{DataType, Field, Schema},
         },
         catalog::TableProvider,
         datasource::{MemTable, empty::EmptyTable},
@@ -1504,6 +1651,20 @@ mod tests {
         );
 
         assert!(rewritten.contains("harborsql_extract_minute(EventTime) AS m"));
+    }
+
+    #[test]
+    fn rewrites_databricks_get_array_access() {
+        let rewritten =
+            rewrite_sql_fast_paths("SELECT get(items, 0).prices AS first_prices FROM hits");
+
+        assert!(
+            rewritten.contains(
+                "array_element(items, CASE WHEN 0 < 0 THEN 0 ELSE 0 + 1 END)['prices'] AS first_prices"
+            ),
+            "{rewritten}"
+        );
+        assert!(!rewritten.to_ascii_lowercase().contains("get("));
     }
 
     #[test]
@@ -1792,6 +1953,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_handles_delta_type_nested_field_access_query_shape() {
+        let engine = QueryEngine::with_dependencies(
+            test_config(),
+            Arc::new(MockUnity::delta()),
+            Arc::new(MockTableOpener::with_provider(mem_table_provider(
+                delta_type_nested_access_batch(),
+            ))),
+        );
+
+        let result = engine
+            .execute(
+                "token",
+                "SELECT \
+                    row_id, \
+                    c_struct_scalar.name AS scalar_name, \
+                    c_struct_nested.child.effective_date AS child_effective_date, \
+                    element_at(c_map_string_int, 'one') AS map_one, \
+                    element_at(c_map_string_array, 'small') AS map_array_small, \
+                    get(c_struct_all_complex.items, 0).prices AS first_item_prices \
+                 FROM hits \
+                 ORDER BY row_id",
+                "workspace",
+                "default",
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.row_count, 1);
+        assert_eq!(result.columns.len(), 6);
+        assert!(matches!(result.data_types()[4], DataType::List(_)));
+        assert!(matches!(result.data_types()[5], DataType::Map(_, _)));
+    }
+
+    #[tokio::test]
     async fn execute_allows_explain_select_queries() {
         let engine = QueryEngine::with_dependencies(
             test_config(),
@@ -2042,6 +2237,113 @@ mod tests {
 
     fn mem_table_provider(batch: RecordBatch) -> Arc<dyn TableProvider> {
         Arc::new(MemTable::try_new(batch.schema(), vec![vec![batch]]).unwrap())
+    }
+
+    fn delta_type_nested_access_batch() -> RecordBatch {
+        let c_struct_scalar = StructArray::from(vec![(
+            Arc::new(Field::new("name", DataType::Utf8, true)),
+            Arc::new(StringArray::from(vec![Some("widget")])) as ArrayRef,
+        )]);
+
+        let child = StructArray::from(vec![(
+            Arc::new(Field::new("effective_date", DataType::Date32, true)),
+            Arc::new(Date32Array::from(vec![Some(19725)])) as ArrayRef,
+        )]);
+        let c_struct_nested = StructArray::from(vec![(
+            Arc::new(Field::new("child", child.data_type().clone(), true)),
+            Arc::new(child) as ArrayRef,
+        )]);
+
+        let mut map_string_int = MapBuilder::new(None, StringBuilder::new(), Int32Builder::new());
+        map_string_int.keys().append_value("one");
+        map_string_int.values().append_value(1);
+        map_string_int.append(true).unwrap();
+        let c_map_string_int = map_string_int.finish();
+
+        let mut map_string_array = MapBuilder::new(
+            None,
+            StringBuilder::new(),
+            ListBuilder::new(Int32Builder::new()),
+        );
+        map_string_array.keys().append_value("small");
+        map_string_array.values().values().append_value(1);
+        map_string_array.values().values().append_value(2);
+        map_string_array.values().append(true);
+        map_string_array.append(true).unwrap();
+        let c_map_string_array = map_string_array.finish();
+
+        let prices_map_type = DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(
+                    vec![
+                        Field::new("keys", DataType::Utf8, false),
+                        Field::new("values", DataType::Decimal128(10, 2), true),
+                    ]
+                    .into(),
+                ),
+                false,
+            )),
+            false,
+        );
+        let price_map_builder = MapBuilder::new(
+            None,
+            StringBuilder::new(),
+            Decimal128Builder::new().with_data_type(DataType::Decimal128(10, 2)),
+        );
+        let item_struct_builder = StructBuilder::new(
+            vec![Field::new("prices", prices_map_type, true)],
+            vec![Box::new(price_map_builder)],
+        );
+        let mut items_builder = ListBuilder::new(item_struct_builder);
+        let item = items_builder.values();
+        let prices = item
+            .field_builder::<MapBuilder<StringBuilder, Decimal128Builder>>(0)
+            .unwrap();
+        prices.keys().append_value("usd");
+        prices.values().append_value(1234);
+        prices.append(true).unwrap();
+        item.append(true);
+        items_builder.append(true);
+        let items = items_builder.finish();
+        let c_struct_all_complex = StructArray::from(vec![(
+            Arc::new(Field::new("items", items.data_type().clone(), true)),
+            Arc::new(items) as ArrayRef,
+        )]);
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("row_id", DataType::Int32, false),
+            Field::new("c_struct_scalar", c_struct_scalar.data_type().clone(), true),
+            Field::new("c_struct_nested", c_struct_nested.data_type().clone(), true),
+            Field::new(
+                "c_map_string_int",
+                c_map_string_int.data_type().clone(),
+                true,
+            ),
+            Field::new(
+                "c_map_string_array",
+                c_map_string_array.data_type().clone(),
+                true,
+            ),
+            Field::new(
+                "c_struct_all_complex",
+                c_struct_all_complex.data_type().clone(),
+                true,
+            ),
+        ]));
+
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1])) as ArrayRef,
+                Arc::new(c_struct_scalar) as ArrayRef,
+                Arc::new(c_struct_nested) as ArrayRef,
+                Arc::new(c_map_string_int) as ArrayRef,
+                Arc::new(c_map_string_array) as ArrayRef,
+                Arc::new(c_struct_all_complex) as ArrayRef,
+            ],
+        )
+        .unwrap()
     }
 
     fn int_batch(values: Vec<i32>) -> RecordBatch {

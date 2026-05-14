@@ -6,8 +6,9 @@ use std::{
 
 use datafusion::arrow::{
     array::{
-        Array, BooleanArray, Date32Array, Date64Array, Float32Array, Float64Array, Int8Array,
-        Int16Array, Int32Array, Int64Array, LargeStringArray, StringArray, StringViewArray,
+        Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal128Array,
+        Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int32Builder, Int64Array,
+        LargeStringArray, ListBuilder, MapBuilder, StringArray, StringBuilder, StringViewArray,
         TimestampMicrosecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
     },
     datatypes::{DataType, Field, Schema, TimeUnit},
@@ -382,6 +383,84 @@ fn row_set_rejects_uint64_values_outside_signed_bigint_range() {
 }
 
 #[test]
+fn row_set_encodes_delta_type_compatibility_values() {
+    let mut list_builder = ListBuilder::new(Int32Builder::new());
+    list_builder.values().append_value(1);
+    list_builder.values().append_value(2);
+    list_builder.append(true);
+    list_builder.append(true);
+    let list_array = list_builder.finish();
+
+    let mut map_builder = MapBuilder::new(None, StringBuilder::new(), Int32Builder::new());
+    map_builder.keys().append_value("b");
+    map_builder.values().append_value(2);
+    map_builder.keys().append_value("a");
+    map_builder.values().append_value(1);
+    map_builder.append(true).unwrap();
+    map_builder.append(true).unwrap();
+    let map_array = map_builder.finish();
+
+    let struct_array = datafusion::arrow::array::StructArray::from(vec![
+        (
+            Arc::new(Field::new("name", DataType::Utf8, true)),
+            Arc::new(StringArray::from(vec![Some("widget"), None])) as ArrayRef,
+        ),
+        (
+            Arc::new(Field::new("created", DataType::Date32, true)),
+            Arc::new(Date32Array::from(vec![Some(19724), None])) as ArrayRef,
+        ),
+    ]);
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("amount", DataType::Decimal128(10, 2), true),
+        Field::new("payload", DataType::Binary, true),
+        Field::new("numbers", list_array.data_type().clone(), true),
+        Field::new("attrs", map_array.data_type().clone(), true),
+        Field::new("item", struct_array.data_type().clone(), true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(
+                Decimal128Array::from(vec![Some(123456), Some(-1234)])
+                    .with_precision_and_scale(10, 2)
+                    .unwrap(),
+            ),
+            Arc::new(BinaryArray::from(vec![
+                Some(&b"\x00\x01"[..]),
+                Some(&b""[..]),
+            ])),
+            Arc::new(list_array),
+            Arc::new(map_array),
+            Arc::new(struct_array),
+        ],
+    )
+    .unwrap();
+    let result = QueryResult::from_batches(columns_from_schema(&schema), vec![batch]);
+    let page = row_page(&result, 0, Some(2));
+    let mut writer = Writer::new();
+    write_row_set(&mut writer, &result, &page).unwrap();
+
+    let bytes = writer.into_inner();
+    let mut reader = Reader::new(&bytes);
+    let (_, columns) = read_row_set_values(&mut reader);
+
+    assert_eq!(
+        columns,
+        vec![
+            DecodedColumn::String(vec!["1234.56".to_string(), "-12.34".to_string()]),
+            DecodedColumn::Binary(vec![vec![0, 1], vec![]]),
+            DecodedColumn::String(vec!["[1,2]".to_string(), "[]".to_string()]),
+            DecodedColumn::String(vec!["{\"a\":1,\"b\":2}".to_string(), "{}".to_string(),]),
+            DecodedColumn::String(vec![
+                "{\"name\":\"widget\",\"created\":2024-01-02}".to_string(),
+                "{\"name\":null,\"created\":null}".to_string(),
+            ]),
+        ]
+    );
+}
+
+#[test]
 fn fetch_response_encodes_typed_values_and_pagination() {
     let result = typed_pagination_result();
 
@@ -428,11 +507,11 @@ fn fetch_response_encodes_typed_values_and_pagination() {
 fn metadata_response_reports_unsupported_result_type() {
     let result = QueryResult::from_batches_with_data_types(
         vec![Column {
-            name: "payload".to_string(),
-            data_type: "Binary".to_string(),
+            name: "duration".to_string(),
+            data_type: "Duration(Second)".to_string(),
             nullable: true,
         }],
-        vec![DataType::Binary],
+        vec![DataType::Duration(TimeUnit::Second)],
         Vec::new(),
     );
 
@@ -443,6 +522,89 @@ fn metadata_response_reports_unsupported_result_type() {
     assert_eq!(
         message.as_deref(),
         Some("UNSUPPORTED_RESULT_TYPE: unsupported result column type")
+    );
+}
+
+#[test]
+fn metadata_response_encodes_decimal_and_complex_type_ids() {
+    let result = QueryResult::from_batches_with_data_types(
+        vec![
+            Column {
+                name: "amount".to_string(),
+                data_type: "Decimal128(10, 2)".to_string(),
+                nullable: true,
+            },
+            Column {
+                name: "numbers".to_string(),
+                data_type: "List(Int32)".to_string(),
+                nullable: true,
+            },
+            Column {
+                name: "attrs".to_string(),
+                data_type: "Map(Utf8, Int32)".to_string(),
+                nullable: true,
+            },
+            Column {
+                name: "item".to_string(),
+                data_type: "Struct".to_string(),
+                nullable: true,
+            },
+            Column {
+                name: "payload".to_string(),
+                data_type: "Binary".to_string(),
+                nullable: true,
+            },
+        ],
+        vec![
+            DataType::Decimal128(10, 2),
+            DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+            DataType::Map(
+                Arc::new(Field::new(
+                    "entries",
+                    DataType::Struct(
+                        vec![
+                            Field::new("key", DataType::Utf8, false),
+                            Field::new("value", DataType::Int32, true),
+                        ]
+                        .into(),
+                    ),
+                    false,
+                )),
+                false,
+            ),
+            DataType::Struct(vec![Field::new("name", DataType::Utf8, true)].into()),
+            DataType::Binary,
+        ],
+        Vec::new(),
+    );
+
+    let response = write_get_result_set_metadata_response(1, &result);
+    let metadata = read_metadata_types(&response);
+
+    assert_eq!(
+        metadata,
+        vec![
+            DecodedType {
+                type_id: DECIMAL_TYPE,
+                decimal: Some((10, 2)),
+            },
+            DecodedType {
+                type_id: ARRAY_TYPE,
+                decimal: None,
+            },
+            DecodedType {
+                type_id: MAP_TYPE,
+                decimal: None,
+            },
+            DecodedType {
+                type_id: STRUCT_TYPE,
+                decimal: None,
+            },
+            DecodedType {
+                type_id: BINARY_TYPE,
+                decimal: None,
+            },
+        ]
     );
 }
 
@@ -590,6 +752,7 @@ enum DecodedColumn {
     I64(Vec<i64>),
     F64(Vec<f64>),
     String(Vec<String>),
+    Binary(Vec<Vec<u8>>),
 }
 
 #[derive(Clone, Copy)]
@@ -599,6 +762,166 @@ enum ColumnKind {
     I64,
     F64,
     String,
+    Binary,
+}
+
+#[derive(Debug, PartialEq)]
+struct DecodedType {
+    type_id: i32,
+    decimal: Option<(i32, i32)>,
+}
+
+fn read_metadata_types(response: &[u8]) -> Vec<DecodedType> {
+    let mut reader = success_reader(response, "GetResultSetMetadata");
+    loop {
+        let (field_type, field_id) = reader.read_field_begin().unwrap();
+        if field_type == T_STOP {
+            break;
+        }
+        match (field_id, field_type) {
+            (2, T_STRUCT) => return read_table_schema_types(&mut reader),
+            _ => reader.skip(field_type).unwrap(),
+        }
+    }
+    panic!("GetResultSetMetadata response did not include schema")
+}
+
+fn read_table_schema_types(reader: &mut Reader<'_>) -> Vec<DecodedType> {
+    loop {
+        let (field_type, field_id) = reader.read_field_begin().unwrap();
+        if field_type == T_STOP {
+            break;
+        }
+        match (field_id, field_type) {
+            (1, T_LIST) => {
+                assert_eq!(reader.read_u8().unwrap(), T_STRUCT);
+                let len = reader.read_i32().unwrap();
+                assert!(len >= 0);
+                return (0..len)
+                    .map(|_| read_column_desc_type(reader))
+                    .collect::<Vec<_>>();
+            }
+            _ => reader.skip(field_type).unwrap(),
+        }
+    }
+    panic!("table schema did not include columns")
+}
+
+fn read_column_desc_type(reader: &mut Reader<'_>) -> DecodedType {
+    let mut decoded = None;
+    loop {
+        let (field_type, field_id) = reader.read_field_begin().unwrap();
+        if field_type == T_STOP {
+            break;
+        }
+        match (field_id, field_type) {
+            (2, T_STRUCT) => decoded = Some(read_type_desc(reader)),
+            _ => reader.skip(field_type).unwrap(),
+        }
+    }
+    decoded.expect("column description did not include type")
+}
+
+fn read_type_desc(reader: &mut Reader<'_>) -> DecodedType {
+    let mut decoded = None;
+    loop {
+        let (field_type, field_id) = reader.read_field_begin().unwrap();
+        if field_type == T_STOP {
+            break;
+        }
+        match (field_id, field_type) {
+            (1, T_LIST) => {
+                assert_eq!(reader.read_u8().unwrap(), T_STRUCT);
+                assert_eq!(reader.read_i32().unwrap(), 1);
+                decoded = Some(read_type_entry(reader));
+            }
+            _ => reader.skip(field_type).unwrap(),
+        }
+    }
+    decoded.expect("type description did not include type entries")
+}
+
+fn read_type_entry(reader: &mut Reader<'_>) -> DecodedType {
+    loop {
+        let (field_type, field_id) = reader.read_field_begin().unwrap();
+        if field_type == T_STOP {
+            break;
+        }
+        match (field_id, field_type) {
+            (1, T_STRUCT) => {
+                let decoded = read_primitive_type_entry(reader);
+                assert_eq!(reader.read_field_begin().unwrap().0, T_STOP);
+                return decoded;
+            }
+            _ => reader.skip(field_type).unwrap(),
+        }
+    }
+    panic!("type entry did not include primitive entry")
+}
+
+fn read_primitive_type_entry(reader: &mut Reader<'_>) -> DecodedType {
+    let mut type_id = None;
+    let mut decimal = None;
+    loop {
+        let (field_type, field_id) = reader.read_field_begin().unwrap();
+        if field_type == T_STOP {
+            break;
+        }
+        match (field_id, field_type) {
+            (1, T_I32) => type_id = Some(reader.read_i32().unwrap()),
+            (2, T_STRUCT) => decimal = Some(read_decimal_type_qualifiers(reader)),
+            _ => reader.skip(field_type).unwrap(),
+        }
+    }
+    DecodedType {
+        type_id: type_id.unwrap(),
+        decimal,
+    }
+}
+
+fn read_decimal_type_qualifiers(reader: &mut Reader<'_>) -> (i32, i32) {
+    let mut precision = None;
+    let mut scale = None;
+    loop {
+        let (field_type, field_id) = reader.read_field_begin().unwrap();
+        if field_type == T_STOP {
+            break;
+        }
+        match (field_id, field_type) {
+            (1, T_MAP) => {
+                assert_eq!(reader.read_u8().unwrap(), T_STRING);
+                assert_eq!(reader.read_u8().unwrap(), T_STRUCT);
+                let len = reader.read_i32().unwrap();
+                assert!(len >= 0);
+                for _ in 0..len {
+                    let key = reader.read_string().unwrap();
+                    let value = read_type_qualifier_value(reader);
+                    match key.as_str() {
+                        "precision" => precision = Some(value),
+                        "scale" => scale = Some(value),
+                        _ => {}
+                    }
+                }
+            }
+            _ => reader.skip(field_type).unwrap(),
+        }
+    }
+    (precision.unwrap(), scale.unwrap())
+}
+
+fn read_type_qualifier_value(reader: &mut Reader<'_>) -> i32 {
+    let mut value = None;
+    loop {
+        let (field_type, field_id) = reader.read_field_begin().unwrap();
+        if field_type == T_STOP {
+            break;
+        }
+        match (field_id, field_type) {
+            (1, T_I32) => value = Some(reader.read_i32().unwrap()),
+            _ => reader.skip(field_type).unwrap(),
+        }
+    }
+    value.unwrap()
 }
 
 fn read_fetch_page(response: &[u8]) -> DecodedFetchPage {
@@ -684,6 +1007,7 @@ fn read_column(reader: &mut Reader<'_>) -> DecodedColumn {
             (5, T_STRUCT) => ColumnKind::I64,
             (6, T_STRUCT) => ColumnKind::F64,
             (7, T_STRUCT) => ColumnKind::String,
+            (8, T_STRUCT) => ColumnKind::Binary,
             _ => {
                 reader.skip(field_type).unwrap();
                 continue;
@@ -742,6 +1066,10 @@ fn read_value_list(reader: &mut Reader<'_>, kind: ColumnKind) -> DecodedColumn {
         ColumnKind::String => {
             assert_eq!(element_type, T_STRING);
             DecodedColumn::String((0..len).map(|_| reader.read_string().unwrap()).collect())
+        }
+        ColumnKind::Binary => {
+            assert_eq!(element_type, T_STRING);
+            DecodedColumn::Binary((0..len).map(|_| reader.read_binary().unwrap()).collect())
         }
     }
 }

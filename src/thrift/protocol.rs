@@ -30,11 +30,19 @@ pub(super) const DEFAULT_FETCH_ROWS: usize = 1_000;
 pub(super) const MAX_FETCH_ROWS: usize = 10_000;
 
 pub(super) const BOOLEAN_TYPE: i32 = 0;
+pub(super) const TINYINT_TYPE: i32 = 1;
+pub(super) const SMALLINT_TYPE: i32 = 2;
 pub(super) const INT_TYPE: i32 = 3;
 pub(super) const BIGINT_TYPE: i32 = 4;
+pub(super) const FLOAT_TYPE: i32 = 5;
 pub(super) const DOUBLE_TYPE: i32 = 6;
 pub(super) const STRING_TYPE: i32 = 7;
 pub(super) const TIMESTAMP_TYPE: i32 = 8;
+pub(super) const BINARY_TYPE: i32 = 9;
+pub(super) const ARRAY_TYPE: i32 = 10;
+pub(super) const MAP_TYPE: i32 = 11;
+pub(super) const STRUCT_TYPE: i32 = 12;
+pub(super) const DECIMAL_TYPE: i32 = 15;
 pub(super) const DATE_TYPE: i32 = 17;
 
 pub(super) fn valid_field_type(field_type: u8) -> bool {

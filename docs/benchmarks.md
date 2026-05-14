@@ -30,6 +30,9 @@ topology details.
 Compatibility findings that explain benchmark correctness differences can live
 in this repository when they describe HarborSQL/DataFusion behavior rather than
 private benchmark infrastructure. See
+[`delta-types-compatibility.md`](delta-types-compatibility.md) for the
+`delta-types` decimal, binary, nested-result, and `get(array, index)` coverage,
+and
 [`regexp-replace-linebreak-compatibility.md`](regexp-replace-linebreak-compatibility.md)
 for the ClickBench Q29 `REGEXP_REPLACE` line-break finding and workaround
 options.
