@@ -63,8 +63,8 @@ GRANT EXTERNAL USE SCHEMA ON SCHEMA <catalog>.<schema> TO `<principal>`;
 
 Your existing Unity Catalog read permissions still apply. HarborSQL does not
 need static cloud credentials; Unity Catalog vends temporary table credentials
-at query time. See the documentation site for the full Unity Catalog grant
-model.
+at query time. See the [documentation site](https://docs.harborsql.com) for the
+full Unity Catalog grant model.
 
 ## Quick Start
 
@@ -240,6 +240,8 @@ Automation and coding-agent notes live in [AGENTS.md](AGENTS.md).
 
 ## Project Docs
 
+- [Documentation site](https://docs.harborsql.com)
+- [Benchmarks](https://docs.harborsql.com/benchmarks)
 - [Connector smoke tests](docs/ci-smoke-tests.md)
 - [Release publishing](docs/release.md)
 - [Benchmark policy](docs/benchmarks.md)
