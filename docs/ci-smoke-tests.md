@@ -77,7 +77,9 @@ when opening the Delta log.
 The GitHub Actions workflow always runs the local connector smoke test.
 Databricks-backed integration smoke is split into the `databricks-smoke`
 environment, runs only on pushes to `main`, and is opt-in with
-`DATABRICKS_CONNECTOR_SMOKE_ENABLED=true`.
+`DATABRICKS_CONNECTOR_SMOKE_ENABLED=true`. When enabled, the workflow runs
+separate PAT and OAuth matrix legs with fail-fast disabled so both auth modes
+report a result even if one leg fails.
 
 OAuth-backed integration smoke uses these `databricks-smoke` environment
 secrets:
@@ -88,10 +90,9 @@ secrets:
 - `TEST_CI_DATABRICKS_CLIENT_ID`
 - `TEST_CI_DATABRICKS_CLIENT_SECRET`
 
-PAT-backed integration smoke is optional and only runs when both of these
-`databricks-smoke` environment secrets are set. The PAT must belong to the
-configured workspace and must be able to read the type-matrix table through
-Unity Catalog:
+PAT-backed integration smoke uses these `databricks-smoke` environment
+secrets. The PAT must belong to the configured workspace and must be able to
+read the type-matrix table through Unity Catalog:
 
 - `TEST_CI_DATABRICKS_PAT`
 - `TEST_CI_DATABRICKS_PAT_HOSTNAME`
