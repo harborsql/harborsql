@@ -743,7 +743,10 @@ fn rewrite_leaf_expr_fast_paths(expr: &mut Expr, options: RewriteOptions) -> boo
         Expr::Function(function) => {
             let changed_args = rewrite_function_fast_paths(function, options);
             if let Some((array, index)) = databricks_get_array_args(function) {
-                *expr = array_element_expr(array, index);
+                *expr = databricks_get_array_expr(array, index);
+                true
+            } else if let Some((map, key)) = databricks_element_at_map_args(function) {
+                *expr = databricks_element_at_map_expr(map, key);
                 true
             } else if let Some((source, pattern, capture_index)) =
                 regexp_replace_capture_fast_path_args(function)
@@ -1071,6 +1074,35 @@ fn databricks_get_array_args(function: &Function) -> Option<(Expr, Expr)> {
     Some((array, index))
 }
 
+fn databricks_element_at_map_args(function: &Function) -> Option<(Expr, Expr)> {
+    if !function_name_eq(function, "element_at")
+        || function.uses_odbc_syntax
+        || !matches!(function.parameters, FunctionArguments::None)
+        || function.filter.is_some()
+        || function.null_treatment.is_some()
+        || function.over.is_some()
+        || !function.within_group.is_empty()
+    {
+        return None;
+    }
+
+    let FunctionArguments::List(FunctionArgumentList {
+        duplicate_treatment: None,
+        args,
+        clauses,
+    }) = &function.args
+    else {
+        return None;
+    };
+    if args.len() != 2 || !clauses.is_empty() {
+        return None;
+    }
+
+    let map = function_arg_expr(args.first()?)?.clone();
+    let key = function_arg_expr(args.get(1)?)?.clone();
+    Some((map, key))
+}
+
 fn function_name_eq(function: &Function, expected: &str) -> bool {
     if function.name.0.len() != 1 {
         return false;
@@ -1102,7 +1134,17 @@ fn capture_replacement_index(replacement: &str) -> Option<u64> {
     digits.parse().ok()
 }
 
-fn array_element_expr(array: Expr, zero_based_index: Expr) -> Expr {
+fn databricks_get_array_expr(array: Expr, zero_based_index: Expr) -> Expr {
+    array_element_expr(array, databricks_get_array_index_expr(zero_based_index))
+}
+
+fn databricks_element_at_map_expr(map: Expr, key: Expr) -> Expr {
+    // DataFusion's map_extract/element_at returns a one-value list. Databricks
+    // returns the extracted map value itself.
+    array_element_expr(map_extract_expr(map, key), number_expr("1"))
+}
+
+fn array_element_expr(array: Expr, one_based_index: Expr) -> Expr {
     Expr::Function(Function {
         name: ObjectName::from(Ident::new("array_element")),
         uses_odbc_syntax: false,
@@ -1111,9 +1153,27 @@ fn array_element_expr(array: Expr, zero_based_index: Expr) -> Expr {
             duplicate_treatment: None,
             args: vec![
                 FunctionArg::Unnamed(FunctionArgExpr::Expr(array)),
-                FunctionArg::Unnamed(FunctionArgExpr::Expr(databricks_get_array_index_expr(
-                    zero_based_index,
-                ))),
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(one_based_index)),
+            ],
+            clauses: vec![],
+        }),
+        filter: None,
+        null_treatment: None,
+        over: None,
+        within_group: vec![],
+    })
+}
+
+fn map_extract_expr(map: Expr, key: Expr) -> Expr {
+    Expr::Function(Function {
+        name: ObjectName::from(Ident::new("map_extract")),
+        uses_odbc_syntax: false,
+        parameters: FunctionArguments::None,
+        args: FunctionArguments::List(FunctionArgumentList {
+            duplicate_treatment: None,
+            args: vec![
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(map)),
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(key)),
             ],
             clauses: vec![],
         }),
@@ -1463,7 +1523,8 @@ mod tests {
         arrow::{
             array::{
                 Array, ArrayRef, Date32Array, Decimal128Builder, Int32Array, Int32Builder,
-                ListBuilder, MapBuilder, StringArray, StringBuilder, StructArray, StructBuilder,
+                ListArray, ListBuilder, MapArray, MapBuilder, StringArray, StringBuilder,
+                StructArray, StructBuilder,
             },
             datatypes::{DataType, Field, Schema},
         },
@@ -1665,6 +1726,18 @@ mod tests {
             "{rewritten}"
         );
         assert!(!rewritten.to_ascii_lowercase().contains("get("));
+    }
+
+    #[test]
+    fn rewrites_databricks_element_at_map_access() {
+        let rewritten =
+            rewrite_sql_fast_paths("SELECT element_at(attrs, 'one') AS map_one FROM hits");
+
+        assert!(
+            rewritten.contains("array_element(map_extract(attrs, 'one'), 1) AS map_one"),
+            "{rewritten}"
+        );
+        assert!(!rewritten.to_ascii_lowercase().contains("element_at("));
     }
 
     #[test]
@@ -1980,10 +2053,38 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(result.row_count, 1);
+        assert_eq!(result.row_count, 2);
         assert_eq!(result.columns.len(), 6);
+        assert!(matches!(result.data_types()[3], DataType::Int32));
         assert!(matches!(result.data_types()[4], DataType::List(_)));
         assert!(matches!(result.data_types()[5], DataType::Map(_, _)));
+
+        let page = result.page(0, 10);
+        let batch = &page.batches[0];
+        let map_one = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(map_one.value(0), 1);
+        assert!(map_one.is_null(1));
+
+        let map_array_small = batch
+            .column(4)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        let first_map_array_small = map_array_small.value(0);
+        let first_map_array_small = first_map_array_small
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(first_map_array_small.values(), &[1, 2]);
+        assert!(map_array_small.is_null(1));
+
+        let first_item_prices = batch.column(5).as_any().downcast_ref::<MapArray>().unwrap();
+        assert!(!first_item_prices.is_null(0));
+        assert!(first_item_prices.is_null(1));
     }
 
     #[tokio::test]
@@ -2242,12 +2343,12 @@ mod tests {
     fn delta_type_nested_access_batch() -> RecordBatch {
         let c_struct_scalar = StructArray::from(vec![(
             Arc::new(Field::new("name", DataType::Utf8, true)),
-            Arc::new(StringArray::from(vec![Some("widget")])) as ArrayRef,
+            Arc::new(StringArray::from(vec![Some("widget"), None])) as ArrayRef,
         )]);
 
         let child = StructArray::from(vec![(
             Arc::new(Field::new("effective_date", DataType::Date32, true)),
-            Arc::new(Date32Array::from(vec![Some(19725)])) as ArrayRef,
+            Arc::new(Date32Array::from(vec![Some(19725), None])) as ArrayRef,
         )]);
         let c_struct_nested = StructArray::from(vec![(
             Arc::new(Field::new("child", child.data_type().clone(), true)),
@@ -2257,6 +2358,7 @@ mod tests {
         let mut map_string_int = MapBuilder::new(None, StringBuilder::new(), Int32Builder::new());
         map_string_int.keys().append_value("one");
         map_string_int.values().append_value(1);
+        map_string_int.append(true).unwrap();
         map_string_int.append(true).unwrap();
         let c_map_string_int = map_string_int.finish();
 
@@ -2269,6 +2371,7 @@ mod tests {
         map_string_array.values().values().append_value(1);
         map_string_array.values().values().append_value(2);
         map_string_array.values().append(true);
+        map_string_array.append(true).unwrap();
         map_string_array.append(true).unwrap();
         let c_map_string_array = map_string_array.finish();
 
@@ -2305,6 +2408,7 @@ mod tests {
         prices.append(true).unwrap();
         item.append(true);
         items_builder.append(true);
+        items_builder.append(true);
         let items = items_builder.finish();
         let c_struct_all_complex = StructArray::from(vec![(
             Arc::new(Field::new("items", items.data_type().clone(), true)),
@@ -2335,7 +2439,7 @@ mod tests {
         RecordBatch::try_new(
             schema,
             vec![
-                Arc::new(Int32Array::from(vec![1])) as ArrayRef,
+                Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
                 Arc::new(c_struct_scalar) as ArrayRef,
                 Arc::new(c_struct_nested) as ArrayRef,
                 Arc::new(c_map_string_int) as ArrayRef,
