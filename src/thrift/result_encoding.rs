@@ -169,6 +169,9 @@ fn write_row_set_with_encoders(
     encoders: &[ColumnEncoder],
 ) -> Result<()> {
     writer.write_field(T_I64, 1, |writer| writer.write_i64(page.start_row_offset));
+    writer.write_field(T_LIST, 2, |writer| {
+        writer.write_list_begin(T_STRUCT, 0);
+    });
     writer.write_field_result(T_LIST, 3, |writer| {
         writer.write_list_begin(T_STRUCT, result.columns.len());
         for (column_index, encoder) in encoders.iter().enumerate() {

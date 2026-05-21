@@ -2534,6 +2534,7 @@ dependencies = [
  "arrow-json",
  "async-trait",
  "axum",
+ "base64",
  "datafusion",
  "deltalake",
  "futures",
