@@ -147,6 +147,7 @@ impl DatabricksThriftService {
                     secret.as_bytes(),
                     &catalog,
                     &schema,
+                    &request.get_info_types,
                 ))
             }
             "CloseSession" => {
@@ -155,6 +156,20 @@ impl DatabricksThriftService {
                     .remove_session(request.session_handle.as_ref(), bearer_token)
                     .await;
                 Ok(write_close_session_response(message.seqid, removed))
+            }
+            "GetInfo" => {
+                let request = read_args(message.payload, read_get_info_req)?;
+                let Some(session) = self
+                    .session_for(request.session_handle.as_ref(), bearer_token)
+                    .await
+                else {
+                    return Ok(write_get_info_invalid(message.seqid));
+                };
+                Ok(write_get_info_response(
+                    message.seqid,
+                    request.info_type,
+                    &session.catalog,
+                ))
             }
             "ExecuteStatement" => {
                 let request = read_args(message.payload, read_execute_statement_req)?;
@@ -281,6 +296,20 @@ impl DatabricksThriftService {
                     )
                     .await
                     .unwrap_or_else(|| write_get_operation_status_invalid(message.seqid)))
+            }
+            "GetQueryId" => {
+                let request = read_args(message.payload, read_operation_req)?;
+                let query_id = request
+                    .operation_handle
+                    .as_ref()
+                    .map(|handle| handle.id.as_str())
+                    .unwrap_or("");
+                Ok(self
+                    .with_operation(request.operation_handle.as_ref(), bearer_token, |_| {
+                        write_get_query_id_response(message.seqid, query_id)
+                    })
+                    .await
+                    .unwrap_or_else(|| write_get_query_id_response(message.seqid, "")))
             }
             "GetResultSetMetadata" => {
                 let request = read_args(message.payload, read_operation_req)?;
@@ -627,11 +656,18 @@ struct Message<'a> {
 struct OpenSessionReq {
     catalog: Option<String>,
     schema: Option<String>,
+    get_info_types: Vec<i32>,
 }
 
 #[derive(Debug)]
 struct CloseSessionReq {
     session_handle: Option<Handle>,
+}
+
+#[derive(Debug)]
+struct GetInfoReq {
+    session_handle: Option<Handle>,
+    info_type: i32,
 }
 
 #[derive(Debug)]
@@ -695,20 +731,27 @@ fn read_args<T>(payload: &[u8], parse_req: fn(&mut Reader<'_>) -> Result<T>) -> 
 fn read_open_session_req(reader: &mut Reader<'_>) -> Result<OpenSessionReq> {
     let mut catalog = None;
     let mut schema = None;
+    let mut get_info_types = Vec::new();
     loop {
         let (field_type, field_id) = reader.read_field_begin()?;
         if field_type == T_STOP {
             break;
         }
-        if field_id == 1284 && field_type == T_STRUCT {
-            let namespace = read_namespace(reader)?;
-            catalog = namespace.0;
-            schema = namespace.1;
-        } else {
-            reader.skip(field_type)?;
+        match (field_id, field_type) {
+            (1281, T_LIST) => get_info_types = read_i32_list(reader)?,
+            (1284, T_STRUCT) => {
+                let namespace = read_namespace(reader)?;
+                catalog = namespace.0;
+                schema = namespace.1;
+            }
+            _ => reader.skip(field_type)?,
         }
     }
-    Ok(OpenSessionReq { catalog, schema })
+    Ok(OpenSessionReq {
+        catalog,
+        schema,
+        get_info_types,
+    })
 }
 
 fn read_namespace(reader: &mut Reader<'_>) -> Result<(Option<String>, Option<String>)> {
@@ -728,6 +771,26 @@ fn read_namespace(reader: &mut Reader<'_>) -> Result<(Option<String>, Option<Str
     Ok((catalog, schema))
 }
 
+fn read_i32_list(reader: &mut Reader<'_>) -> Result<Vec<i32>> {
+    let element_type = reader.read_u8()?;
+    let len = reader.read_i32()?;
+    if len < 0 {
+        return Err(HarborError::Thrift("negative i32 list size".into()));
+    }
+    if element_type != T_I32 {
+        for _ in 0..len {
+            reader.skip(element_type)?;
+        }
+        return Ok(Vec::new());
+    }
+
+    let mut values = Vec::with_capacity(len as usize);
+    for _ in 0..len {
+        values.push(reader.read_i32()?);
+    }
+    Ok(values)
+}
+
 fn read_close_session_req(reader: &mut Reader<'_>) -> Result<CloseSessionReq> {
     let mut session_handle = None;
     loop {
@@ -742,6 +805,26 @@ fn read_close_session_req(reader: &mut Reader<'_>) -> Result<CloseSessionReq> {
         }
     }
     Ok(CloseSessionReq { session_handle })
+}
+
+fn read_get_info_req(reader: &mut Reader<'_>) -> Result<GetInfoReq> {
+    let mut session_handle = None;
+    let mut info_type = None;
+    loop {
+        let (field_type, field_id) = reader.read_field_begin()?;
+        if field_type == T_STOP {
+            break;
+        }
+        match (field_id, field_type) {
+            (1, T_STRUCT) => session_handle = read_session_handle(reader)?,
+            (2, T_I32) => info_type = Some(reader.read_i32()?),
+            _ => reader.skip(field_type)?,
+        }
+    }
+    Ok(GetInfoReq {
+        session_handle,
+        info_type: info_type.unwrap_or(CLI_DBMS_NAME),
+    })
 }
 
 fn read_execute_statement_req(reader: &mut Reader<'_>) -> Result<ExecuteStatementReq> {
@@ -869,6 +952,7 @@ fn write_open_session_response(
     secret: &[u8; 16],
     catalog: &str,
     schema: &str,
+    get_info_types: &[i32],
 ) -> Vec<u8> {
     write_success_response("OpenSession", seqid, |writer| {
         writer.write_field(T_STRUCT, 1, |writer| {
@@ -884,6 +968,14 @@ fn write_open_session_response(
             write_namespace(writer, catalog, schema);
         });
         writer.write_field(T_BOOL, 1285, |writer| writer.write_bool(true));
+        if !get_info_types.is_empty() {
+            writer.write_field(T_LIST, 1281, |writer| {
+                writer.write_list_begin(T_STRUCT, get_info_types.len());
+                for info_type in get_info_types {
+                    write_get_info_value(writer, *info_type, catalog);
+                }
+            });
+        }
         writer.write_stop();
     })
 }
@@ -913,6 +1005,34 @@ fn write_close_session_response(seqid: i32, valid: bool) -> Vec<u8> {
                     Some("invalid session handle")
                 },
             )
+        });
+        writer.write_stop();
+    })
+}
+
+fn write_get_info_response(seqid: i32, info_type: i32, catalog: &str) -> Vec<u8> {
+    write_success_response("GetInfo", seqid, |writer| {
+        writer.write_field(T_STRUCT, 1, |writer| {
+            write_status(writer, SUCCESS_STATUS, None)
+        });
+        writer.write_field(T_STRUCT, 2, |writer| {
+            write_get_info_value(writer, info_type, catalog);
+        });
+        writer.write_stop();
+    })
+}
+
+fn write_get_info_invalid(seqid: i32) -> Vec<u8> {
+    write_success_response("GetInfo", seqid, |writer| {
+        writer.write_field(T_STRUCT, 1, |writer| {
+            write_status(
+                writer,
+                INVALID_HANDLE_STATUS,
+                Some("invalid session handle"),
+            )
+        });
+        writer.write_field(T_STRUCT, 2, |writer| {
+            write_get_info_string_value(writer, "");
         });
         writer.write_stop();
     })
@@ -970,6 +1090,13 @@ fn write_get_operation_status_invalid(seqid: i32) -> Vec<u8> {
             false,
             Some("unknown operation handle"),
         );
+    })
+}
+
+fn write_get_query_id_response(seqid: i32, query_id: &str) -> Vec<u8> {
+    write_success_response("GetQueryId", seqid, |writer| {
+        writer.write_field(T_STRING, 1, |writer| writer.write_string(query_id));
+        writer.write_stop();
     })
 }
 
@@ -1182,6 +1309,120 @@ fn write_namespace(writer: &mut Writer, catalog: &str, schema: &str) {
     writer.write_field(T_STRING, 1, |writer| writer.write_string(catalog));
     writer.write_field(T_STRING, 2, |writer| writer.write_string(schema));
     writer.write_stop();
+}
+
+fn write_get_info_value(writer: &mut Writer, info_type: i32, catalog: &str) {
+    match info_type {
+        CLI_DATA_SOURCE_NAME
+        | CLI_SERVER_NAME
+        | CLI_SEARCH_PATTERN_ESCAPE
+        | CLI_DBMS_NAME
+        | CLI_DBMS_VER
+        | CLI_IDENTIFIER_QUOTE_CHAR
+        | CLI_USER_NAME
+        | CLI_CATALOG_NAME
+        | CLI_COLLATION_SEQ
+        | CLI_SPECIAL_CHARACTERS => {
+            write_get_info_string_value(writer, get_info_string(info_type, catalog));
+        }
+        CLI_MAX_DRIVER_CONNECTIONS
+        | CLI_MAX_CONCURRENT_ACTIVITIES
+        | CLI_MAX_COLUMN_NAME_LEN
+        | CLI_MAX_CURSOR_NAME_LEN
+        | CLI_MAX_SCHEMA_NAME_LEN
+        | CLI_MAX_CATALOG_NAME_LEN
+        | CLI_MAX_TABLE_NAME_LEN
+        | CLI_MAX_INDEX_SIZE
+        | CLI_MAX_ROW_SIZE
+        | CLI_MAX_STATEMENT_LEN
+        | CLI_MAX_TABLES_IN_SELECT
+        | CLI_MAX_USER_NAME_LEN
+        | CLI_MAX_IDENTIFIER_LEN => {
+            writer.write_field(T_I64, 6, |writer| writer.write_i64(get_info_len(info_type)));
+            writer.write_stop();
+        }
+        CLI_FETCH_DIRECTION
+        | CLI_CURSOR_COMMIT_BEHAVIOR
+        | CLI_DATA_SOURCE_READ_ONLY
+        | CLI_DEFAULT_TXN_ISOLATION
+        | CLI_IDENTIFIER_CASE
+        | CLI_ACCESSIBLE_TABLES
+        | CLI_ACCESSIBLE_PROCEDURES
+        | CLI_TXN_CAPABLE
+        | CLI_INTEGRITY
+        | CLI_NULL_COLLATION
+        | CLI_ORDER_BY_COLUMNS_IN_SELECT
+        | CLI_XOPEN_CLI_YEAR
+        | CLI_CURSOR_SENSITIVITY
+        | CLI_DESCRIBE_PARAMETER => {
+            writer.write_field(T_I32, 4, |writer| {
+                writer.write_i32(get_info_flag(info_type))
+            });
+            writer.write_stop();
+        }
+        CLI_TXN_ISOLATION_OPTION
+        | CLI_GETDATA_EXTENSIONS
+        | CLI_ALTER_TABLE
+        | CLI_MAX_COLUMNS_IN_GROUP_BY
+        | CLI_MAX_COLUMNS_IN_INDEX
+        | CLI_MAX_COLUMNS_IN_ORDER_BY
+        | CLI_MAX_COLUMNS_IN_SELECT
+        | CLI_MAX_COLUMNS_IN_TABLE
+        | CLI_OJ_CAPABILITIES => {
+            writer.write_field(T_I32, 3, |writer| writer.write_i32(0));
+            writer.write_stop();
+        }
+        _ => {
+            writer.write_field(T_I32, 3, |writer| writer.write_i32(0));
+            writer.write_stop();
+        }
+    }
+}
+
+fn write_get_info_string_value(writer: &mut Writer, value: &str) {
+    writer.write_field(T_STRING, 1, |writer| writer.write_string(value));
+    writer.write_stop();
+}
+
+fn get_info_string(info_type: i32, catalog: &str) -> &str {
+    match info_type {
+        CLI_DATA_SOURCE_NAME => "HarborSQL",
+        CLI_SERVER_NAME => "HarborSQL",
+        CLI_SEARCH_PATTERN_ESCAPE => "\\",
+        CLI_DBMS_NAME => "Spark SQL",
+        CLI_DBMS_VER => "3.1.0",
+        CLI_IDENTIFIER_QUOTE_CHAR => "`",
+        CLI_USER_NAME => "",
+        CLI_CATALOG_NAME => catalog,
+        CLI_COLLATION_SEQ => "",
+        CLI_SPECIAL_CHARACTERS => "",
+        _ => "",
+    }
+}
+
+fn get_info_len(info_type: i32) -> i64 {
+    match info_type {
+        CLI_MAX_COLUMN_NAME_LEN
+        | CLI_MAX_CURSOR_NAME_LEN
+        | CLI_MAX_SCHEMA_NAME_LEN
+        | CLI_MAX_CATALOG_NAME_LEN
+        | CLI_MAX_TABLE_NAME_LEN
+        | CLI_MAX_USER_NAME_LEN
+        | CLI_MAX_IDENTIFIER_LEN => 128,
+        CLI_MAX_STATEMENT_LEN => 0,
+        _ => 0,
+    }
+}
+
+fn get_info_flag(info_type: i32) -> i32 {
+    match info_type {
+        CLI_FETCH_DIRECTION => 1,
+        CLI_DATA_SOURCE_READ_ONLY => 1,
+        CLI_IDENTIFIER_CASE => 1,
+        CLI_ORDER_BY_COLUMNS_IN_SELECT => 1,
+        CLI_XOPEN_CLI_YEAR => 2011,
+        _ => 0,
+    }
 }
 
 fn is_noop_statement(statement: &str) -> bool {

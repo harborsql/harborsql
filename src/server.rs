@@ -12,6 +12,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use serde::{Deserialize, Serialize};
 use tower::ServiceBuilder;
 use tower_http::{ServiceBuilderExt, request_id::MakeRequestUuid, trace::TraceLayer};
@@ -120,7 +121,7 @@ async fn query(
     headers: HeaderMap,
     Json(request): Json<QueryRequest>,
 ) -> Result<Json<QueryResponse>> {
-    let token = bearer_token(&headers)?;
+    let token = auth_token(&headers)?;
     let catalog = request
         .catalog
         .as_deref()
@@ -131,7 +132,7 @@ async fn query(
         .unwrap_or(&state.config.default_schema);
     let result = state
         .engine
-        .execute(token, &request.sql, catalog, schema)
+        .execute(&token, &request.sql, catalog, schema)
         .await?;
     Ok(Json(QueryResponse { result }))
 }
@@ -165,8 +166,8 @@ async fn thrift_rpc(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response> {
-    let token = bearer_token(&headers)?;
-    let body = state.thrift.handle(token, &body).await?;
+    let token = auth_token(&headers)?;
+    let body = state.thrift.handle(&token, &body).await?;
     Ok(([(header::CONTENT_TYPE, "application/x-thrift")], body).into_response())
 }
 
@@ -175,10 +176,10 @@ async fn query_history(
     headers: HeaderMap,
     Path(query_id): Path<String>,
 ) -> Result<Json<QueryHistory>> {
-    let token = bearer_token(&headers)?;
+    let token = auth_token(&headers)?;
     state
         .thrift
-        .query_history(token, &query_id)
+        .query_history(&token, &query_id)
         .await
         .map(Json)
         .ok_or_else(|| HarborError::Query(format!("unknown query id `{query_id}`")))
@@ -191,19 +192,53 @@ async fn feature_flags(Path(_version): Path<String>) -> Json<FeatureFlagsRespons
     })
 }
 
-fn bearer_token(headers: &HeaderMap) -> Result<&str> {
+fn auth_token(headers: &HeaderMap) -> Result<String> {
     let value = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .ok_or(HarborError::MissingBearerToken)?;
-    let (scheme, token) = value
-        .trim()
-        .split_once(' ')
-        .ok_or(HarborError::MissingBearerToken)?;
+
+    if let Some(token) = bearer_auth_token(value) {
+        return Ok(token.to_string());
+    }
+    if let Some(token) = databricks_basic_auth_token(value) {
+        return Ok(token);
+    }
+
+    Err(HarborError::MissingBearerToken)
+}
+
+fn bearer_auth_token(value: &str) -> Option<&str> {
+    let (scheme, token) = value.trim().split_once(' ')?;
     if scheme.eq_ignore_ascii_case("bearer") && !token.trim().is_empty() {
-        Ok(token.trim())
+        Some(token.trim())
     } else {
-        Err(HarborError::MissingBearerToken)
+        None
+    }
+}
+
+fn databricks_basic_auth_token(value: &str) -> Option<String> {
+    let value = value.trim();
+    // Databricks JDBC 2.x emits PAT credentials as Basic auth, and some builds omit
+    // the usual space after the auth scheme.
+    let rest = value.get(..5).and_then(|scheme| {
+        if scheme.eq_ignore_ascii_case("basic") {
+            Some(&value[5..])
+        } else {
+            None
+        }
+    })?;
+    let encoded = rest.trim_start();
+    if encoded.is_empty() {
+        return None;
+    }
+    let decoded = BASE64_STANDARD.decode(encoded).ok()?;
+    let credentials = String::from_utf8(decoded).ok()?;
+    let (username, password) = credentials.split_once(':')?;
+    if username == "token" && !password.trim().is_empty() {
+        Some(password.to_string())
+    } else {
+        None
     }
 }
 
@@ -229,4 +264,55 @@ struct FeatureFlagsResponse {
 struct FeatureFlag {
     name: String,
     value: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::http::{HeaderMap, HeaderValue, header};
+
+    use super::auth_token;
+
+    #[test]
+    fn auth_token_accepts_bearer_token() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer local-token"),
+        );
+
+        assert_eq!(auth_token(&headers).unwrap(), "local-token");
+    }
+
+    #[test]
+    fn auth_token_accepts_databricks_pat_basic_auth() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Basic dG9rZW46bG9jYWwtdG9rZW4="),
+        );
+
+        assert_eq!(auth_token(&headers).unwrap(), "local-token");
+    }
+
+    #[test]
+    fn auth_token_accepts_legacy_databricks_basic_auth_without_space() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("BasicdG9rZW46bG9jYWwtdG9rZW4="),
+        );
+
+        assert_eq!(auth_token(&headers).unwrap(), "local-token");
+    }
+
+    #[test]
+    fn auth_token_rejects_basic_auth_with_non_token_user() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Basic dXNlcjpsb2NhbC10b2tlbg=="),
+        );
+
+        assert!(auth_token(&headers).is_err());
+    }
 }
