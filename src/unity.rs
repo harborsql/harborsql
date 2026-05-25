@@ -32,6 +32,71 @@ impl UnityCatalogClient {
         self.get(bearer_token, &url).await
     }
 
+    pub async fn catalogs(&self, bearer_token: &str) -> Result<Vec<CatalogInfo>> {
+        let mut catalogs = Vec::new();
+        let mut page_token = None;
+        loop {
+            let mut url = format!("{}/api/2.1/unity-catalog/catalogs?max_results=0", self.host);
+            append_page_token(&mut url, page_token.as_deref());
+            let response: ListCatalogsResponse = self.get(bearer_token, &url).await?;
+            catalogs.extend(response.catalogs);
+            let Some(next_page_token) = response.next_page_token.filter(|token| !token.is_empty())
+            else {
+                break;
+            };
+            page_token = Some(next_page_token);
+        }
+        Ok(catalogs)
+    }
+
+    pub async fn schemas(&self, bearer_token: &str, catalog_name: &str) -> Result<Vec<SchemaInfo>> {
+        let encoded_catalog = urlencoding::encode(catalog_name);
+        let mut schemas = Vec::new();
+        let mut page_token = None;
+        loop {
+            let mut url = format!(
+                "{}/api/2.1/unity-catalog/schemas?catalog_name={encoded_catalog}&max_results=0",
+                self.host
+            );
+            append_page_token(&mut url, page_token.as_deref());
+            let response: ListSchemasResponse = self.get(bearer_token, &url).await?;
+            schemas.extend(response.schemas);
+            let Some(next_page_token) = response.next_page_token.filter(|token| !token.is_empty())
+            else {
+                break;
+            };
+            page_token = Some(next_page_token);
+        }
+        Ok(schemas)
+    }
+
+    pub async fn tables(
+        &self,
+        bearer_token: &str,
+        catalog_name: &str,
+        schema_name: &str,
+    ) -> Result<Vec<TableInfo>> {
+        let encoded_catalog = urlencoding::encode(catalog_name);
+        let encoded_schema = urlencoding::encode(schema_name);
+        let mut tables = Vec::new();
+        let mut page_token = None;
+        loop {
+            let mut url = format!(
+                "{}/api/2.1/unity-catalog/tables?catalog_name={encoded_catalog}&schema_name={encoded_schema}&max_results=0&omit_columns=true&omit_properties=true&omit_username=true",
+                self.host
+            );
+            append_page_token(&mut url, page_token.as_deref());
+            let response: ListTablesResponse = self.get(bearer_token, &url).await?;
+            tables.extend(response.tables);
+            let Some(next_page_token) = response.next_page_token.filter(|token| !token.is_empty())
+            else {
+                break;
+            };
+            page_token = Some(next_page_token);
+        }
+        Ok(tables)
+    }
+
     pub async fn temporary_table_credentials(
         &self,
         bearer_token: &str,
@@ -76,6 +141,13 @@ impl UnityCatalogClient {
     }
 }
 
+fn append_page_token(url: &mut String, page_token: Option<&str>) {
+    if let Some(page_token) = page_token {
+        url.push_str("&page_token=");
+        url.push_str(&urlencoding::encode(page_token));
+    }
+}
+
 async fn decode_response<T>(response: reqwest::Response) -> Result<T>
 where
     T: for<'de> Deserialize<'de>,
@@ -106,10 +178,45 @@ struct DatabricksError {
 
 #[derive(Debug, Deserialize)]
 pub struct TableInfo {
-    pub table_id: String,
+    pub table_id: Option<String>,
     pub full_name: String,
+    pub name: Option<String>,
+    pub catalog_name: Option<String>,
+    pub schema_name: Option<String>,
+    pub table_type: Option<String>,
     pub data_source_format: Option<String>,
     pub storage_location: Option<String>,
+    pub comment: Option<String>,
+    pub created_by: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CatalogInfo {
+    pub name: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SchemaInfo {
+    pub name: String,
+    pub full_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ListCatalogsResponse {
+    catalogs: Vec<CatalogInfo>,
+    next_page_token: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ListSchemasResponse {
+    schemas: Vec<SchemaInfo>,
+    next_page_token: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ListTablesResponse {
+    tables: Vec<TableInfo>,
+    next_page_token: Option<String>,
 }
 
 #[derive(Serialize)]

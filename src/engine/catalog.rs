@@ -21,11 +21,22 @@ use crate::{
     error::{HarborError, Result},
     observability,
     table_cache::{CachedTable, TableCache, expires_at_from_unity_expiration_ms},
-    unity::{TableInfo, TemporaryTableCredentials, UnityCatalogClient},
+    unity::{CatalogInfo, SchemaInfo, TableInfo, TemporaryTableCredentials, UnityCatalogClient},
 };
 
 #[async_trait]
 pub(super) trait UnityCatalog: Send + Sync {
+    async fn catalogs(&self, bearer_token: &str) -> Result<Vec<CatalogInfo>>;
+
+    async fn schemas(&self, bearer_token: &str, catalog_name: &str) -> Result<Vec<SchemaInfo>>;
+
+    async fn tables(
+        &self,
+        bearer_token: &str,
+        catalog_name: &str,
+        schema_name: &str,
+    ) -> Result<Vec<TableInfo>>;
+
     async fn table(&self, bearer_token: &str, full_name: &str) -> Result<TableInfo>;
 
     async fn temporary_table_credentials(
@@ -37,6 +48,49 @@ pub(super) trait UnityCatalog: Send + Sync {
 
 #[async_trait]
 impl UnityCatalog for UnityCatalogClient {
+    async fn catalogs(&self, bearer_token: &str) -> Result<Vec<CatalogInfo>> {
+        let started = Instant::now();
+        let result = UnityCatalogClient::catalogs(self, bearer_token)
+            .instrument(tracing::info_span!("unity_call", stage = "catalogs"))
+            .await;
+        observe_unity_call("unity_catalogs", "catalogs", started, &result);
+        result
+    }
+
+    async fn schemas(&self, bearer_token: &str, catalog_name: &str) -> Result<Vec<SchemaInfo>> {
+        let started = Instant::now();
+        let identifier_hash = observability::stable_hash(catalog_name);
+        let result = UnityCatalogClient::schemas(self, bearer_token, catalog_name)
+            .instrument(tracing::info_span!(
+                "unity_call",
+                stage = "schemas",
+                identifier_hash = %identifier_hash
+            ))
+            .await;
+        observe_unity_call("unity_schemas", catalog_name, started, &result);
+        result
+    }
+
+    async fn tables(
+        &self,
+        bearer_token: &str,
+        catalog_name: &str,
+        schema_name: &str,
+    ) -> Result<Vec<TableInfo>> {
+        let full_name = format!("{catalog_name}.{schema_name}");
+        let started = Instant::now();
+        let identifier_hash = observability::stable_hash(&full_name);
+        let result = UnityCatalogClient::tables(self, bearer_token, catalog_name, schema_name)
+            .instrument(tracing::info_span!(
+                "unity_call",
+                stage = "tables",
+                identifier_hash = %identifier_hash
+            ))
+            .await;
+        observe_unity_call("unity_tables", &full_name, started, &result);
+        result
+    }
+
     async fn table(&self, bearer_token: &str, full_name: &str) -> Result<TableInfo> {
         let started = Instant::now();
         let identifier_hash = observability::stable_hash(full_name);
@@ -391,9 +445,12 @@ pub(super) async fn load_cached_table(
 ) -> Result<CachedTable> {
     let table = unity.table(bearer_token, full_name).await?;
     ensure_delta_table(&table)?;
+    let table_id = table.table_id.as_deref().ok_or_else(|| {
+        HarborError::Unity("Unity Catalog table response omitted table_id".into())
+    })?;
 
     let credentials = unity
-        .temporary_table_credentials(bearer_token, &table.table_id)
+        .temporary_table_credentials(bearer_token, table_id)
         .await?;
     let credential_expires_at = expires_at_from_unity_expiration_ms(
         credentials.expiration_time,
