@@ -34,6 +34,13 @@ public repositories, or private repositories with `ENABLE_GITHUB_ATTESTATIONS`
 set after enabling GitHub artifact attestations for the plan, the workflow also
 creates GitHub provenance and SBOM attestations.
 
+After a non-prerelease GitHub release publishes successfully, the release
+workflow dispatches the `HarborSQL Release Benchmarks` workflow in
+`harborsql/harborsql-bench` with the release tag as `release_version`. Configure
+the `HARBORSQL_BENCH_WORKFLOW_TOKEN` repository secret with access to dispatch
+that workflow in `harborsql-bench`; the built-in `GITHUB_TOKEN` is scoped to
+this repository and cannot trigger workflows in the benchmark repository.
+
 ```bash
 docker pull ghcr.io/<owner>/harborsql:<tag>
 oras pull ghcr.io/<owner>/harborsql-binaries:<tag>
