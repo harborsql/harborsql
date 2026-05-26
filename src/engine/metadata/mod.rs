@@ -28,6 +28,10 @@ enum MetadataStatement {
         schema: Option<ObjectName>,
         pattern: Option<String>,
     },
+    Columns {
+        table: ObjectName,
+        schema: Option<ObjectName>,
+    },
     TableExtended {
         schema: Option<ObjectName>,
         pattern: String,
@@ -42,6 +46,13 @@ struct ObjectName(Vec<String>);
 struct ResolvedSchema {
     catalog: String,
     schema: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedTable {
+    catalog: String,
+    schema: String,
+    table: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -193,6 +204,13 @@ where
             sort_table_rows(&mut rows);
             result::views(rows)
         }
+        MetadataStatement::Columns { table, schema } => {
+            let table = resolve_table(&table, schema.as_ref(), default_catalog, default_schema)?;
+            let detailed = source
+                .table(bearer_token, &table_full_identifier(&table))
+                .await?;
+            result::columns(table_column_names(&detailed))
+        }
         MetadataStatement::TableExtended {
             schema,
             pattern,
@@ -282,6 +300,60 @@ fn resolve_schema(
     }
 }
 
+fn resolve_table(
+    table_name: &ObjectName,
+    schema_name: Option<&ObjectName>,
+    default_catalog: &str,
+    default_schema: &str,
+) -> Result<ResolvedTable> {
+    let (table_catalog, table_schema, table) = match table_name.0.as_slice() {
+        [table] => (None, None, table.clone()),
+        [schema, table] => (None, Some(schema.clone()), table.clone()),
+        [catalog, schema, table] => (Some(catalog.clone()), Some(schema.clone()), table.clone()),
+        _ => {
+            return Err(HarborError::UnsupportedSql(
+                "SHOW COLUMNS expects a table, schema.table, or catalog.schema.table name".into(),
+            ));
+        }
+    };
+
+    let (schema_catalog, schema) = match schema_name.map(|name| name.0.as_slice()) {
+        None => (None, None),
+        Some([schema]) => (None, Some(schema.clone())),
+        Some([catalog, schema]) => (Some(catalog.clone()), Some(schema.clone())),
+        Some(_) => {
+            return Err(HarborError::UnsupportedSql(
+                "SHOW COLUMNS expects an optional schema or catalog.schema name".into(),
+            ));
+        }
+    };
+
+    if let (Some(left), Some(right)) = (&table_schema, &schema)
+        && left != right
+    {
+        return Err(HarborError::UnsupportedSql(
+            "SHOW COLUMNS table name and schema name must not refer to different schemas".into(),
+        ));
+    }
+    if let (Some(left), Some(right)) = (&table_catalog, &schema_catalog)
+        && left != right
+    {
+        return Err(HarborError::UnsupportedSql(
+            "SHOW COLUMNS table name and schema name must not refer to different catalogs".into(),
+        ));
+    }
+
+    Ok(ResolvedTable {
+        catalog: table_catalog
+            .or(schema_catalog)
+            .unwrap_or_else(|| default_catalog.to_string()),
+        schema: table_schema
+            .or(schema)
+            .unwrap_or_else(|| default_schema.to_string()),
+        table,
+    })
+}
+
 fn schema_name(schema: &SchemaInfo) -> String {
     if !schema.name.is_empty() {
         return schema.name.clone();
@@ -308,6 +380,19 @@ fn table_full_name(table: &TableInfo, schema: &ResolvedSchema, table_name: &str)
     } else {
         format!("{}.{}.{}", schema.catalog, schema.schema, table_name)
     }
+}
+
+fn table_full_identifier(table: &ResolvedTable) -> String {
+    format!("{}.{}.{}", table.catalog, table.schema, table.table)
+}
+
+fn table_column_names(table: &TableInfo) -> Vec<String> {
+    let mut columns = table.columns.iter().enumerate().collect::<Vec<_>>();
+    columns.sort_by_key(|(index, column)| (column.position.unwrap_or(i32::MAX), *index));
+    columns
+        .into_iter()
+        .map(|(_, column)| column.name.clone())
+        .collect()
 }
 
 fn is_view_like(table: &TableInfo) -> bool {
@@ -375,7 +460,7 @@ fn table_information(table: &TableInfo) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ObjectName, pattern::ShowPattern, resolve_schema};
+    use super::{ObjectName, pattern::ShowPattern, resolve_schema, resolve_table};
 
     #[test]
     fn resolves_show_table_namespaces() {
@@ -412,6 +497,65 @@ mod tests {
                 catalog: "main".to_string(),
                 schema: "analytics".to_string(),
             }
+        );
+    }
+
+    #[test]
+    fn resolves_show_columns_table_names() {
+        assert_eq!(
+            resolve_table(
+                &ObjectName(vec!["customer".to_string()]),
+                None,
+                "workspace",
+                "default",
+            )
+            .unwrap(),
+            super::ResolvedTable {
+                catalog: "workspace".to_string(),
+                schema: "default".to_string(),
+                table: "customer".to_string(),
+            }
+        );
+        assert_eq!(
+            resolve_table(
+                &ObjectName(vec!["sales".to_string(), "customer".to_string()]),
+                None,
+                "workspace",
+                "default",
+            )
+            .unwrap(),
+            super::ResolvedTable {
+                catalog: "workspace".to_string(),
+                schema: "sales".to_string(),
+                table: "customer".to_string(),
+            }
+        );
+        assert_eq!(
+            resolve_table(
+                &ObjectName(vec!["customer".to_string()]),
+                Some(&ObjectName(vec!["main".to_string(), "sales".to_string()])),
+                "workspace",
+                "default",
+            )
+            .unwrap(),
+            super::ResolvedTable {
+                catalog: "main".to_string(),
+                schema: "sales".to_string(),
+                table: "customer".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_conflicting_show_columns_namespaces() {
+        assert!(
+            resolve_table(
+                &ObjectName(vec!["sales".to_string(), "customer".to_string()]),
+                Some(&ObjectName(vec!["finance".to_string()])),
+                "workspace",
+                "default",
+            )
+            .is_err()
         );
     }
 

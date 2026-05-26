@@ -22,13 +22,13 @@ SHOW SCHEMAS [ { FROM | IN } catalog_name ] [ [ LIKE ] regex_pattern ]
 SHOW CATALOGS [ [ LIKE ] regex_pattern ]
 SHOW TABLES [ { FROM | IN } schema_name ] [ [ LIKE ] regex_pattern ]
 SHOW VIEWS [ { FROM | IN } schema_name ] [ [ LIKE ] regex_pattern ]
+SHOW COLUMNS { IN | FROM } table_name [ { IN | FROM } schema_name ]
 SHOW TABLE EXTENDED [ { IN | FROM } schema_name ] LIKE regex_pattern
     [ PARTITION clause ]
 ```
 
 Out of scope for this phase:
 
-- `SHOW COLUMNS`
 - `SHOW FUNCTIONS`
 - `SHOW GRANTS`
 - `SHOW TBLPROPERTIES`
@@ -128,6 +128,12 @@ Resolve object names before calling Unity Catalog:
   catalog and schema when no namespace is provided.
 - An unqualified schema name resolves as `<default_catalog>.<schema>`.
 - A two-part schema name resolves as `<catalog>.<schema>`.
+- `SHOW COLUMNS` resolves an unqualified table name as
+  `<default_catalog>.<default_schema>.<table>`, a two-part table name as
+  `<default_catalog>.<schema>.<table>`, and a three-part table name as
+  `<catalog>.<schema>.<table>`.
+- `SHOW COLUMNS IN table IN schema` uses the optional schema as an alternative
+  qualifier and rejects conflicting table/schema qualifiers.
 - Quoted identifiers must preserve case and special characters.
 
 ## Result Shapes
@@ -143,6 +149,7 @@ Expected output columns:
 | `SHOW SCHEMAS` | `databaseName` string |
 | `SHOW TABLES` | `database` string, `tableName` string, `isTemporary` boolean |
 | `SHOW VIEWS` | `namespace` string, `viewName` string, `isTemporary` boolean |
+| `SHOW COLUMNS` | `col_name` string |
 | `SHOW TABLE EXTENDED` | `database` string, `tableName` string, `isTemporary` boolean, `information` string |
 
 `isTemporary` should be `false` until HarborSQL has session-local temporary
@@ -168,6 +175,9 @@ objects.
 - Parse `SHOW VIEWS FROM sales`.
 - Parse `SHOW VIEWS IN main.sales`.
 - Parse `SHOW VIEWS LIKE 'dim*'`.
+- Parse `SHOW COLUMNS IN customer`.
+- Parse `SHOW COLUMNS FROM salessc.customer`.
+- Parse `SHOW COLUMNS IN customer IN salessc`.
 - Parse `SHOW TABLE EXTENDED IN sales LIKE 'fact*'`.
 - Parse `SHOW TABLE EXTENDED FROM main.sales LIKE 'fact*' PARTITION (dt='2026-05-25')`.
 - Parse case, whitespace, multiline, and semicolon variants.
@@ -185,6 +195,10 @@ objects.
 - `SHOW TABLES IN catalog_a.schema_a` resolves to `catalog_a.schema_a`.
 - `SHOW VIEWS` follows the same rules as `SHOW TABLES`.
 - `SHOW TABLE EXTENDED` follows the same rules as `SHOW TABLES`.
+- `SHOW COLUMNS IN table_a IN schema_a` resolves to
+  `<default_catalog>.schema_a.table_a`.
+- `SHOW COLUMNS IN catalog_a.schema_a.table_a` resolves directly to the
+  three-part table name.
 - Quoted identifiers preserve exact spelling in Unity Catalog calls.
 
 ### Credential Propagation Tests
@@ -222,6 +236,7 @@ objects.
 - `SHOW SCHEMAS` returns exactly the `databaseName` column.
 - `SHOW TABLES` returns `database`, `tableName`, and `isTemporary`.
 - `SHOW VIEWS` returns `namespace`, `viewName`, and `isTemporary`.
+- `SHOW COLUMNS` returns exactly the `col_name` column.
 - `SHOW TABLE EXTENDED` returns `database`, `tableName`, `isTemporary`, and
   `information`.
 - Empty Unity results return zero rows with the correct columns.

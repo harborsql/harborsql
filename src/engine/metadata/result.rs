@@ -39,6 +39,10 @@ pub(super) fn views(rows: Vec<TableRow>) -> Result<QueryResult> {
     )
 }
 
+pub(super) fn columns(names: Vec<String>) -> Result<QueryResult> {
+    string_result("col_name", names)
+}
+
 pub(super) fn table_extended(rows: Vec<TableExtendedRow>) -> Result<QueryResult> {
     let schema_names = rows
         .iter()
