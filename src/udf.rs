@@ -4,9 +4,9 @@ use datafusion::{
     arrow::{
         array::{
             Array, ArrayRef, ArrowPrimitiveType, AsArray, GenericStringArray, Int32Array,
-            LargeStringBuilder, StringBuilder, StringViewBuilder,
+            Int64Array, LargeStringBuilder, StringBuilder, StringViewBuilder,
         },
-        compute::{DatePart, date_part},
+        compute::{DatePart, date_part, kernels::length::length as arrow_length, take},
         datatypes::DataType,
     },
     common::{
@@ -20,12 +20,181 @@ use datafusion::{
 };
 use regex::Regex;
 
+pub const LENGTH_UDF: &str = "length";
 pub const REGEXP_REPLACE_CAPTURE_UDF: &str = "harborsql_regexp_replace_capture";
 pub const EXTRACT_MINUTE_UDF: &str = "harborsql_extract_minute";
 
 pub fn register_udfs(ctx: &SessionContext) {
+    ctx.register_udf(ScalarUDF::new_from_impl(LengthFunc::new()));
     ctx.register_udf(ScalarUDF::new_from_impl(RegexpReplaceCaptureFunc::new()));
     ctx.register_udf(ScalarUDF::new_from_impl(ExtractMinuteFunc::new()));
+}
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct LengthFunc {
+    signature: Signature,
+}
+
+impl LengthFunc {
+    fn new() -> Self {
+        Self {
+            signature: Signature::any(1, Volatility::Immutable),
+        }
+    }
+}
+
+impl ScalarUDFImpl for LengthFunc {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn name(&self) -> &str {
+        LENGTH_UDF
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, arg_types: &[DataType]) -> DataFusionResult<DataType> {
+        if arg_types.len() != 1 {
+            return Err(DataFusionError::Plan(format!(
+                "{LENGTH_UDF} expects one argument"
+            )));
+        }
+
+        length_return_type(&arg_types[0])
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DataFusionResult<ColumnarValue> {
+        if args.args.len() != 1 {
+            return Err(DataFusionError::Execution(format!(
+                "{LENGTH_UDF} expects one argument"
+            )));
+        }
+
+        match &args.args[0] {
+            ColumnarValue::Scalar(scalar) => length_scalar(scalar).map(ColumnarValue::Scalar),
+            ColumnarValue::Array(array) => length_array(array).map(ColumnarValue::Array),
+        }
+    }
+}
+
+fn length_return_type(data_type: &DataType) -> DataFusionResult<DataType> {
+    match data_type {
+        DataType::Utf8
+        | DataType::Utf8View
+        | DataType::Binary
+        | DataType::BinaryView
+        | DataType::FixedSizeBinary(_)
+        | DataType::Null => Ok(DataType::Int32),
+        DataType::LargeUtf8 | DataType::LargeBinary => Ok(DataType::Int64),
+        DataType::Dictionary(_, value_type) => length_return_type(value_type),
+        other => Err(DataFusionError::Plan(format!(
+            "{LENGTH_UDF} expects a string or binary argument, got {other}"
+        ))),
+    }
+}
+
+fn length_scalar(scalar: &ScalarValue) -> DataFusionResult<ScalarValue> {
+    match scalar {
+        ScalarValue::Utf8(value) | ScalarValue::Utf8View(value) => Ok(ScalarValue::Int32(
+            optional_char_count_i32(value.as_deref())?,
+        )),
+        ScalarValue::LargeUtf8(value) => Ok(ScalarValue::Int64(optional_char_count_i64(
+            value.as_deref(),
+        )?)),
+        ScalarValue::Binary(value) | ScalarValue::BinaryView(value) => {
+            Ok(ScalarValue::Int32(optional_byte_len_i32(value.as_deref())?))
+        }
+        ScalarValue::FixedSizeBinary(_, value) => {
+            Ok(ScalarValue::Int32(optional_byte_len_i32(value.as_deref())?))
+        }
+        ScalarValue::LargeBinary(value) => {
+            Ok(ScalarValue::Int64(optional_byte_len_i64(value.as_deref())?))
+        }
+        ScalarValue::Null => Ok(ScalarValue::Int32(None)),
+        other => Err(DataFusionError::Execution(format!(
+            "{LENGTH_UDF} expects a string or binary argument, got {other:?}"
+        ))),
+    }
+}
+
+fn length_array(array: &ArrayRef) -> DataFusionResult<ArrayRef> {
+    if let Some(dictionary) = array.as_any_dictionary_opt() {
+        let lengths = length_array(dictionary.values())?;
+        return take(lengths.as_ref(), dictionary.keys(), None).map_err(DataFusionError::from);
+    }
+
+    match array.data_type() {
+        DataType::Utf8 => {
+            let array = array.as_string::<i32>();
+            string_length_array_i32(array.iter())
+        }
+        DataType::LargeUtf8 => {
+            let array = array.as_string::<i64>();
+            let values = array
+                .iter()
+                .map(optional_char_count_i64)
+                .collect::<DataFusionResult<Vec<_>>>()?;
+            Ok(Arc::new(Int64Array::from(values)) as ArrayRef)
+        }
+        DataType::Utf8View => {
+            let array = as_string_view_array(array)?;
+            string_length_array_i32(array.iter())
+        }
+        DataType::Binary
+        | DataType::LargeBinary
+        | DataType::BinaryView
+        | DataType::FixedSizeBinary(_) => {
+            arrow_length(array.as_ref()).map_err(DataFusionError::from)
+        }
+        DataType::Null => Ok(Arc::new(Int32Array::from_iter(std::iter::repeat_n(
+            None,
+            array.len(),
+        ))) as ArrayRef),
+        other => Err(DataFusionError::Execution(format!(
+            "{LENGTH_UDF} expects a string or binary array, got {other}"
+        ))),
+    }
+}
+
+fn string_length_array_i32<'a>(
+    values: impl IntoIterator<Item = Option<&'a str>>,
+) -> DataFusionResult<ArrayRef> {
+    let values = values
+        .into_iter()
+        .map(|value| optional_char_count_i32(value))
+        .collect::<DataFusionResult<Vec<_>>>()?;
+    Ok(Arc::new(Int32Array::from(values)) as ArrayRef)
+}
+
+fn optional_char_count_i32(value: Option<&str>) -> DataFusionResult<Option<i32>> {
+    value
+        .map(|value| i32::try_from(value.chars().count()))
+        .transpose()
+        .map_err(|_| DataFusionError::Execution(format!("{LENGTH_UDF} result exceeded Int32")))
+}
+
+fn optional_byte_len_i32(value: Option<&[u8]>) -> DataFusionResult<Option<i32>> {
+    value
+        .map(|value| i32::try_from(value.len()))
+        .transpose()
+        .map_err(|_| DataFusionError::Execution(format!("{LENGTH_UDF} result exceeded Int32")))
+}
+
+fn optional_char_count_i64(value: Option<&str>) -> DataFusionResult<Option<i64>> {
+    value
+        .map(|value| i64::try_from(value.chars().count()))
+        .transpose()
+        .map_err(|_| DataFusionError::Execution(format!("{LENGTH_UDF} result exceeded Int64")))
+}
+
+fn optional_byte_len_i64(value: Option<&[u8]>) -> DataFusionResult<Option<i64>> {
+    value
+        .map(|value| i64::try_from(value.len()))
+        .transpose()
+        .map_err(|_| DataFusionError::Execution(format!("{LENGTH_UDF} result exceeded Int64")))
 }
 
 #[derive(Debug, PartialEq, Eq, Hash)]
@@ -338,12 +507,15 @@ mod tests {
     use std::sync::Arc;
 
     use datafusion::arrow::{
-        array::{Array, ArrayRef, Int32Array, TimestampMicrosecondArray},
-        datatypes::{DataType, TimeUnit},
+        array::{
+            Array, ArrayRef, BinaryArray, Int32Array, StringArray, StringDictionaryBuilder,
+            TimestampMicrosecondArray,
+        },
+        datatypes::{DataType, Int8Type, TimeUnit},
     };
     use regex::Regex;
 
-    use super::{extract_minute_array, replace_capture};
+    use super::{extract_minute_array, length_array, length_scalar, replace_capture};
 
     #[test]
     fn replaces_first_match_with_capture() {
@@ -367,6 +539,60 @@ mod tests {
     fn uses_empty_string_for_missing_capture() {
         let regex = Regex::new("b(..)").unwrap();
         assert_eq!(replace_capture("foobarbequebaz", &regex, 2), "foobequebaz");
+    }
+
+    #[test]
+    fn databricks_length_counts_string_characters() {
+        let array = Arc::new(StringArray::from(vec![Some("josé"), Some(""), None])) as ArrayRef;
+
+        let result = length_array(&array).unwrap();
+        let result = result.as_any().downcast_ref::<Int32Array>().unwrap();
+
+        assert_eq!(result.value(0), 4);
+        assert_eq!(result.value(1), 0);
+        assert!(result.is_null(2));
+    }
+
+    #[test]
+    fn databricks_length_counts_binary_bytes_without_utf8_decoding() {
+        let array = Arc::new(BinaryArray::from(vec![
+            Some(&b"\x00\x01\x02\xff"[..]),
+            Some(&b""[..]),
+            None,
+        ])) as ArrayRef;
+
+        let result = length_array(&array).unwrap();
+        let result = result.as_any().downcast_ref::<Int32Array>().unwrap();
+
+        assert_eq!(result.value(0), 4);
+        assert_eq!(result.value(1), 0);
+        assert!(result.is_null(2));
+    }
+
+    #[test]
+    fn databricks_length_expands_dictionary_string_results() {
+        let mut builder = StringDictionaryBuilder::<Int8Type>::new();
+        builder.append("josé").unwrap();
+        builder.append_null();
+        builder.append("").unwrap();
+        let array = Arc::new(builder.finish()) as ArrayRef;
+
+        let result = length_array(&array).unwrap();
+        let result = result.as_any().downcast_ref::<Int32Array>().unwrap();
+
+        assert_eq!(result.value(0), 4);
+        assert!(result.is_null(1));
+        assert_eq!(result.value(2), 0);
+    }
+
+    #[test]
+    fn databricks_length_counts_scalar_binary_bytes() {
+        let result = length_scalar(&datafusion::common::ScalarValue::Binary(Some(vec![
+            0, 1, 2, 255,
+        ])))
+        .unwrap();
+
+        assert_eq!(result, datafusion::common::ScalarValue::Int32(Some(4)));
     }
 
     #[test]
