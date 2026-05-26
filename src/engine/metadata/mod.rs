@@ -424,4 +424,21 @@ mod tests {
         assert!(pattern.matches("hrdata"));
         assert!(!pattern.matches("finance"));
     }
+
+    #[test]
+    fn show_patterns_keep_regex_semantics_except_star_wildcards() {
+        let pattern = ShowPattern::new(Some("fact.2026|dim_store")).unwrap();
+
+        assert!(pattern.matches("fact_2026"));
+        assert!(pattern.matches("fact.2026"));
+        assert!(pattern.matches("dim_store"));
+        assert!(!pattern.matches("dimXstore"));
+    }
+
+    #[test]
+    fn show_patterns_reject_empty_or_invalid_patterns() {
+        assert!(ShowPattern::new(Some("")).is_err());
+        assert!(ShowPattern::new(Some("   ")).is_err());
+        assert!(ShowPattern::new(Some("fact[")).is_err());
+    }
 }

@@ -12,6 +12,11 @@ impl ShowPattern {
             return Ok(Self { regex: None });
         };
         let pattern = pattern.trim();
+        if pattern.is_empty() {
+            return Err(HarborError::UnsupportedSql(
+                "SHOW pattern cannot be empty".into(),
+            ));
+        }
         let regex = databricks_show_regex(pattern);
         let regex = RegexBuilder::new(&regex)
             .case_insensitive(true)
