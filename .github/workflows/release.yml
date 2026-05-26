@@ -568,6 +568,7 @@ jobs:
   trigger-release-benchmarks:
     name: Trigger HarborSQL release benchmarks
     runs-on: ubuntu-24.04
+    environment: release
     needs:
       - prepare
       - publish-image
