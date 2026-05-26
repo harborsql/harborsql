@@ -9,7 +9,8 @@ decimals, binary values, arrays, maps, structs, and nested field access.
 HarborSQL handles these cases in two places:
 
 - Thrift result metadata and value encoding for Arrow result batches.
-- A Databricks SQL compatibility rewrite for `get(array, index)`.
+- Databricks SQL compatibility handling for `length(binary)` and
+  `get(array, index)`.
 
 No DataFusion bug is required for this behavior. DataFusion plans and executes
 the supported Arrow expressions once HarborSQL exposes connector-compatible
@@ -49,6 +50,14 @@ order.
 Unsupported Arrow types still fail explicitly with `UNSUPPORTED_RESULT_TYPE`.
 That is intentional; HarborSQL should not silently coerce interval, duration,
 dictionary, or time-only values into misleading connector results.
+
+## `length(binary)`
+
+Databricks `length(string)` returns a character count, while `length(binary)`
+returns the number of bytes. DataFusion's built-in `length` is a string
+function and may try to decode binary input as UTF-8. HarborSQL registers a
+Databricks-compatible `length` implementation that preserves string character
+counting and treats binary values as raw bytes.
 
 ## `get(array, index)`
 
