@@ -107,7 +107,8 @@ connection = sql.connect(
 The `_connection_uri` override is required for local HTTP. Without it, the
 connector constructs an HTTPS URL for the Thrift transport. In production,
 HarborSQL should be served over HTTPS on port 443 so standard
-`server_hostname`/`http_path` settings can be used.
+`server_hostname`/`http_path` settings can be used. See
+[`native-https.md`](native-https.md) for the proposed native HTTPS support.
 
 ### Phase 4: SQL Coverage
 
