@@ -1538,9 +1538,9 @@ mod tests {
     use datafusion::{
         arrow::{
             array::{
-                Array, ArrayRef, BooleanArray, Date32Array, Decimal128Builder, Int32Array,
-                Int32Builder, ListArray, ListBuilder, MapArray, MapBuilder, StringArray,
-                StringBuilder, StructArray, StructBuilder,
+                Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Builder,
+                Int32Array, Int32Builder, ListArray, ListBuilder, MapArray, MapBuilder,
+                StringArray, StringBuilder, StructArray, StructBuilder,
             },
             datatypes::{DataType, Field, Schema},
         },
@@ -2103,6 +2103,57 @@ mod tests {
         let first_item_prices = batch.column(5).as_any().downcast_ref::<MapArray>().unwrap();
         assert!(!first_item_prices.is_null(0));
         assert!(first_item_prices.is_null(1));
+    }
+
+    #[tokio::test]
+    async fn execute_handles_databricks_length_on_binary_and_string_values() {
+        let engine = QueryEngine::with_dependencies(
+            test_config(),
+            Arc::new(MockUnity::delta()),
+            Arc::new(MockTableOpener::with_provider(mem_table_provider(
+                delta_type_scalar_length_batch(),
+            ))),
+        );
+
+        let result = engine
+            .execute(
+                "token",
+                "SELECT \
+                    row_id, \
+                    length(c_binary) AS c_binary_length, \
+                    length(c_string) AS c_string_length \
+                 FROM hits \
+                 ORDER BY row_id",
+                "workspace",
+                "default",
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.row_count, 3);
+        assert_eq!(result.columns.len(), 3);
+        assert!(matches!(result.data_types()[1], DataType::Int32));
+        assert!(matches!(result.data_types()[2], DataType::Int32));
+
+        let page = result.page(0, 10);
+        let batch = &page.batches[0];
+        let binary_lengths = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let string_lengths = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+
+        assert_eq!(binary_lengths.value(0), 4);
+        assert_eq!(binary_lengths.value(1), 0);
+        assert!(binary_lengths.is_null(2));
+        assert_eq!(string_lengths.value(0), 4);
+        assert_eq!(string_lengths.value(1), 0);
+        assert!(string_lengths.is_null(2));
     }
 
     #[tokio::test]
@@ -2851,6 +2902,28 @@ mod tests {
                 Arc::new(c_map_string_int) as ArrayRef,
                 Arc::new(c_map_string_array) as ArrayRef,
                 Arc::new(c_struct_all_complex) as ArrayRef,
+            ],
+        )
+        .unwrap()
+    }
+
+    fn delta_type_scalar_length_batch() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("row_id", DataType::Int32, false),
+            Field::new("c_binary", DataType::Binary, true),
+            Field::new("c_string", DataType::Utf8, true),
+        ]));
+
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef,
+                Arc::new(BinaryArray::from(vec![
+                    Some(&b"\x00\x01\x02\xff"[..]),
+                    Some(&b""[..]),
+                    None,
+                ])) as ArrayRef,
+                Arc::new(StringArray::from(vec![Some("josé"), Some(""), None])) as ArrayRef,
             ],
         )
         .unwrap()

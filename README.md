@@ -202,6 +202,8 @@ queries working while leaving general SQL semantics to DataFusion.
   HarborSQL UDF.
 - `extract(minute FROM timestamp)` is rewritten to a HarborSQL UDF for
   Databricks-compatible minute extraction.
+- `length(binary)` returns byte counts without UTF-8 decoding while
+  `length(string)` keeps character-count semantics.
 - Databricks `get(array, zero_based_index)` is rewritten to DataFusion
   `array_element(...)` with one-based index adjustment and negative-index
   null behavior. `get(...).field` is rewritten to DataFusion named-field
