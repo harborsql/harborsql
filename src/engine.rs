@@ -42,6 +42,7 @@ use crate::{
 };
 
 mod catalog;
+mod metadata;
 mod results;
 
 use catalog::{
@@ -182,6 +183,18 @@ impl QueryEngine {
         default_catalog: &str,
         default_schema: &str,
     ) -> Result<QueryResult> {
+        if let Some(result) = metadata::execute_show_statement(
+            self.unity.as_ref(),
+            bearer_token,
+            sql,
+            default_catalog,
+            default_schema,
+        )
+        .await?
+        {
+            return Ok(result);
+        }
+
         let session_config = SessionConfig::new()
             .with_default_catalog_and_schema(default_catalog, default_schema)
             .with_target_partitions(self.config.target_partitions)
@@ -1515,16 +1528,19 @@ pub struct Column {
 mod tests {
     use std::{
         net::SocketAddr,
-        sync::atomic::{AtomicUsize, Ordering},
+        sync::{
+            Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
         time::{Duration, Instant},
     };
 
     use datafusion::{
         arrow::{
             array::{
-                Array, ArrayRef, Date32Array, Decimal128Builder, Int32Array, Int32Builder,
-                ListArray, ListBuilder, MapArray, MapBuilder, StringArray, StringBuilder,
-                StructArray, StructBuilder,
+                Array, ArrayRef, BooleanArray, Date32Array, Decimal128Builder, Int32Array,
+                Int32Builder, ListArray, ListBuilder, MapArray, MapBuilder, StringArray,
+                StringBuilder, StructArray, StructBuilder,
             },
             datatypes::{DataType, Field, Schema},
         },
@@ -1537,7 +1553,9 @@ mod tests {
 
     use crate::{
         table_cache::CachedTable,
-        unity::{AwsTempCredentials, TableInfo, TemporaryTableCredentials},
+        unity::{
+            AwsTempCredentials, CatalogInfo, SchemaInfo, TableInfo, TemporaryTableCredentials,
+        },
     };
 
     use super::*;
@@ -2111,6 +2129,192 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_show_schemas_forwards_token_and_skips_table_loading() {
+        let unity = Arc::new(RecordingUnity::new());
+        let calls = unity.calls.clone();
+        let opener = Arc::new(MockTableOpener::ok());
+        let engine = QueryEngine::with_dependencies(test_config(), unity, opener.clone());
+
+        let result = engine
+            .execute("token-a", "SHOW SCHEMAS", "workspace", "default")
+            .await
+            .unwrap();
+
+        assert_eq!(result.columns[0].name, "databaseName");
+        assert_eq!(
+            result_string_column(&result, 0),
+            vec!["analytics".to_string(), "default".to_string()]
+        );
+        let calls = calls.lock().unwrap();
+        assert_eq!(
+            calls.schemas,
+            vec![("token-a".to_string(), "workspace".to_string())]
+        );
+        assert!(calls.temporary_credentials.is_empty());
+        assert_eq!(opener.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn execute_show_catalogs_filters_and_forwards_token() {
+        let unity = Arc::new(RecordingUnity::new());
+        let calls = unity.calls.clone();
+        let engine =
+            QueryEngine::with_dependencies(test_config(), unity, Arc::new(MockTableOpener::ok()));
+
+        let result = engine
+            .execute(
+                "token-b",
+                "SHOW CATALOGS LIKE 'work*'",
+                "workspace",
+                "default",
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.columns[0].name, "catalog");
+        assert_eq!(result_string_column(&result, 0), vec!["workspace"]);
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.catalogs, vec!["token-b".to_string()]);
+        assert!(calls.temporary_credentials.is_empty());
+    }
+
+    #[tokio::test]
+    async fn execute_show_tables_resolves_schema_filters_views_and_forwards_token() {
+        let unity = Arc::new(RecordingUnity::new());
+        let calls = unity.calls.clone();
+        let engine =
+            QueryEngine::with_dependencies(test_config(), unity, Arc::new(MockTableOpener::ok()));
+
+        let result = engine
+            .execute(
+                "token-c",
+                "SHOW TABLES IN main.analytics LIKE 'fact*'",
+                "workspace",
+                "default",
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result
+                .columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["database", "tableName", "isTemporary"]
+        );
+        assert_eq!(result_string_column(&result, 0), vec!["analytics"]);
+        assert_eq!(result_string_column(&result, 1), vec!["fact_sales"]);
+        assert_eq!(result_bool_column(&result, 2), vec![false]);
+        let calls = calls.lock().unwrap();
+        assert_eq!(
+            calls.tables,
+            vec![(
+                "token-c".to_string(),
+                "main".to_string(),
+                "analytics".to_string()
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_show_views_filters_tables_and_forwards_token() {
+        let unity = Arc::new(RecordingUnity::new());
+        let engine =
+            QueryEngine::with_dependencies(test_config(), unity, Arc::new(MockTableOpener::ok()));
+
+        let result = engine
+            .execute(
+                "token-d",
+                "SHOW VIEWS IN analytics LIKE 'daily*'",
+                "workspace",
+                "default",
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result
+                .columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["namespace", "viewName", "isTemporary"]
+        );
+        assert_eq!(result_string_column(&result, 0), vec!["analytics"]);
+        assert_eq!(result_string_column(&result, 1), vec!["daily_sales"]);
+        assert_eq!(result_bool_column(&result, 2), vec![false]);
+    }
+
+    #[tokio::test]
+    async fn execute_show_table_extended_fetches_each_match_with_received_token() {
+        let unity = Arc::new(RecordingUnity::new());
+        let calls = unity.calls.clone();
+        let opener = Arc::new(MockTableOpener::ok());
+        let engine = QueryEngine::with_dependencies(test_config(), unity, opener.clone());
+
+        let result = engine
+            .execute(
+                "token-e",
+                "SHOW TABLE EXTENDED IN analytics LIKE 'fact*'",
+                "workspace",
+                "default",
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result
+                .columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["database", "tableName", "isTemporary", "information"]
+        );
+        assert_eq!(result_string_column(&result, 1), vec!["fact_sales"]);
+        assert!(
+            result_string_column(&result, 3)[0].contains("Provider: delta"),
+            "{:?}",
+            result_string_column(&result, 3)
+        );
+        let calls = calls.lock().unwrap();
+        assert_eq!(
+            calls.table,
+            vec![(
+                "token-e".to_string(),
+                "workspace.analytics.fact_sales".to_string()
+            )]
+        );
+        assert!(calls.temporary_credentials.is_empty());
+        assert_eq!(opener.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn execute_show_table_extended_partition_is_explicitly_unsupported() {
+        let unity = Arc::new(RecordingUnity::new());
+        let calls = unity.calls.clone();
+        let engine =
+            QueryEngine::with_dependencies(test_config(), unity, Arc::new(MockTableOpener::ok()));
+
+        let err = engine
+            .execute(
+                "token-f",
+                "SHOW TABLE EXTENDED IN analytics LIKE 'fact_sales' PARTITION (dt='2026-05-25')",
+                "workspace",
+                "default",
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, HarborError::UnsupportedSql(message) if message.contains("PARTITION"))
+        );
+        let calls = calls.lock().unwrap();
+        assert!(calls.tables.is_empty());
+        assert!(calls.table.is_empty());
+    }
+
+    #[tokio::test]
     async fn execute_rejects_ddl_without_opening_unity_tables() {
         let opener = Arc::new(MockTableOpener::ok());
         let engine = QueryEngine::with_dependencies(
@@ -2165,6 +2369,116 @@ mod tests {
         Error(&'static str),
     }
 
+    #[derive(Default)]
+    struct RecordingCalls {
+        catalogs: Vec<String>,
+        schemas: Vec<(String, String)>,
+        tables: Vec<(String, String, String)>,
+        table: Vec<(String, String)>,
+        temporary_credentials: Vec<String>,
+    }
+
+    struct RecordingUnity {
+        calls: Arc<Mutex<RecordingCalls>>,
+    }
+
+    impl RecordingUnity {
+        fn new() -> Self {
+            Self {
+                calls: Arc::new(Mutex::new(RecordingCalls::default())),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl UnityCatalog for RecordingUnity {
+        async fn catalogs(&self, bearer_token: &str) -> Result<Vec<CatalogInfo>> {
+            self.calls
+                .lock()
+                .unwrap()
+                .catalogs
+                .push(bearer_token.to_string());
+            Ok(vec![
+                CatalogInfo {
+                    name: "main".to_string(),
+                },
+                CatalogInfo {
+                    name: "workspace".to_string(),
+                },
+            ])
+        }
+
+        async fn schemas(&self, bearer_token: &str, catalog_name: &str) -> Result<Vec<SchemaInfo>> {
+            self.calls
+                .lock()
+                .unwrap()
+                .schemas
+                .push((bearer_token.to_string(), catalog_name.to_string()));
+            Ok(vec![
+                SchemaInfo {
+                    name: "default".to_string(),
+                    full_name: Some(format!("{catalog_name}.default")),
+                },
+                SchemaInfo {
+                    name: "analytics".to_string(),
+                    full_name: Some(format!("{catalog_name}.analytics")),
+                },
+            ])
+        }
+
+        async fn tables(
+            &self,
+            bearer_token: &str,
+            catalog_name: &str,
+            schema_name: &str,
+        ) -> Result<Vec<TableInfo>> {
+            self.calls.lock().unwrap().tables.push((
+                bearer_token.to_string(),
+                catalog_name.to_string(),
+                schema_name.to_string(),
+            ));
+            Ok(vec![
+                metadata_table(
+                    catalog_name,
+                    schema_name,
+                    "fact_sales",
+                    "MANAGED",
+                    Some("DELTA"),
+                ),
+                metadata_table(
+                    catalog_name,
+                    schema_name,
+                    "dim_store",
+                    "EXTERNAL",
+                    Some("DELTA"),
+                ),
+                metadata_table(catalog_name, schema_name, "daily_sales", "VIEW", None),
+            ])
+        }
+
+        async fn table(&self, bearer_token: &str, full_name: &str) -> Result<TableInfo> {
+            self.calls
+                .lock()
+                .unwrap()
+                .table
+                .push((bearer_token.to_string(), full_name.to_string()));
+            Ok(table_info(full_name, Some("DELTA"), true))
+        }
+
+        async fn temporary_table_credentials(
+            &self,
+            bearer_token: &str,
+            _table_id: &str,
+        ) -> Result<TemporaryTableCredentials> {
+            self.calls
+                .lock()
+                .unwrap()
+                .temporary_credentials
+                .push(bearer_token.to_string());
+            Ok(temporary_credentials())
+        }
+    }
+
     struct MockUnity {
         table_response: MockTableResponse,
         credential_response: MockCredentialResponse,
@@ -2202,6 +2516,61 @@ mod tests {
 
     #[async_trait::async_trait]
     impl UnityCatalog for MockUnity {
+        async fn catalogs(&self, _bearer_token: &str) -> Result<Vec<CatalogInfo>> {
+            Ok(vec![
+                CatalogInfo {
+                    name: "workspace".to_string(),
+                },
+                CatalogInfo {
+                    name: "main".to_string(),
+                },
+            ])
+        }
+
+        async fn schemas(
+            &self,
+            _bearer_token: &str,
+            catalog_name: &str,
+        ) -> Result<Vec<SchemaInfo>> {
+            Ok(vec![
+                SchemaInfo {
+                    name: "default".to_string(),
+                    full_name: Some(format!("{catalog_name}.default")),
+                },
+                SchemaInfo {
+                    name: "analytics".to_string(),
+                    full_name: Some(format!("{catalog_name}.analytics")),
+                },
+            ])
+        }
+
+        async fn tables(
+            &self,
+            _bearer_token: &str,
+            catalog_name: &str,
+            schema_name: &str,
+        ) -> Result<Vec<TableInfo>> {
+            Ok(vec![
+                table_info(
+                    &format!("{catalog_name}.{schema_name}.hits"),
+                    Some("DELTA"),
+                    true,
+                ),
+                TableInfo {
+                    table_id: Some("view-id".to_string()),
+                    full_name: format!("{catalog_name}.{schema_name}.daily_hits"),
+                    name: Some("daily_hits".to_string()),
+                    catalog_name: Some(catalog_name.to_string()),
+                    schema_name: Some(schema_name.to_string()),
+                    table_type: Some("VIEW".to_string()),
+                    data_source_format: None,
+                    storage_location: None,
+                    comment: Some("daily hits view".to_string()),
+                    created_by: Some("creator@example.com".to_string()),
+                },
+            ])
+        }
+
         async fn table(&self, _bearer_token: &str, full_name: &str) -> Result<TableInfo> {
             match self.table_response {
                 MockTableResponse::Delta => Ok(table_info(full_name, Some("DELTA"), true)),
@@ -2281,11 +2650,48 @@ mod tests {
         data_source_format: Option<&str>,
         has_storage: bool,
     ) -> TableInfo {
+        let mut parts = full_name.rsplitn(3, '.').collect::<Vec<_>>();
+        parts.reverse();
+        let (catalog_name, schema_name, name) = match parts.as_slice() {
+            [catalog, schema, name] => (
+                Some((*catalog).to_string()),
+                Some((*schema).to_string()),
+                Some((*name).to_string()),
+            ),
+            _ => (None, None, None),
+        };
         TableInfo {
-            table_id: "table-id".to_string(),
+            table_id: Some("table-id".to_string()),
             full_name: full_name.to_string(),
+            name,
+            catalog_name,
+            schema_name,
+            table_type: Some("MANAGED".to_string()),
             data_source_format: data_source_format.map(str::to_string),
             storage_location: has_storage.then(|| "s3://bench-bucket/ssb/sf10/tables/hits".into()),
+            comment: Some("test table".to_string()),
+            created_by: Some("creator@example.com".to_string()),
+        }
+    }
+
+    fn metadata_table(
+        catalog_name: &str,
+        schema_name: &str,
+        table_name: &str,
+        table_type: &str,
+        data_source_format: Option<&str>,
+    ) -> TableInfo {
+        TableInfo {
+            table_id: Some(format!("{table_name}-id")),
+            full_name: format!("{catalog_name}.{schema_name}.{table_name}"),
+            name: Some(table_name.to_string()),
+            catalog_name: Some(catalog_name.to_string()),
+            schema_name: Some(schema_name.to_string()),
+            table_type: Some(table_type.to_string()),
+            data_source_format: data_source_format.map(str::to_string),
+            storage_location: None,
+            comment: None,
+            created_by: Some("creator@example.com".to_string()),
         }
     }
 
@@ -2456,6 +2862,30 @@ mod tests {
             vec![Arc::new(Int32Array::from(values)) as ArrayRef],
         )
         .unwrap()
+    }
+
+    fn result_string_column(result: &QueryResult, column_index: usize) -> Vec<String> {
+        let page = result.page(0, 100);
+        let batch = &page.batches[0];
+        let values = batch
+            .column(column_index)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        (0..values.len())
+            .map(|row| values.value(row).to_string())
+            .collect()
+    }
+
+    fn result_bool_column(result: &QueryResult, column_index: usize) -> Vec<bool> {
+        let page = result.page(0, 100);
+        let batch = &page.batches[0];
+        let values = batch
+            .column(column_index)
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap();
+        (0..values.len()).map(|row| values.value(row)).collect()
     }
 
     fn test_schema() -> Arc<Schema> {
