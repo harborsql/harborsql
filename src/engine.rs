@@ -1554,7 +1554,8 @@ mod tests {
     use crate::{
         table_cache::CachedTable,
         unity::{
-            AwsTempCredentials, CatalogInfo, SchemaInfo, TableInfo, TemporaryTableCredentials,
+            AwsTempCredentials, CatalogInfo, ColumnInfo, SchemaInfo, TableInfo,
+            TemporaryTableCredentials,
         },
     };
 
@@ -2298,6 +2299,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_show_columns_resolves_table_and_forwards_token() {
+        let unity = Arc::new(RecordingUnity::new());
+        let calls = unity.calls.clone();
+        let opener = Arc::new(MockTableOpener::ok());
+        let engine = QueryEngine::with_dependencies(test_config(), unity, opener.clone());
+
+        let result = engine
+            .execute(
+                "token-columns",
+                "SHOW COLUMNS IN fact_sales IN analytics",
+                "workspace",
+                "default",
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.columns[0].name, "col_name");
+        assert_eq!(
+            result_string_column(&result, 0),
+            vec!["cust_cd", "name", "cust_addr"]
+        );
+        let calls = calls.lock().unwrap();
+        assert_eq!(
+            calls.table,
+            vec![(
+                "token-columns".to_string(),
+                "workspace.analytics.fact_sales".to_string()
+            )]
+        );
+        assert!(calls.tables.is_empty());
+        assert!(calls.temporary_credentials.is_empty());
+        assert_eq!(opener.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn execute_show_table_extended_fetches_each_match_with_received_token() {
         let unity = Arc::new(RecordingUnity::new());
         let calls = unity.calls.clone();
@@ -2618,6 +2654,7 @@ mod tests {
                     storage_location: None,
                     comment: Some("daily hits view".to_string()),
                     created_by: Some("creator@example.com".to_string()),
+                    columns: Vec::new(),
                 },
             ])
         }
@@ -2722,6 +2759,7 @@ mod tests {
             storage_location: has_storage.then(|| "s3://bench-bucket/ssb/sf10/tables/hits".into()),
             comment: Some("test table".to_string()),
             created_by: Some("creator@example.com".to_string()),
+            columns: test_columns(),
         }
     }
 
@@ -2743,7 +2781,25 @@ mod tests {
             storage_location: None,
             comment: None,
             created_by: Some("creator@example.com".to_string()),
+            columns: Vec::new(),
         }
+    }
+
+    fn test_columns() -> Vec<ColumnInfo> {
+        vec![
+            ColumnInfo {
+                name: "cust_addr".to_string(),
+                position: Some(2),
+            },
+            ColumnInfo {
+                name: "cust_cd".to_string(),
+                position: Some(0),
+            },
+            ColumnInfo {
+                name: "name".to_string(),
+                position: Some(1),
+            },
+        ]
     }
 
     fn temporary_credentials() -> TemporaryTableCredentials {

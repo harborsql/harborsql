@@ -188,6 +188,14 @@ pub struct TableInfo {
     pub storage_location: Option<String>,
     pub comment: Option<String>,
     pub created_by: Option<String>,
+    #[serde(default)]
+    pub columns: Vec<ColumnInfo>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ColumnInfo {
+    pub name: String,
+    pub position: Option<i32>,
 }
 
 #[derive(Debug, Deserialize)]

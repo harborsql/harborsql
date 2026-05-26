@@ -98,6 +98,14 @@ impl ShowParser {
             return Ok(MetadataStatement::Views { schema, pattern });
         }
 
+        if self.consume_keyword("COLUMNS") {
+            let table =
+                self.parse_required_in_name("SHOW COLUMNS requires IN or FROM table_name")?;
+            let schema = self.parse_optional_in_name()?;
+            self.expect_end()?;
+            return Ok(MetadataStatement::Columns { table, schema });
+        }
+
         if self.consume_keyword("TABLE") {
             self.expect_keyword("EXTENDED")?;
             let schema = self.parse_optional_in_name()?;
@@ -115,6 +123,14 @@ impl ShowParser {
         Err(HarborError::UnsupportedSql(
             "unsupported SHOW statement".into(),
         ))
+    }
+
+    fn parse_required_in_name(&mut self, message: &str) -> Result<ObjectName> {
+        if self.consume_keyword("FROM") || self.consume_keyword("IN") {
+            self.parse_object_name()
+        } else {
+            Err(HarborError::UnsupportedSql(message.into()))
+        }
     }
 
     fn parse_optional_in_name(&mut self) -> Result<Option<ObjectName>> {
@@ -364,6 +380,31 @@ mod tests {
     }
 
     #[test]
+    fn parses_show_columns_variants() {
+        assert_eq!(
+            parse_show_statement("SHOW COLUMNS IN customer").unwrap(),
+            Some(MetadataStatement::Columns {
+                table: ObjectName(vec!["customer".to_string()]),
+                schema: None,
+            })
+        );
+        assert_eq!(
+            parse_show_statement("SHOW COLUMNS FROM salessc.customer").unwrap(),
+            Some(MetadataStatement::Columns {
+                table: ObjectName(vec!["salessc".to_string(), "customer".to_string()]),
+                schema: None,
+            })
+        );
+        assert_eq!(
+            parse_show_statement("SHOW COLUMNS IN customer IN salessc").unwrap(),
+            Some(MetadataStatement::Columns {
+                table: ObjectName(vec!["customer".to_string()]),
+                schema: Some(ObjectName(vec!["salessc".to_string()])),
+            })
+        );
+    }
+
+    #[test]
     fn parses_show_table_extended() {
         assert_eq!(
             parse_show_statement(
@@ -382,6 +423,8 @@ mod tests {
     fn rejects_unsupported_show_shapes() {
         assert!(parse_show_statement("SHOW SCHEMAS HISTORY").is_err());
         assert!(parse_show_statement("SHOW TABLES EXTENDED").is_err());
+        assert!(parse_show_statement("SHOW COLUMNS").is_err());
+        assert!(parse_show_statement("SHOW COLUMNS IN customer LIKE 'cust*'").is_err());
         assert!(parse_show_statement("SHOW TABLE EXTENDED IN sales").is_err());
         assert!(
             parse_show_statement("SHOW TABLE EXTENDED IN sales LIKE 'x' PARTITION dt='1'").is_err()
