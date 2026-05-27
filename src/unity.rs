@@ -196,6 +196,12 @@ pub struct TableInfo {
 pub struct ColumnInfo {
     pub name: String,
     pub position: Option<i32>,
+    pub type_name: Option<String>,
+    pub type_text: Option<String>,
+    pub type_precision: Option<i32>,
+    pub type_scale: Option<i32>,
+    pub nullable: Option<bool>,
+    pub comment: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

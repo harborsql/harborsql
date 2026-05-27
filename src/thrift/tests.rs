@@ -4,6 +4,12 @@ use std::{
     time::{Duration, Instant},
 };
 
+use axum::{
+    Router,
+    http::{StatusCode, Uri, header},
+    response::{IntoResponse, Response},
+    routing::get,
+};
 use datafusion::arrow::{
     array::{
         Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal128Array,
@@ -14,6 +20,7 @@ use datafusion::arrow::{
     datatypes::{DataType, Field, Schema, TimeUnit},
     record_batch::RecordBatch,
 };
+use tokio::{net::TcpListener, task::JoinHandle};
 
 use crate::{engine::Column, error::ClientError};
 
@@ -197,6 +204,91 @@ async fn service_handles_open_execute_status_metadata_fetch_and_close() {
     assert_eq!(
         read_top_level_status(&close_session_response, "CloseSession"),
         SUCCESS_STATUS
+    );
+}
+
+#[tokio::test]
+async fn service_handles_get_columns_metadata_operation() {
+    let unity = TestUnityServer::new().await;
+    let mut config = test_config();
+    config.databricks_host = unity.host.clone();
+    let service = DatabricksThriftService::new(config.clone(), QueryEngine::new(config));
+    let token = "test-token";
+
+    let open_response = service
+        .handle(token, &open_session_call(1, "workspace", "analytics"))
+        .await
+        .unwrap();
+    let session = read_handle_response(&open_response, "OpenSession", 3, read_session_handle);
+
+    let get_columns_response = service
+        .handle(
+            token,
+            &get_columns_call(
+                2,
+                &session,
+                Some("workspace"),
+                Some("analytics"),
+                Some("hits"),
+                Some("User%"),
+            ),
+        )
+        .await
+        .unwrap();
+    let (operation, operation_type, has_result_set) =
+        read_operation_handle_response(&get_columns_response, "GetColumns");
+    assert_eq!(operation_type, GET_COLUMNS);
+    assert!(has_result_set);
+
+    let status_response = service
+        .handle(token, &operation_call("GetOperationStatus", 3, &operation))
+        .await
+        .unwrap();
+    assert_eq!(
+        read_operation_status_response(&status_response),
+        (SUCCESS_STATUS, FINISHED_STATE, true)
+    );
+
+    let metadata_response = service
+        .handle(
+            token,
+            &operation_call("GetResultSetMetadata", 4, &operation),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        read_top_level_status(&metadata_response, "GetResultSetMetadata"),
+        SUCCESS_STATUS
+    );
+    let metadata_columns = read_metadata_column_names(&metadata_response);
+    assert_eq!(metadata_columns.len(), 23);
+    assert_eq!(
+        &metadata_columns[..5],
+        [
+            "TABLE_CAT",
+            "TABLE_SCHEM",
+            "TABLE_NAME",
+            "COLUMN_NAME",
+            "DATA_TYPE",
+        ]
+    );
+
+    let fetch_response = service
+        .handle(token, &fetch_results_call(5, &operation, 0, 10))
+        .await
+        .unwrap();
+    assert_eq!(
+        read_top_level_status(&fetch_response, "FetchResults"),
+        SUCCESS_STATUS
+    );
+    assert_eq!(
+        read_fetch_string_prefix(&fetch_response, 4),
+        vec![
+            Some("workspace".to_string()),
+            Some("analytics".to_string()),
+            Some("hits".to_string()),
+            Some("UserID".to_string()),
+        ]
     );
 }
 
@@ -786,6 +878,57 @@ fn read_metadata_types(response: &[u8]) -> Vec<DecodedType> {
     panic!("GetResultSetMetadata response did not include schema")
 }
 
+fn read_metadata_column_names(response: &[u8]) -> Vec<String> {
+    let mut reader = success_reader(response, "GetResultSetMetadata");
+    loop {
+        let (field_type, field_id) = reader.read_field_begin().unwrap();
+        if field_type == T_STOP {
+            break;
+        }
+        match (field_id, field_type) {
+            (2, T_STRUCT) => return read_table_schema_column_names(&mut reader),
+            _ => reader.skip(field_type).unwrap(),
+        }
+    }
+    panic!("GetResultSetMetadata response did not include schema")
+}
+
+fn read_table_schema_column_names(reader: &mut Reader<'_>) -> Vec<String> {
+    loop {
+        let (field_type, field_id) = reader.read_field_begin().unwrap();
+        if field_type == T_STOP {
+            break;
+        }
+        match (field_id, field_type) {
+            (1, T_LIST) => {
+                assert_eq!(reader.read_u8().unwrap(), T_STRUCT);
+                let len = reader.read_i32().unwrap();
+                assert!(len >= 0);
+                return (0..len)
+                    .map(|_| read_column_desc_name(reader))
+                    .collect::<Vec<_>>();
+            }
+            _ => reader.skip(field_type).unwrap(),
+        }
+    }
+    panic!("table schema did not include columns")
+}
+
+fn read_column_desc_name(reader: &mut Reader<'_>) -> String {
+    let mut name = None;
+    loop {
+        let (field_type, field_id) = reader.read_field_begin().unwrap();
+        if field_type == T_STOP {
+            break;
+        }
+        match (field_id, field_type) {
+            (1, T_STRING) => name = Some(reader.read_string().unwrap()),
+            _ => reader.skip(field_type).unwrap(),
+        }
+    }
+    name.expect("column description did not include name")
+}
+
 fn read_table_schema_types(reader: &mut Reader<'_>) -> Vec<DecodedType> {
     loop {
         let (field_type, field_id) = reader.read_field_begin().unwrap();
@@ -959,6 +1102,95 @@ fn read_fetch_page(response: &[u8]) -> DecodedFetchPage {
         metadata_included,
         start_row_offset: start_row_offset.unwrap(),
         columns: columns.unwrap(),
+    }
+}
+
+fn read_fetch_string_prefix(response: &[u8], count: usize) -> Vec<Option<String>> {
+    let mut reader = success_reader(response, "FetchResults");
+    loop {
+        let (field_type, field_id) = reader.read_field_begin().unwrap();
+        if field_type == T_STOP {
+            break;
+        }
+        match (field_id, field_type) {
+            (3, T_STRUCT) => return read_row_set_string_prefix(&mut reader, count),
+            _ => reader.skip(field_type).unwrap(),
+        }
+    }
+    panic!("FetchResults response did not include row set")
+}
+
+fn read_row_set_string_prefix(reader: &mut Reader<'_>, count: usize) -> Vec<Option<String>> {
+    loop {
+        let (field_type, field_id) = reader.read_field_begin().unwrap();
+        if field_type == T_STOP {
+            break;
+        }
+        match (field_id, field_type) {
+            (3, T_LIST) => {
+                assert_eq!(reader.read_u8().unwrap(), T_STRUCT);
+                let len = reader.read_i32().unwrap();
+                assert!(len >= 0);
+                assert!(len as usize >= count);
+                let mut values = Vec::with_capacity(count);
+                for column_index in 0..len {
+                    if (column_index as usize) < count {
+                        values.push(read_single_string_column(reader));
+                    } else {
+                        reader.skip(T_STRUCT).unwrap();
+                    }
+                }
+                return values;
+            }
+            _ => reader.skip(field_type).unwrap(),
+        }
+    }
+    panic!("row set did not include columns")
+}
+
+fn read_single_string_column(reader: &mut Reader<'_>) -> Option<String> {
+    let mut value = None;
+    loop {
+        let (field_type, field_id) = reader.read_field_begin().unwrap();
+        if field_type == T_STOP {
+            break;
+        }
+        match (field_id, field_type) {
+            (7, T_STRUCT) => value = Some(read_single_string_value(reader)),
+            _ => reader.skip(field_type).unwrap(),
+        }
+    }
+    value.expect("expected string column")
+}
+
+fn read_single_string_value(reader: &mut Reader<'_>) -> Option<String> {
+    let mut value = None;
+    let mut nulls = None;
+
+    loop {
+        let (field_type, field_id) = reader.read_field_begin().unwrap();
+        if field_type == T_STOP {
+            break;
+        }
+        match (field_id, field_type) {
+            (1, T_LIST) => {
+                assert_eq!(reader.read_u8().unwrap(), T_STRING);
+                assert_eq!(reader.read_i32().unwrap(), 1);
+                value = Some(reader.read_string().unwrap());
+            }
+            (2, T_STRING) => nulls = Some(reader.read_binary().unwrap()),
+            _ => reader.skip(field_type).unwrap(),
+        }
+    }
+
+    if nulls.as_deref().is_some_and(|bytes| {
+        bytes
+            .first()
+            .is_some_and(|first_byte| first_byte & 0b0000_0001 != 0)
+    }) {
+        None
+    } else {
+        value
     }
 }
 
@@ -1244,6 +1476,33 @@ fn execute_statement_call(seqid: i32, session: &Handle, statement: &str) -> Vec<
     })
 }
 
+fn get_columns_call(
+    seqid: i32,
+    session: &Handle,
+    catalog: Option<&str>,
+    schema: Option<&str>,
+    table: Option<&str>,
+    column: Option<&str>,
+) -> Vec<u8> {
+    call("GetColumns", seqid, |writer| {
+        writer.write_field(T_STRUCT, 1, |writer| {
+            write_session_handle_value(writer, session)
+        });
+        if let Some(catalog) = catalog {
+            writer.write_field(T_STRING, 2, |writer| writer.write_string(catalog));
+        }
+        if let Some(schema) = schema {
+            writer.write_field(T_STRING, 3, |writer| writer.write_string(schema));
+        }
+        if let Some(table) = table {
+            writer.write_field(T_STRING, 4, |writer| writer.write_string(table));
+        }
+        if let Some(column) = column {
+            writer.write_field(T_STRING, 5, |writer| writer.write_string(column));
+        }
+    })
+}
+
 fn operation_call(method: &str, seqid: i32, operation: &Handle) -> Vec<u8> {
     call(method, seqid, |writer| {
         writer.write_field(T_STRUCT, 1, |writer| {
@@ -1308,6 +1567,49 @@ fn read_handle_response(
 
     assert_eq!(status, Some(SUCCESS_STATUS));
     handle.unwrap()
+}
+
+fn read_operation_handle_response(response: &[u8], method: &str) -> (Handle, i32, bool) {
+    let mut reader = success_reader(response, method);
+    let mut status = None;
+    let mut handle = None;
+    loop {
+        let (field_type, field_id) = reader.read_field_begin().unwrap();
+        if field_type == T_STOP {
+            break;
+        }
+        match (field_id, field_type) {
+            (1, T_STRUCT) => status = Some(read_status_code(&mut reader)),
+            (2, T_STRUCT) => handle = Some(read_operation_handle_details(&mut reader)),
+            _ => reader.skip(field_type).unwrap(),
+        }
+    }
+
+    assert_eq!(status, Some(SUCCESS_STATUS));
+    handle.unwrap()
+}
+
+fn read_operation_handle_details(reader: &mut Reader<'_>) -> (Handle, i32, bool) {
+    let mut handle = None;
+    let mut operation_type = None;
+    let mut has_result_set = None;
+    loop {
+        let (field_type, field_id) = reader.read_field_begin().unwrap();
+        if field_type == T_STOP {
+            break;
+        }
+        match (field_id, field_type) {
+            (1, T_STRUCT) => handle = read_handle_identifier(reader).unwrap(),
+            (2, T_I32) => operation_type = Some(reader.read_i32().unwrap()),
+            (3, T_BOOL) => has_result_set = Some(reader.read_u8().unwrap() != 0),
+            _ => reader.skip(field_type).unwrap(),
+        }
+    }
+    (
+        handle.unwrap(),
+        operation_type.unwrap(),
+        has_result_set.unwrap_or(false),
+    )
 }
 
 fn read_operation_status_response(response: &[u8]) -> (i32, i32, bool) {
@@ -1383,4 +1685,81 @@ fn success_reader<'a>(response: &'a [u8], method: &str) -> Reader<'a> {
     let (field_type, field_id) = reader.read_field_begin().unwrap();
     assert_eq!((field_type, field_id), (T_STRUCT, 0));
     reader
+}
+
+struct TestUnityServer {
+    host: String,
+    task: JoinHandle<()>,
+}
+
+impl TestUnityServer {
+    async fn new() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route("/{*path}", get(unity_test_handler));
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        Self {
+            host: format!("http://{}", socket_addr(addr)),
+            task,
+        }
+    }
+}
+
+impl Drop for TestUnityServer {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+async fn unity_test_handler(uri: Uri) -> Response {
+    match uri.path() {
+        "/api/2.1/unity-catalog/tables/workspace.analytics.hits" => json_response(
+            StatusCode::OK,
+            r#"{
+                "table_id":"table-id",
+                "full_name":"workspace.analytics.hits",
+                "name":"hits",
+                "catalog_name":"workspace",
+                "schema_name":"analytics",
+                "table_type":"MANAGED",
+                "data_source_format":"DELTA",
+                "columns":[
+                    {
+                        "name":"EventDate",
+                        "position":0,
+                        "type_name":"DATE",
+                        "type_text":"date",
+                        "nullable":false,
+                        "comment":"event date"
+                    },
+                    {
+                        "name":"UserID",
+                        "position":1,
+                        "type_name":"BIGINT",
+                        "type_text":"bigint",
+                        "nullable":true
+                    },
+                    {
+                        "name":"URL",
+                        "position":2,
+                        "type_name":"STRING",
+                        "type_text":"string",
+                        "nullable":true
+                    }
+                ]
+            }"#
+            .into(),
+        ),
+        _ => json_response(StatusCode::NOT_FOUND, r#"{"message":"not found"}"#.into()),
+    }
+}
+
+fn json_response(status: StatusCode, body: String) -> Response {
+    (status, [(header::CONTENT_TYPE, "application/json")], body).into_response()
+}
+
+fn socket_addr(addr: SocketAddr) -> String {
+    format!("{}:{}", addr.ip(), addr.port())
 }

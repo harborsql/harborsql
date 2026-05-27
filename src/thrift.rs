@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use crate::{
     config::Config,
-    engine::{QueryEngine, QueryResult},
+    engine::{GetColumnsMetadataRequest, QueryEngine, QueryResult},
     error::{HarborError, Result},
     observability,
 };
@@ -170,6 +170,91 @@ impl DatabricksThriftService {
                     request.info_type,
                     &session.catalog,
                 ))
+            }
+            "GetColumns" => {
+                let request = read_args(message.payload, read_get_columns_req)?;
+                self.cleanup_expired().await;
+                let Some(session) = self
+                    .session_for(request.session_handle.as_ref(), bearer_token)
+                    .await
+                else {
+                    return Ok(write_get_columns_invalid(
+                        message.seqid,
+                        "invalid session handle",
+                    ));
+                };
+                if self.operations.read().await.len() >= self.config.max_operations {
+                    return Ok(write_get_columns_error(
+                        message.seqid,
+                        "maximum operation count exceeded",
+                    ));
+                }
+
+                let operation_id = Uuid::new_v4();
+                let secret = Uuid::new_v4();
+                let started = Instant::now();
+                let result = self
+                    .engine
+                    .get_columns_metadata(
+                        bearer_token,
+                        GetColumnsMetadataRequest {
+                            catalog: request.catalog_name.as_deref(),
+                            schema: request.schema_name.as_deref(),
+                            table: request.table_name.as_deref(),
+                            column: request.column_name.as_deref(),
+                        },
+                        &session.catalog,
+                        &session.schema,
+                    )
+                    .instrument(tracing::info_span!(
+                        "thrift_metadata_operation",
+                        method = "GetColumns",
+                        session_id = %session.id
+                    ))
+                    .await;
+
+                match result {
+                    Ok(result) => {
+                        let query_id = operation_id.to_string();
+                        let mut operations = self.operations.write().await;
+                        if operations.len() >= self.config.max_operations {
+                            return Ok(write_get_columns_error(
+                                message.seqid,
+                                "maximum operation count exceeded",
+                            ));
+                        }
+                        operations.insert(
+                            query_id.clone(),
+                            OperationState {
+                                secret: *secret.as_bytes(),
+                                session_id: session.id.clone(),
+                                token_fingerprint: token_fingerprint(bearer_token),
+                                state: OperationExecution::Finished {
+                                    result: Arc::new(result),
+                                    duration_ms: started.elapsed().as_millis() as u64,
+                                    completed_at: Instant::now(),
+                                },
+                            },
+                        );
+                        record_operation_gauges(&operations);
+                        tracing::info!(
+                            query_id = %query_id,
+                            session_id = %session.id,
+                            duration_ms = started.elapsed().as_millis() as u64,
+                            "Thrift metadata operation finished"
+                        );
+                        Ok(write_get_columns_response(
+                            message.seqid,
+                            operation_id.as_bytes(),
+                            secret.as_bytes(),
+                        ))
+                    }
+                    Err(err) => {
+                        let error_message =
+                            thrift_client_error_message(&err, "thrift GetColumns metadata");
+                        Ok(write_get_columns_error(message.seqid, &error_message))
+                    }
+                }
             }
             "ExecuteStatement" => {
                 let request = read_args(message.payload, read_execute_statement_req)?;
@@ -671,6 +756,15 @@ struct GetInfoReq {
 }
 
 #[derive(Debug)]
+struct GetColumnsReq {
+    session_handle: Option<Handle>,
+    catalog_name: Option<String>,
+    schema_name: Option<String>,
+    table_name: Option<String>,
+    column_name: Option<String>,
+}
+
+#[derive(Debug)]
 struct ExecuteStatementReq {
     session_handle: Option<Handle>,
     statement: String,
@@ -824,6 +918,35 @@ fn read_get_info_req(reader: &mut Reader<'_>) -> Result<GetInfoReq> {
     Ok(GetInfoReq {
         session_handle,
         info_type: info_type.unwrap_or(CLI_DBMS_NAME),
+    })
+}
+
+fn read_get_columns_req(reader: &mut Reader<'_>) -> Result<GetColumnsReq> {
+    let mut session_handle = None;
+    let mut catalog_name = None;
+    let mut schema_name = None;
+    let mut table_name = None;
+    let mut column_name = None;
+    loop {
+        let (field_type, field_id) = reader.read_field_begin()?;
+        if field_type == T_STOP {
+            break;
+        }
+        match (field_id, field_type) {
+            (1, T_STRUCT) => session_handle = read_session_handle(reader)?,
+            (2, T_STRING) => catalog_name = Some(reader.read_string()?),
+            (3, T_STRING) => schema_name = Some(reader.read_string()?),
+            (4, T_STRING) => table_name = Some(reader.read_string()?),
+            (5, T_STRING) => column_name = Some(reader.read_string()?),
+            _ => reader.skip(field_type)?,
+        }
+    }
+    Ok(GetColumnsReq {
+        session_handle,
+        catalog_name,
+        schema_name,
+        table_name,
+        column_name,
     })
 }
 
@@ -1033,6 +1156,36 @@ fn write_get_info_invalid(seqid: i32) -> Vec<u8> {
         });
         writer.write_field(T_STRUCT, 2, |writer| {
             write_get_info_string_value(writer, "");
+        });
+        writer.write_stop();
+    })
+}
+
+fn write_get_columns_response(seqid: i32, guid: &[u8; 16], secret: &[u8; 16]) -> Vec<u8> {
+    write_success_response("GetColumns", seqid, |writer| {
+        writer.write_field(T_STRUCT, 1, |writer| {
+            write_status(writer, SUCCESS_STATUS, None)
+        });
+        writer.write_field(T_STRUCT, 2, |writer| {
+            write_operation_handle_with_type(writer, guid, secret, true, GET_COLUMNS);
+        });
+        writer.write_stop();
+    })
+}
+
+fn write_get_columns_error(seqid: i32, message: &str) -> Vec<u8> {
+    write_success_response("GetColumns", seqid, |writer| {
+        writer.write_field(T_STRUCT, 1, |writer| {
+            write_status(writer, ERROR_STATUS, Some(message))
+        });
+        writer.write_stop();
+    })
+}
+
+fn write_get_columns_invalid(seqid: i32, message: &str) -> Vec<u8> {
+    write_success_response("GetColumns", seqid, |writer| {
+        writer.write_field(T_STRUCT, 1, |writer| {
+            write_status(writer, INVALID_HANDLE_STATUS, Some(message))
         });
         writer.write_stop();
     })
@@ -1291,10 +1444,20 @@ fn write_operation_handle(
     secret: &[u8; 16],
     has_result_set: bool,
 ) {
+    write_operation_handle_with_type(writer, guid, secret, has_result_set, EXECUTE_STATEMENT);
+}
+
+fn write_operation_handle_with_type(
+    writer: &mut Writer,
+    guid: &[u8; 16],
+    secret: &[u8; 16],
+    has_result_set: bool,
+    operation_type: i32,
+) {
     writer.write_field(T_STRUCT, 1, |writer| {
         write_handle_identifier(writer, guid, secret);
     });
-    writer.write_field(T_I32, 2, |writer| writer.write_i32(EXECUTE_STATEMENT));
+    writer.write_field(T_I32, 2, |writer| writer.write_i32(operation_type));
     writer.write_field(T_BOOL, 3, |writer| writer.write_bool(has_result_set));
     writer.write_stop();
 }
