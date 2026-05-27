@@ -61,6 +61,14 @@ pub struct QueryEngine {
     table_cache: TableCache,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct GetColumnsMetadataRequest<'a> {
+    pub(crate) catalog: Option<&'a str>,
+    pub(crate) schema: Option<&'a str>,
+    pub(crate) table: Option<&'a str>,
+    pub(crate) column: Option<&'a str>,
+}
+
 impl QueryEngine {
     pub fn new(config: Config) -> Self {
         let unity = Arc::new(UnityCatalogClient::new(
@@ -93,6 +101,28 @@ impl QueryEngine {
     ) -> Result<QueryResult> {
         self.execute_with_query_id(None, bearer_token, sql, default_catalog, default_schema)
             .await
+    }
+
+    pub(crate) async fn get_columns_metadata(
+        &self,
+        bearer_token: &str,
+        request: GetColumnsMetadataRequest<'_>,
+        default_catalog: &str,
+        default_schema: &str,
+    ) -> Result<QueryResult> {
+        metadata::get_columns(
+            self.unity.as_ref(),
+            bearer_token,
+            metadata::GetColumnsRequest {
+                catalog: request.catalog.map(str::to_string),
+                schema: request.schema.map(str::to_string),
+                table: request.table.map(str::to_string),
+                column: request.column.map(str::to_string),
+            },
+            default_catalog,
+            default_schema,
+        )
+        .await
     }
 
     pub async fn execute_with_query_id(
@@ -2334,6 +2364,191 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_columns_metadata_returns_databricks_column_rows() {
+        let unity = Arc::new(RecordingUnity::new());
+        let calls = unity.calls.clone();
+        let opener = Arc::new(MockTableOpener::ok());
+        let engine = QueryEngine::with_dependencies(test_config(), unity, opener.clone());
+
+        let result = engine
+            .get_columns_metadata(
+                "token-get-columns",
+                GetColumnsMetadataRequest {
+                    catalog: Some("workspace"),
+                    schema: Some("analytics"),
+                    table: Some("fact_sales"),
+                    column: Some("cust_cd"),
+                },
+                "workspace",
+                "default",
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result
+                .columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "TABLE_CAT",
+                "TABLE_SCHEM",
+                "TABLE_NAME",
+                "COLUMN_NAME",
+                "DATA_TYPE",
+                "TYPE_NAME",
+                "COLUMN_SIZE",
+                "BUFFER_LENGTH",
+                "DECIMAL_DIGITS",
+                "NUM_PREC_RADIX",
+                "NULLABLE",
+                "REMARKS",
+                "COLUMN_DEF",
+                "SQL_DATA_TYPE",
+                "SQL_DATETIME_SUB",
+                "CHAR_OCTET_LENGTH",
+                "ORDINAL_POSITION",
+                "IS_NULLABLE",
+                "SCOPE_CATALOG",
+                "SCOPE_SCHEMA",
+                "SCOPE_TABLE",
+                "SOURCE_DATA_TYPE",
+                "IS_AUTO_INCREMENT",
+            ]
+        );
+        assert_eq!(result_string_column(&result, 3), vec!["cust_cd"]);
+        assert_eq!(result_i32_column(&result, 4), vec![-5]);
+        assert_eq!(result_string_column(&result, 5), vec!["BIGINT"]);
+        assert_eq!(result_i32_column(&result, 16), vec![1]);
+        let calls = calls.lock().unwrap();
+        assert_eq!(
+            calls.table,
+            vec![(
+                "token-get-columns".to_string(),
+                "workspace.analytics.fact_sales".to_string()
+            )]
+        );
+        assert!(calls.temporary_credentials.is_empty());
+        assert_eq!(opener.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn get_columns_metadata_with_wildcard_table_pattern_returns_view_columns() {
+        let unity = Arc::new(RecordingUnity::new());
+        let calls = unity.calls.clone();
+        let opener = Arc::new(MockTableOpener::ok());
+        let engine = QueryEngine::with_dependencies(test_config(), unity, opener.clone());
+
+        let result = engine
+            .get_columns_metadata(
+                "token-get-columns",
+                GetColumnsMetadataRequest {
+                    catalog: Some("workspace"),
+                    schema: Some("analytics"),
+                    table: Some("daily%"),
+                    column: Some("cust_cd"),
+                },
+                "workspace",
+                "default",
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.row_count, 1);
+        assert_eq!(result_string_column(&result, 1), vec!["analytics"]);
+        assert_eq!(result_string_column(&result, 2), vec!["daily_sales"]);
+        assert_eq!(result_string_column(&result, 3), vec!["cust_cd"]);
+        let calls = calls.lock().unwrap();
+        assert_eq!(
+            calls.tables,
+            vec![(
+                "token-get-columns".to_string(),
+                "workspace".to_string(),
+                "analytics".to_string()
+            )]
+        );
+        assert_eq!(
+            calls.table,
+            vec![(
+                "token-get-columns".to_string(),
+                "workspace.analytics.daily_sales".to_string()
+            )]
+        );
+        assert!(calls.temporary_credentials.is_empty());
+        assert_eq!(opener.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn get_columns_metadata_without_schema_lists_all_schemas() {
+        let unity = Arc::new(RecordingUnity::new());
+        let calls = unity.calls.clone();
+        let opener = Arc::new(MockTableOpener::ok());
+        let engine = QueryEngine::with_dependencies(test_config(), unity, opener.clone());
+
+        let result = engine
+            .get_columns_metadata(
+                "token-get-columns",
+                GetColumnsMetadataRequest {
+                    catalog: Some("workspace"),
+                    schema: None,
+                    table: Some("fact_sales"),
+                    column: Some("cust_cd"),
+                },
+                "workspace",
+                "default",
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.row_count, 2);
+        assert_eq!(
+            result_string_column(&result, 1),
+            vec!["analytics", "default"]
+        );
+        assert_eq!(
+            result_string_column(&result, 2),
+            vec!["fact_sales", "fact_sales"]
+        );
+        assert_eq!(result_string_column(&result, 3), vec!["cust_cd", "cust_cd"]);
+        let calls = calls.lock().unwrap();
+        assert_eq!(
+            calls.schemas,
+            vec![("token-get-columns".to_string(), "workspace".to_string())]
+        );
+        assert_eq!(
+            calls.tables,
+            vec![
+                (
+                    "token-get-columns".to_string(),
+                    "workspace".to_string(),
+                    "analytics".to_string()
+                ),
+                (
+                    "token-get-columns".to_string(),
+                    "workspace".to_string(),
+                    "default".to_string()
+                ),
+            ]
+        );
+        assert_eq!(
+            calls.table,
+            vec![
+                (
+                    "token-get-columns".to_string(),
+                    "workspace.analytics.fact_sales".to_string()
+                ),
+                (
+                    "token-get-columns".to_string(),
+                    "workspace.default.fact_sales".to_string()
+                ),
+            ]
+        );
+        assert!(calls.temporary_credentials.is_empty());
+        assert_eq!(opener.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn execute_show_table_extended_fetches_each_match_with_received_token() {
         let unity = Arc::new(RecordingUnity::new());
         let calls = unity.calls.clone();
@@ -2788,16 +3003,34 @@ mod tests {
     fn test_columns() -> Vec<ColumnInfo> {
         vec![
             ColumnInfo {
-                name: "cust_addr".to_string(),
-                position: Some(2),
-            },
-            ColumnInfo {
                 name: "cust_cd".to_string(),
                 position: Some(0),
+                type_name: Some("BIGINT".to_string()),
+                type_text: Some("bigint".to_string()),
+                type_precision: None,
+                type_scale: None,
+                nullable: Some(true),
+                comment: None,
             },
             ColumnInfo {
                 name: "name".to_string(),
                 position: Some(1),
+                type_name: Some("STRING".to_string()),
+                type_text: Some("string".to_string()),
+                type_precision: None,
+                type_scale: None,
+                nullable: Some(true),
+                comment: None,
+            },
+            ColumnInfo {
+                name: "cust_addr".to_string(),
+                position: Some(2),
+                type_name: Some("STRING".to_string()),
+                type_text: Some("string".to_string()),
+                type_precision: None,
+                type_scale: None,
+                nullable: Some(true),
+                comment: None,
             },
         ]
     }
@@ -3013,6 +3246,17 @@ mod tests {
             .column(column_index)
             .as_any()
             .downcast_ref::<BooleanArray>()
+            .unwrap();
+        (0..values.len()).map(|row| values.value(row)).collect()
+    }
+
+    fn result_i32_column(result: &QueryResult, column_index: usize) -> Vec<i32> {
+        let page = result.page(0, 100);
+        let batch = &page.batches[0];
+        let values = batch
+            .column(column_index)
+            .as_any()
+            .downcast_ref::<Int32Array>()
             .unwrap();
         (0..values.len()).map(|row| values.value(row)).collect()
     }

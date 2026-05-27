@@ -1,8 +1,9 @@
 use async_trait::async_trait;
+use regex::{Regex, RegexBuilder};
 
 use crate::{
     error::{HarborError, Result},
-    unity::{CatalogInfo, SchemaInfo, TableInfo},
+    unity::{CatalogInfo, ColumnInfo, SchemaInfo, TableInfo},
 };
 
 use super::{QueryResult, catalog::UnityCatalog};
@@ -62,10 +63,38 @@ struct TableRow {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct ColumnMetadataRow {
+    catalog: String,
+    schema: String,
+    table: String,
+    column: String,
+    data_type: i32,
+    type_name: String,
+    column_size: Option<i32>,
+    decimal_digits: Option<i32>,
+    num_prec_radix: Option<i32>,
+    nullable: i32,
+    remarks: Option<String>,
+    sql_data_type: i32,
+    sql_datetime_sub: Option<i32>,
+    char_octet_length: Option<i32>,
+    ordinal_position: i32,
+    is_nullable: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct TableExtendedRow {
     schema: String,
     name: String,
     information: String,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct GetColumnsRequest {
+    pub(super) catalog: Option<String>,
+    pub(super) schema: Option<String>,
+    pub(super) table: Option<String>,
+    pub(super) column: Option<String>,
 }
 
 #[async_trait]
@@ -136,6 +165,16 @@ pub(super) async fn execute_show_statement(
     )
     .await?;
     Ok(Some(result))
+}
+
+pub(super) async fn get_columns(
+    unity: &dyn UnityCatalog,
+    bearer_token: &str,
+    request: GetColumnsRequest,
+    default_catalog: &str,
+    _default_schema: &str,
+) -> Result<QueryResult> {
+    execute_get_columns(unity, bearer_token, request, default_catalog).await
 }
 
 async fn execute_metadata_statement<S>(
@@ -249,6 +288,227 @@ where
             result::table_extended(rows)
         }
     }
+}
+
+async fn execute_get_columns<S>(
+    source: &S,
+    bearer_token: &str,
+    request: GetColumnsRequest,
+    default_catalog: &str,
+) -> Result<QueryResult>
+where
+    S: MetadataSource + ?Sized,
+{
+    let request = normalize_get_columns_request(request);
+    let catalogs = resolve_catalog_candidates(
+        source,
+        bearer_token,
+        request.catalog.as_deref(),
+        default_catalog,
+    )
+    .await?;
+    let column_pattern = MetadataPattern::new(request.column.as_deref())?;
+    let mut rows = Vec::new();
+
+    for catalog in catalogs {
+        let schemas =
+            resolve_schema_candidates(source, bearer_token, &catalog, request.schema.as_deref())
+                .await?;
+        for schema in schemas {
+            let tables = resolve_table_candidates(
+                source,
+                bearer_token,
+                &catalog,
+                &schema,
+                request.table.as_deref(),
+            )
+            .await?;
+            for table in tables {
+                let full_name = table_full_identifier(&ResolvedTable {
+                    catalog: catalog.clone(),
+                    schema: schema.clone(),
+                    table: table.name.clone(),
+                });
+                let detailed = source.table(bearer_token, &full_name).await?;
+                rows.extend(column_metadata_rows(
+                    &detailed,
+                    &catalog,
+                    &schema,
+                    &table.name,
+                    &column_pattern,
+                ));
+            }
+        }
+    }
+
+    rows.sort_by(|left, right| {
+        (
+            left.catalog.to_ascii_lowercase(),
+            left.schema.to_ascii_lowercase(),
+            left.table.to_ascii_lowercase(),
+            left.ordinal_position,
+        )
+            .cmp(&(
+                right.catalog.to_ascii_lowercase(),
+                right.schema.to_ascii_lowercase(),
+                right.table.to_ascii_lowercase(),
+                right.ordinal_position,
+            ))
+    });
+    result::column_metadata(rows)
+}
+
+fn normalize_get_columns_request(mut request: GetColumnsRequest) -> GetColumnsRequest {
+    if request.catalog.is_none()
+        && request.schema.as_deref().is_some_and(contains_namespace)
+        && let Some(schema) = request.schema.take()
+    {
+        let parts = schema.split('.').collect::<Vec<_>>();
+        if parts.len() == 2 {
+            request.catalog = Some(parts[0].to_string());
+            request.schema = Some(parts[1].to_string());
+        } else {
+            request.schema = Some(schema);
+        }
+    }
+
+    if request.table.as_deref().is_some_and(contains_namespace)
+        && let Some(table) = request.table.take()
+    {
+        let parts = table.split('.').collect::<Vec<_>>();
+        match parts.as_slice() {
+            [catalog, schema, table] if request.catalog.is_none() && request.schema.is_none() => {
+                request.catalog = Some((*catalog).to_string());
+                request.schema = Some((*schema).to_string());
+                request.table = Some((*table).to_string());
+            }
+            [schema, table] if request.schema.is_none() => {
+                request.schema = Some((*schema).to_string());
+                request.table = Some((*table).to_string());
+            }
+            _ => request.table = Some(table),
+        }
+    }
+
+    request
+}
+
+async fn resolve_catalog_candidates<S>(
+    source: &S,
+    bearer_token: &str,
+    catalog: Option<&str>,
+    default_catalog: &str,
+) -> Result<Vec<String>>
+where
+    S: MetadataSource + ?Sized,
+{
+    let Some(catalog) = catalog.filter(|value| !value.is_empty()) else {
+        return Ok(vec![default_catalog.to_string()]);
+    };
+    if !contains_metadata_wildcard(catalog) {
+        return Ok(vec![strip_metadata_escapes(catalog)]);
+    }
+
+    let pattern = MetadataPattern::new(Some(catalog))?;
+    let mut catalogs = source
+        .list_catalogs(bearer_token)
+        .await?
+        .into_iter()
+        .map(|catalog| catalog.name)
+        .filter(|name| pattern.matches(name))
+        .collect::<Vec<_>>();
+    catalogs.sort_by_key(|name| name.to_ascii_lowercase());
+    Ok(catalogs)
+}
+
+async fn resolve_schema_candidates<S>(
+    source: &S,
+    bearer_token: &str,
+    catalog: &str,
+    schema: Option<&str>,
+) -> Result<Vec<String>>
+where
+    S: MetadataSource + ?Sized,
+{
+    match schema {
+        None => list_schema_candidates(source, bearer_token, catalog, None).await,
+        Some("") => Ok(Vec::new()),
+        Some(schema) if !contains_metadata_wildcard(schema) => {
+            Ok(vec![strip_metadata_escapes(schema)])
+        }
+        Some(schema) => list_schema_candidates(source, bearer_token, catalog, Some(schema)).await,
+    }
+}
+
+async fn list_schema_candidates<S>(
+    source: &S,
+    bearer_token: &str,
+    catalog: &str,
+    pattern: Option<&str>,
+) -> Result<Vec<String>>
+where
+    S: MetadataSource + ?Sized,
+{
+    let pattern = MetadataPattern::new(pattern)?;
+    let mut schemas = source
+        .list_schemas(bearer_token, catalog)
+        .await?
+        .into_iter()
+        .map(|schema| schema_name(&schema))
+        .filter(|name| pattern.matches(name))
+        .collect::<Vec<_>>();
+    schemas.sort_by_key(|name| name.to_ascii_lowercase());
+    Ok(schemas)
+}
+
+async fn resolve_table_candidates<S>(
+    source: &S,
+    bearer_token: &str,
+    catalog: &str,
+    schema: &str,
+    table: Option<&str>,
+) -> Result<Vec<TableRow>>
+where
+    S: MetadataSource + ?Sized,
+{
+    let Some(table) = table.filter(|value| !value.is_empty()) else {
+        return list_matching_tables(source, bearer_token, catalog, schema, None).await;
+    };
+    if contains_metadata_wildcard(table) {
+        return list_matching_tables(source, bearer_token, catalog, schema, Some(table)).await;
+    }
+
+    Ok(vec![TableRow {
+        schema: schema.to_string(),
+        name: strip_metadata_escapes(table),
+    }])
+}
+
+async fn list_matching_tables<S>(
+    source: &S,
+    bearer_token: &str,
+    catalog: &str,
+    schema: &str,
+    pattern: Option<&str>,
+) -> Result<Vec<TableRow>>
+where
+    S: MetadataSource + ?Sized,
+{
+    let pattern = MetadataPattern::new(pattern)?;
+    let mut rows = source
+        .list_tables(bearer_token, catalog, schema)
+        .await?
+        .into_iter()
+        .filter_map(|table| {
+            let name = table_name(&table);
+            pattern.matches(&name).then_some(TableRow {
+                schema: schema.to_string(),
+                name,
+            })
+        })
+        .collect::<Vec<_>>();
+    sort_table_rows(&mut rows);
+    Ok(rows)
 }
 
 fn filtered_sorted_names<I>(names: I, pattern: Option<&str>) -> Result<Vec<String>>
@@ -395,6 +655,253 @@ fn table_column_names(table: &TableInfo) -> Vec<String> {
         .collect()
 }
 
+fn column_metadata_rows(
+    table: &TableInfo,
+    catalog: &str,
+    schema: &str,
+    table_name: &str,
+    pattern: &MetadataPattern,
+) -> Vec<ColumnMetadataRow> {
+    let mut columns = table.columns.iter().enumerate().collect::<Vec<_>>();
+    columns.sort_by_key(|(index, column)| (column.position.unwrap_or(i32::MAX), *index));
+    columns
+        .into_iter()
+        .filter(|(_, column)| pattern.matches(&column.name))
+        .map(|(index, column)| {
+            let ordinal = column.position.unwrap_or(index as i32) + 1;
+            let type_name = column_type_name(column);
+            let data_type = jdbc_data_type(&type_name);
+            let (nullable, is_nullable) = match column.nullable {
+                Some(false) => (0, "NO"),
+                Some(true) => (1, "YES"),
+                None => (2, ""),
+            };
+            ColumnMetadataRow {
+                catalog: table
+                    .catalog_name
+                    .clone()
+                    .unwrap_or_else(|| catalog.to_string()),
+                schema: table
+                    .schema_name
+                    .clone()
+                    .unwrap_or_else(|| schema.to_string()),
+                table: table.name.clone().unwrap_or_else(|| table_name.to_string()),
+                column: column.name.clone(),
+                data_type,
+                type_name: type_name.clone(),
+                column_size: column_size(&type_name, column),
+                decimal_digits: decimal_digits(&type_name, column),
+                num_prec_radix: num_prec_radix(&type_name),
+                nullable,
+                remarks: column.comment.clone().filter(|value| !value.is_empty()),
+                sql_data_type: data_type,
+                sql_datetime_sub: sql_datetime_sub(&type_name),
+                char_octet_length: char_octet_length(&type_name),
+                ordinal_position: ordinal,
+                is_nullable: is_nullable.to_string(),
+            }
+        })
+        .collect()
+}
+
+fn column_type_name(column: &ColumnInfo) -> String {
+    column
+        .type_text
+        .as_deref()
+        .or(column.type_name.as_deref())
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_ascii_uppercase())
+        .unwrap_or_else(|| "STRING".to_string())
+}
+
+fn base_type_name(type_name: &str) -> &str {
+    type_name
+        .split(['(', '<'])
+        .next()
+        .unwrap_or(type_name)
+        .trim()
+}
+
+fn jdbc_data_type(type_name: &str) -> i32 {
+    match base_type_name(type_name) {
+        "BOOLEAN" | "BOOL" => 16,
+        "BYTE" | "TINYINT" => -6,
+        "SHORT" | "SMALLINT" => 5,
+        "INT" | "INTEGER" => 4,
+        "LONG" | "BIGINT" => -5,
+        "FLOAT" => 6,
+        "DOUBLE" => 8,
+        "DATE" => 91,
+        "TIMESTAMP" | "TIMESTAMP_NTZ" => 93,
+        "BINARY" => -2,
+        "DECIMAL" | "NUMERIC" => 3,
+        "ARRAY" => 2003,
+        "STRUCT" => 2002,
+        "MAP" => 2000,
+        _ => 12,
+    }
+}
+
+fn column_size(type_name: &str, column: &ColumnInfo) -> Option<i32> {
+    match base_type_name(type_name) {
+        "DECIMAL" | "NUMERIC" => column.type_precision.or_else(|| parse_precision(type_name)),
+        "BYTE" | "TINYINT" => Some(3),
+        "SHORT" | "SMALLINT" => Some(5),
+        "INT" | "INTEGER" | "DATE" => Some(10),
+        "LONG" | "BIGINT" => Some(19),
+        "FLOAT" => Some(7),
+        "DOUBLE" => Some(15),
+        "TIMESTAMP" | "TIMESTAMP_NTZ" => Some(29),
+        "BOOLEAN" | "BOOL" | "BINARY" => Some(1),
+        "STRING" | "VARCHAR" | "CHAR" => Some(255),
+        "ARRAY" | "MAP" | "STRUCT" => Some(255),
+        _ => None,
+    }
+}
+
+fn decimal_digits(type_name: &str, column: &ColumnInfo) -> Option<i32> {
+    match base_type_name(type_name) {
+        "DECIMAL" | "NUMERIC" => column
+            .type_scale
+            .or_else(|| parse_scale(type_name))
+            .or(Some(0)),
+        "TIMESTAMP" | "TIMESTAMP_NTZ" => Some(9),
+        _ => Some(0),
+    }
+}
+
+fn num_prec_radix(type_name: &str) -> Option<i32> {
+    match base_type_name(type_name) {
+        "BYTE" | "TINYINT" | "SHORT" | "SMALLINT" | "INT" | "INTEGER" | "LONG" | "BIGINT"
+        | "FLOAT" | "DOUBLE" | "DECIMAL" | "NUMERIC" => Some(10),
+        _ => Some(0),
+    }
+}
+
+fn sql_datetime_sub(type_name: &str) -> Option<i32> {
+    match base_type_name(type_name) {
+        "DATE" => Some(91),
+        "TIMESTAMP" | "TIMESTAMP_NTZ" => Some(93),
+        _ => None,
+    }
+}
+
+fn char_octet_length(type_name: &str) -> Option<i32> {
+    match base_type_name(type_name) {
+        "STRING" | "VARCHAR" | "CHAR" => Some(255),
+        "BINARY" => Some(32767),
+        _ => None,
+    }
+}
+
+fn parse_precision(type_name: &str) -> Option<i32> {
+    parse_decimal_parts(type_name).and_then(|parts| parts.first().copied())
+}
+
+fn parse_scale(type_name: &str) -> Option<i32> {
+    parse_decimal_parts(type_name).and_then(|parts| parts.get(1).copied())
+}
+
+fn parse_decimal_parts(type_name: &str) -> Option<Vec<i32>> {
+    let start = type_name.find('(')?;
+    let end = type_name[start + 1..].find(')')? + start + 1;
+    type_name[start + 1..end]
+        .split(',')
+        .map(|part| part.trim().parse::<i32>().ok())
+        .collect()
+}
+
+fn contains_namespace(value: &str) -> bool {
+    value.contains('.')
+}
+
+fn contains_metadata_wildcard(value: &str) -> bool {
+    let mut escaped = false;
+    for ch in value.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if matches!(ch, '%' | '_' | '*') {
+            return true;
+        }
+    }
+    false
+}
+
+fn strip_metadata_escapes(value: &str) -> String {
+    let mut stripped = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            if let Some(next) = chars.next() {
+                stripped.push(next);
+            } else {
+                stripped.push(ch);
+            }
+        } else {
+            stripped.push(ch);
+        }
+    }
+    stripped
+}
+
+struct MetadataPattern {
+    regex: Option<Regex>,
+}
+
+impl MetadataPattern {
+    fn new(pattern: Option<&str>) -> Result<Self> {
+        let Some(pattern) = pattern.filter(|value| !value.is_empty()) else {
+            return Ok(Self { regex: None });
+        };
+        let regex = metadata_pattern_regex(pattern);
+        let regex = RegexBuilder::new(&regex)
+            .case_insensitive(true)
+            .build()
+            .map_err(|err| {
+                HarborError::UnsupportedSql(format!("invalid metadata pattern `{pattern}`: {err}"))
+            })?;
+        Ok(Self { regex: Some(regex) })
+    }
+
+    fn matches(&self, value: &str) -> bool {
+        self.regex
+            .as_ref()
+            .is_none_or(|regex| regex.is_match(value))
+    }
+}
+
+fn metadata_pattern_regex(pattern: &str) -> String {
+    let mut regex = String::from("^");
+    let mut escaped = false;
+    for ch in pattern.chars() {
+        if escaped {
+            regex.push_str(&regex::escape(&ch.to_string()));
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        match ch {
+            '%' | '*' => regex.push_str(".*"),
+            '_' => regex.push('.'),
+            ch => regex.push_str(&regex::escape(&ch.to_string())),
+        }
+    }
+    if escaped {
+        regex.push_str(&regex::escape("\\"));
+    }
+    regex.push('$');
+    regex
+}
+
 fn is_view_like(table: &TableInfo) -> bool {
     table
         .table_type
@@ -460,7 +967,12 @@ fn table_information(table: &TableInfo) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ObjectName, pattern::ShowPattern, resolve_schema, resolve_table};
+    use crate::unity::{ColumnInfo, TableInfo};
+
+    use super::{
+        GetColumnsRequest, MetadataPattern, ObjectName, contains_metadata_wildcard,
+        normalize_get_columns_request, pattern::ShowPattern, resolve_schema, resolve_table,
+    };
 
     #[test]
     fn resolves_show_table_namespaces() {
@@ -556,6 +1068,99 @@ mod tests {
                 "default",
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn get_columns_normalizes_dotted_names_with_underscores() {
+        let request = normalize_get_columns_request(GetColumnsRequest {
+            catalog: None,
+            schema: None,
+            table: Some("harborsql_clickbench_s3.hits_optimized".to_string()),
+            column: None,
+        });
+
+        assert_eq!(request.catalog, None);
+        assert_eq!(request.schema.as_deref(), Some("harborsql_clickbench_s3"));
+        assert_eq!(request.table.as_deref(), Some("hits_optimized"));
+    }
+
+    #[test]
+    fn metadata_patterns_honor_jdbc_escapes() {
+        let escaped = MetadataPattern::new(Some(r"harborsql\_clickbench\_s3")).unwrap();
+        assert!(escaped.matches("harborsql_clickbench_s3"));
+        assert!(!escaped.matches("harborsqlXclickbenchYs3"));
+        assert!(!contains_metadata_wildcard(r"hits\_optimized"));
+
+        let wildcard = MetadataPattern::new(Some("hits_optim%")).unwrap();
+        assert!(wildcard.matches("hits_optimized"));
+        assert!(contains_metadata_wildcard("hits_optim%"));
+    }
+
+    #[test]
+    fn column_metadata_maps_nullable_unknown_separately() {
+        let table = TableInfo {
+            table_id: Some("table-id".to_string()),
+            full_name: "workspace.analytics.fact_sales".to_string(),
+            name: Some("fact_sales".to_string()),
+            catalog_name: Some("workspace".to_string()),
+            schema_name: Some("analytics".to_string()),
+            table_type: Some("MANAGED".to_string()),
+            data_source_format: Some("DELTA".to_string()),
+            storage_location: None,
+            comment: None,
+            created_by: None,
+            columns: vec![
+                ColumnInfo {
+                    name: "required".to_string(),
+                    position: Some(0),
+                    type_name: Some("STRING".to_string()),
+                    type_text: Some("string".to_string()),
+                    type_precision: None,
+                    type_scale: None,
+                    nullable: Some(false),
+                    comment: None,
+                },
+                ColumnInfo {
+                    name: "optional".to_string(),
+                    position: Some(1),
+                    type_name: Some("STRING".to_string()),
+                    type_text: Some("string".to_string()),
+                    type_precision: None,
+                    type_scale: None,
+                    nullable: Some(true),
+                    comment: None,
+                },
+                ColumnInfo {
+                    name: "unknown".to_string(),
+                    position: Some(2),
+                    type_name: Some("STRING".to_string()),
+                    type_text: Some("string".to_string()),
+                    type_precision: None,
+                    type_scale: None,
+                    nullable: None,
+                    comment: None,
+                },
+            ],
+        };
+
+        let rows = super::column_metadata_rows(
+            &table,
+            "workspace",
+            "analytics",
+            "fact_sales",
+            &MetadataPattern::new(None).unwrap(),
+        );
+
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.column.as_str(), row.nullable, row.is_nullable.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("required", 0, "NO"),
+                ("optional", 1, "YES"),
+                ("unknown", 2, "")
+            ]
         );
     }
 

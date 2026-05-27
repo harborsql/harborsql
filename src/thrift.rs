@@ -4,14 +4,17 @@ use std::{
     time::{Duration, Instant},
 };
 
-use tokio::{sync::RwLock, task::JoinHandle};
+use tokio::{
+    sync::{RwLock, oneshot},
+    task::JoinHandle,
+};
 use tracing::{Instrument, field};
 use uuid::Uuid;
 
 use crate::{
     config::Config,
-    engine::{QueryEngine, QueryResult},
-    error::{HarborError, Result},
+    engine::{GetColumnsMetadataRequest, QueryEngine, QueryResult},
+    error::{ClientError, HarborError, Result},
     observability,
 };
 
@@ -38,6 +41,11 @@ pub struct DatabricksThriftService {
     engine: QueryEngine,
     sessions: Arc<RwLock<HashMap<String, SessionState>>>,
     operations: Arc<RwLock<HashMap<String, OperationState>>>,
+}
+
+enum OperationFinishOutcome {
+    Succeeded,
+    Failed(String),
 }
 
 impl DatabricksThriftService {
@@ -170,6 +178,141 @@ impl DatabricksThriftService {
                     request.info_type,
                     &session.catalog,
                 ))
+            }
+            "GetColumns" => {
+                let request = read_args(message.payload, read_get_columns_req)?;
+                self.cleanup_expired().await;
+                let Some(session) = self
+                    .session_for(request.session_handle.as_ref(), bearer_token)
+                    .await
+                else {
+                    return Ok(write_get_columns_invalid(
+                        message.seqid,
+                        "invalid session handle",
+                    ));
+                };
+                let operation_id = Uuid::new_v4();
+                let secret = Uuid::new_v4();
+                let query_id = operation_id.to_string();
+                let metadata_catalog = request.catalog_name;
+                let metadata_schema = request.schema_name;
+                let metadata_table = request.table_name;
+                let metadata_column = request.column_name;
+                let engine = self.engine.clone();
+                let token = bearer_token.to_string();
+                let default_catalog = session.catalog.clone();
+                let default_schema = session.schema.clone();
+                let session_id = session.id.clone();
+                let execution_query_id = query_id.clone();
+                let completion_query_id = query_id.clone();
+                let operations_for_task = self.operations.clone();
+                let (completion_sender, completion_receiver) = oneshot::channel();
+                let operation_started = Instant::now();
+                let operation_span = tracing::info_span!(
+                    "thrift_metadata_operation",
+                    method = "GetColumns",
+                    query_id = %query_id,
+                    session_id = %session.id
+                );
+                let mut operations = self.operations.write().await;
+                if operations.len() >= self.config.max_operations {
+                    return Ok(write_get_columns_error(
+                        message.seqid,
+                        "maximum operation count exceeded",
+                    ));
+                }
+
+                let task = tokio::spawn(async move {
+                    let completion = async move {
+                        let result = engine
+                            .get_columns_metadata(
+                                &token,
+                                GetColumnsMetadataRequest {
+                                    catalog: metadata_catalog.as_deref(),
+                                    schema: metadata_schema.as_deref(),
+                                    table: metadata_table.as_deref(),
+                                    column: metadata_column.as_deref(),
+                                },
+                                &default_catalog,
+                                &default_schema,
+                            )
+                            .await;
+                        let duration = operation_started.elapsed();
+                        match &result {
+                            Ok(result) => {
+                                tracing::info!(
+                                    query_id = %execution_query_id,
+                                    session_id = %session_id,
+                                    duration_ms = duration.as_millis() as u64,
+                                    row_count = result.row_count,
+                                    "Thrift metadata operation finished"
+                                );
+                            }
+                            Err(error) => error.log_internal("thrift GetColumns metadata"),
+                        }
+                        OperationCompletion {
+                            duration_ms: duration.as_millis() as u64,
+                            result: result.map_err(|err| err.client_error()),
+                        }
+                    }
+                    .instrument(operation_span)
+                    .await;
+                    let outcome = operation_completion_outcome(&completion);
+                    let mut operations = operations_for_task.write().await;
+                    let operation_completed = if let Some(operation) =
+                        operations.get_mut(&completion_query_id)
+                    {
+                        operation.state = OperationExecution::from_completion(completion.clone());
+                        tracing::info!(
+                            query_id = %completion_query_id,
+                            status = operation.state.history_status(),
+                            duration_ms = operation.state.duration_ms(),
+                            "Thrift operation completed"
+                        );
+                        true
+                    } else {
+                        false
+                    };
+                    let outcome_delivered = completion_sender.send(outcome).is_ok();
+                    if operation_completed
+                        && !outcome_delivered
+                        && operations.remove(&completion_query_id).is_some()
+                    {
+                        tracing::info!(
+                            query_id = %completion_query_id,
+                            "Thrift metadata operation removed before handle returned"
+                        );
+                    }
+                    record_operation_gauges(&operations);
+                    completion
+                });
+
+                operations.insert(
+                    query_id.clone(),
+                    OperationState {
+                        secret: *secret.as_bytes(),
+                        session_id: session.id.clone(),
+                        token_fingerprint: token_fingerprint(bearer_token),
+                        state: OperationExecution::Running {
+                            started: operation_started,
+                            task,
+                        },
+                    },
+                );
+                record_operation_gauges(&operations);
+                drop(operations);
+
+                match await_operation_completion(completion_receiver).await {
+                    OperationFinishOutcome::Succeeded => Ok(write_get_columns_response(
+                        message.seqid,
+                        operation_id.as_bytes(),
+                        secret.as_bytes(),
+                    )),
+                    OperationFinishOutcome::Failed(error_message) => {
+                        self.remove_unreturned_operation(&query_id).await;
+                        Ok(write_get_columns_error(message.seqid, &error_message))
+                    }
+                }
             }
             "ExecuteStatement" => {
                 let request = read_args(message.payload, read_execute_statement_req)?;
@@ -559,6 +702,14 @@ impl DatabricksThriftService {
         true
     }
 
+    async fn remove_unreturned_operation(&self, operation_id: &str) {
+        let mut operations = self.operations.write().await;
+        if let Some(operation) = operations.remove(operation_id) {
+            operation.abort();
+            record_operation_gauges(&operations);
+        }
+    }
+
     async fn refresh_operation(&self, operation_id: &str) {
         let finished_task = {
             let mut operations = self.operations.write().await;
@@ -644,6 +795,21 @@ fn record_operation_gauges(operations: &HashMap<String, OperationState>) {
     metrics.set_gauge("harborsql_thrift_active_operations", active as i64);
 }
 
+async fn await_operation_completion(
+    receiver: oneshot::Receiver<OperationFinishOutcome>,
+) -> OperationFinishOutcome {
+    receiver.await.unwrap_or_else(|_| {
+        OperationFinishOutcome::Failed(ClientError::internal().status_message())
+    })
+}
+
+fn operation_completion_outcome(completion: &OperationCompletion) -> OperationFinishOutcome {
+    match &completion.result {
+        Ok(_) => OperationFinishOutcome::Succeeded,
+        Err(error) => OperationFinishOutcome::Failed(error.status_message()),
+    }
+}
+
 #[derive(Debug)]
 struct Message<'a> {
     name: String,
@@ -668,6 +834,15 @@ struct CloseSessionReq {
 struct GetInfoReq {
     session_handle: Option<Handle>,
     info_type: i32,
+}
+
+#[derive(Debug)]
+struct GetColumnsReq {
+    session_handle: Option<Handle>,
+    catalog_name: Option<String>,
+    schema_name: Option<String>,
+    table_name: Option<String>,
+    column_name: Option<String>,
 }
 
 #[derive(Debug)]
@@ -824,6 +999,35 @@ fn read_get_info_req(reader: &mut Reader<'_>) -> Result<GetInfoReq> {
     Ok(GetInfoReq {
         session_handle,
         info_type: info_type.unwrap_or(CLI_DBMS_NAME),
+    })
+}
+
+fn read_get_columns_req(reader: &mut Reader<'_>) -> Result<GetColumnsReq> {
+    let mut session_handle = None;
+    let mut catalog_name = None;
+    let mut schema_name = None;
+    let mut table_name = None;
+    let mut column_name = None;
+    loop {
+        let (field_type, field_id) = reader.read_field_begin()?;
+        if field_type == T_STOP {
+            break;
+        }
+        match (field_id, field_type) {
+            (1, T_STRUCT) => session_handle = read_session_handle(reader)?,
+            (2, T_STRING) => catalog_name = Some(reader.read_string()?),
+            (3, T_STRING) => schema_name = Some(reader.read_string()?),
+            (4, T_STRING) => table_name = Some(reader.read_string()?),
+            (5, T_STRING) => column_name = Some(reader.read_string()?),
+            _ => reader.skip(field_type)?,
+        }
+    }
+    Ok(GetColumnsReq {
+        session_handle,
+        catalog_name,
+        schema_name,
+        table_name,
+        column_name,
     })
 }
 
@@ -1033,6 +1237,36 @@ fn write_get_info_invalid(seqid: i32) -> Vec<u8> {
         });
         writer.write_field(T_STRUCT, 2, |writer| {
             write_get_info_string_value(writer, "");
+        });
+        writer.write_stop();
+    })
+}
+
+fn write_get_columns_response(seqid: i32, guid: &[u8; 16], secret: &[u8; 16]) -> Vec<u8> {
+    write_success_response("GetColumns", seqid, |writer| {
+        writer.write_field(T_STRUCT, 1, |writer| {
+            write_status(writer, SUCCESS_STATUS, None)
+        });
+        writer.write_field(T_STRUCT, 2, |writer| {
+            write_operation_handle_with_type(writer, guid, secret, true, GET_COLUMNS);
+        });
+        writer.write_stop();
+    })
+}
+
+fn write_get_columns_error(seqid: i32, message: &str) -> Vec<u8> {
+    write_success_response("GetColumns", seqid, |writer| {
+        writer.write_field(T_STRUCT, 1, |writer| {
+            write_status(writer, ERROR_STATUS, Some(message))
+        });
+        writer.write_stop();
+    })
+}
+
+fn write_get_columns_invalid(seqid: i32, message: &str) -> Vec<u8> {
+    write_success_response("GetColumns", seqid, |writer| {
+        writer.write_field(T_STRUCT, 1, |writer| {
+            write_status(writer, INVALID_HANDLE_STATUS, Some(message))
         });
         writer.write_stop();
     })
@@ -1291,10 +1525,20 @@ fn write_operation_handle(
     secret: &[u8; 16],
     has_result_set: bool,
 ) {
+    write_operation_handle_with_type(writer, guid, secret, has_result_set, EXECUTE_STATEMENT);
+}
+
+fn write_operation_handle_with_type(
+    writer: &mut Writer,
+    guid: &[u8; 16],
+    secret: &[u8; 16],
+    has_result_set: bool,
+    operation_type: i32,
+) {
     writer.write_field(T_STRUCT, 1, |writer| {
         write_handle_identifier(writer, guid, secret);
     });
-    writer.write_field(T_I32, 2, |writer| writer.write_i32(EXECUTE_STATEMENT));
+    writer.write_field(T_I32, 2, |writer| writer.write_i32(operation_type));
     writer.write_field(T_BOOL, 3, |writer| writer.write_bool(has_result_set));
     writer.write_stop();
 }

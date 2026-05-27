@@ -45,6 +45,8 @@ pub(super) const STRUCT_TYPE: i32 = 12;
 pub(super) const DECIMAL_TYPE: i32 = 15;
 pub(super) const DATE_TYPE: i32 = 17;
 
+pub(super) const GET_COLUMNS: i32 = 6;
+
 pub(super) const CLI_MAX_DRIVER_CONNECTIONS: i32 = 0;
 pub(super) const CLI_MAX_CONCURRENT_ACTIVITIES: i32 = 1;
 pub(super) const CLI_DATA_SOURCE_NAME: i32 = 2;
