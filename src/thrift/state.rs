@@ -59,7 +59,6 @@ impl OperationState {
         if !self.has_finished_task() {
             return None;
         }
-
         let state = std::mem::replace(
             &mut self.state,
             OperationExecution::Refreshing {
@@ -243,6 +242,7 @@ impl OperationExecution {
     }
 }
 
+#[derive(Clone)]
 pub(super) struct OperationCompletion {
     pub(super) duration_ms: u64,
     pub(super) result: std::result::Result<QueryResult, ClientError>,

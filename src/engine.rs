@@ -2434,6 +2434,121 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_columns_metadata_with_wildcard_table_pattern_returns_view_columns() {
+        let unity = Arc::new(RecordingUnity::new());
+        let calls = unity.calls.clone();
+        let opener = Arc::new(MockTableOpener::ok());
+        let engine = QueryEngine::with_dependencies(test_config(), unity, opener.clone());
+
+        let result = engine
+            .get_columns_metadata(
+                "token-get-columns",
+                GetColumnsMetadataRequest {
+                    catalog: Some("workspace"),
+                    schema: Some("analytics"),
+                    table: Some("daily%"),
+                    column: Some("cust_cd"),
+                },
+                "workspace",
+                "default",
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.row_count, 1);
+        assert_eq!(result_string_column(&result, 1), vec!["analytics"]);
+        assert_eq!(result_string_column(&result, 2), vec!["daily_sales"]);
+        assert_eq!(result_string_column(&result, 3), vec!["cust_cd"]);
+        let calls = calls.lock().unwrap();
+        assert_eq!(
+            calls.tables,
+            vec![(
+                "token-get-columns".to_string(),
+                "workspace".to_string(),
+                "analytics".to_string()
+            )]
+        );
+        assert_eq!(
+            calls.table,
+            vec![(
+                "token-get-columns".to_string(),
+                "workspace.analytics.daily_sales".to_string()
+            )]
+        );
+        assert!(calls.temporary_credentials.is_empty());
+        assert_eq!(opener.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn get_columns_metadata_without_schema_lists_all_schemas() {
+        let unity = Arc::new(RecordingUnity::new());
+        let calls = unity.calls.clone();
+        let opener = Arc::new(MockTableOpener::ok());
+        let engine = QueryEngine::with_dependencies(test_config(), unity, opener.clone());
+
+        let result = engine
+            .get_columns_metadata(
+                "token-get-columns",
+                GetColumnsMetadataRequest {
+                    catalog: Some("workspace"),
+                    schema: None,
+                    table: Some("fact_sales"),
+                    column: Some("cust_cd"),
+                },
+                "workspace",
+                "default",
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.row_count, 2);
+        assert_eq!(
+            result_string_column(&result, 1),
+            vec!["analytics", "default"]
+        );
+        assert_eq!(
+            result_string_column(&result, 2),
+            vec!["fact_sales", "fact_sales"]
+        );
+        assert_eq!(result_string_column(&result, 3), vec!["cust_cd", "cust_cd"]);
+        let calls = calls.lock().unwrap();
+        assert_eq!(
+            calls.schemas,
+            vec![("token-get-columns".to_string(), "workspace".to_string())]
+        );
+        assert_eq!(
+            calls.tables,
+            vec![
+                (
+                    "token-get-columns".to_string(),
+                    "workspace".to_string(),
+                    "analytics".to_string()
+                ),
+                (
+                    "token-get-columns".to_string(),
+                    "workspace".to_string(),
+                    "default".to_string()
+                ),
+            ]
+        );
+        assert_eq!(
+            calls.table,
+            vec![
+                (
+                    "token-get-columns".to_string(),
+                    "workspace.analytics.fact_sales".to_string()
+                ),
+                (
+                    "token-get-columns".to_string(),
+                    "workspace.default.fact_sales".to_string()
+                ),
+            ]
+        );
+        assert!(calls.temporary_credentials.is_empty());
+        assert_eq!(opener.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn execute_show_table_extended_fetches_each_match_with_received_token() {
         let unity = Arc::new(RecordingUnity::new());
         let calls = unity.calls.clone();

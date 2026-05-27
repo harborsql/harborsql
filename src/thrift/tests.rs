@@ -1,11 +1,15 @@
 use std::{
     net::SocketAddr,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
 
 use axum::{
     Router,
+    extract::State,
     http::{StatusCode, Uri, header},
     response::{IntoResponse, Response},
     routing::get,
@@ -20,7 +24,7 @@ use datafusion::arrow::{
     datatypes::{DataType, Field, Schema, TimeUnit},
     record_batch::RecordBatch,
 };
-use tokio::{net::TcpListener, task::JoinHandle};
+use tokio::{net::TcpListener, sync::Notify, task::JoinHandle};
 
 use crate::{engine::Column, error::ClientError};
 
@@ -290,6 +294,122 @@ async fn service_handles_get_columns_metadata_operation() {
             Some("UserID".to_string()),
         ]
     );
+}
+
+#[tokio::test]
+async fn get_columns_reserves_operation_slot_while_metadata_is_pending() {
+    let unity = BlockingUnityServer::new().await;
+    let mut config = test_config();
+    config.databricks_host = unity.host.clone();
+    config.max_operations = 1;
+    let service = DatabricksThriftService::new(config.clone(), QueryEngine::new(config));
+    let token = "test-token";
+
+    let open_response = service
+        .handle(token, &open_session_call(1, "workspace", "analytics"))
+        .await
+        .unwrap();
+    let session = read_handle_response(&open_response, "OpenSession", 3, read_session_handle);
+
+    let first_call = get_columns_call(
+        2,
+        &session,
+        Some("workspace"),
+        Some("analytics"),
+        Some("hits"),
+        Some("User%"),
+    );
+    let first_service = service.clone();
+    let first =
+        tokio::spawn(async move { first_service.handle(token, &first_call).await.unwrap() });
+    tokio::time::timeout(Duration::from_secs(5), unity.wait_for_requests(1))
+        .await
+        .expect("first GetColumns should reach Unity");
+
+    assert_eq!(service.operations.read().await.len(), 1);
+
+    let second_response = tokio::time::timeout(
+        Duration::from_secs(5),
+        service.handle(
+            token,
+            &get_columns_call(
+                3,
+                &session,
+                Some("workspace"),
+                Some("analytics"),
+                Some("hits"),
+                Some("User%"),
+            ),
+        ),
+    )
+    .await
+    .expect("second GetColumns should be rejected without waiting for Unity")
+    .unwrap();
+    let (status, message) = read_top_level_status_and_message(&second_response, "GetColumns");
+    assert_eq!(status, ERROR_STATUS);
+    assert_eq!(message.as_deref(), Some("maximum operation count exceeded"));
+    assert_eq!(unity.request_count(), 1);
+
+    unity.release_one();
+    let first_response = tokio::time::timeout(Duration::from_secs(5), first)
+        .await
+        .expect("first GetColumns should finish after Unity is released")
+        .unwrap();
+    let (operation, operation_type, has_result_set) =
+        read_operation_handle_response(&first_response, "GetColumns");
+    assert_eq!(operation_type, GET_COLUMNS);
+    assert!(has_result_set);
+
+    let status_response = service
+        .handle(token, &operation_call("GetOperationStatus", 4, &operation))
+        .await
+        .unwrap();
+    assert_eq!(
+        read_operation_status_response(&status_response),
+        (SUCCESS_STATUS, FINISHED_STATE, true)
+    );
+}
+
+#[tokio::test]
+async fn canceled_get_columns_request_does_not_leave_active_operation() {
+    let unity = BlockingUnityServer::new().await;
+    let mut config = test_config();
+    config.databricks_host = unity.host.clone();
+    config.max_operations = 1;
+    let service = DatabricksThriftService::new(config.clone(), QueryEngine::new(config));
+    let token = "test-token";
+
+    let open_response = service
+        .handle(token, &open_session_call(1, "workspace", "analytics"))
+        .await
+        .unwrap();
+    let session = read_handle_response(&open_response, "OpenSession", 3, read_session_handle);
+
+    let call = get_columns_call(
+        2,
+        &session,
+        Some("workspace"),
+        Some("analytics"),
+        Some("hits"),
+        Some("User%"),
+    );
+    let pending_service = service.clone();
+    let pending = tokio::spawn(async move { pending_service.handle(token, &call).await.unwrap() });
+    tokio::time::timeout(Duration::from_secs(5), unity.wait_for_requests(1))
+        .await
+        .expect("GetColumns should reach Unity before cancellation");
+
+    let operations = service.operations.read().await;
+    assert_eq!(operations.len(), 1);
+    assert!(operations.values().all(|operation| operation.is_active()));
+    drop(operations);
+
+    pending.abort();
+    assert!(pending.await.unwrap_err().is_cancelled());
+
+    unity.release_one();
+    wait_for_no_operations(&service).await;
+    assert!(service.operations.read().await.is_empty());
 }
 
 #[tokio::test]
@@ -1677,6 +1797,19 @@ fn read_status(reader: &mut Reader<'_>) -> (i32, Option<String>) {
     (status.unwrap(), message)
 }
 
+async fn wait_for_no_operations(service: &DatabricksThriftService) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if service.operations.read().await.is_empty() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("unreturned operation should be removed after metadata completion");
+}
+
 fn success_reader<'a>(response: &'a [u8], method: &str) -> Reader<'a> {
     let message = decode_message(response).unwrap();
     assert_eq!(message.name, method);
@@ -1686,6 +1819,40 @@ fn success_reader<'a>(response: &'a [u8], method: &str) -> Reader<'a> {
     assert_eq!((field_type, field_id), (T_STRUCT, 0));
     reader
 }
+
+const UNITY_HITS_TABLE_JSON: &str = r#"{
+    "table_id":"table-id",
+    "full_name":"workspace.analytics.hits",
+    "name":"hits",
+    "catalog_name":"workspace",
+    "schema_name":"analytics",
+    "table_type":"MANAGED",
+    "data_source_format":"DELTA",
+    "columns":[
+        {
+            "name":"EventDate",
+            "position":0,
+            "type_name":"DATE",
+            "type_text":"date",
+            "nullable":false,
+            "comment":"event date"
+        },
+        {
+            "name":"UserID",
+            "position":1,
+            "type_name":"BIGINT",
+            "type_text":"bigint",
+            "nullable":true
+        },
+        {
+            "name":"URL",
+            "position":2,
+            "type_name":"STRING",
+            "type_text":"string",
+            "nullable":true
+        }
+    ]
+}"#;
 
 struct TestUnityServer {
     host: String,
@@ -1713,45 +1880,81 @@ impl Drop for TestUnityServer {
     }
 }
 
+struct BlockingUnityServer {
+    host: String,
+    task: JoinHandle<()>,
+    state: Arc<BlockingUnityState>,
+}
+
+struct BlockingUnityState {
+    requests: AtomicUsize,
+    received: Notify,
+    release: Notify,
+}
+
+impl BlockingUnityServer {
+    async fn new() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let state = Arc::new(BlockingUnityState {
+            requests: AtomicUsize::new(0),
+            received: Notify::new(),
+            release: Notify::new(),
+        });
+        let app = Router::new()
+            .route("/{*path}", get(blocking_unity_test_handler))
+            .with_state(state.clone());
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        Self {
+            host: format!("http://{}", socket_addr(addr)),
+            task,
+            state,
+        }
+    }
+
+    async fn wait_for_requests(&self, expected: usize) {
+        while self.request_count() < expected {
+            self.state.received.notified().await;
+        }
+    }
+
+    fn request_count(&self) -> usize {
+        self.state.requests.load(Ordering::SeqCst)
+    }
+
+    fn release_one(&self) {
+        self.state.release.notify_one();
+    }
+}
+
+impl Drop for BlockingUnityServer {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 async fn unity_test_handler(uri: Uri) -> Response {
     match uri.path() {
-        "/api/2.1/unity-catalog/tables/workspace.analytics.hits" => json_response(
-            StatusCode::OK,
-            r#"{
-                "table_id":"table-id",
-                "full_name":"workspace.analytics.hits",
-                "name":"hits",
-                "catalog_name":"workspace",
-                "schema_name":"analytics",
-                "table_type":"MANAGED",
-                "data_source_format":"DELTA",
-                "columns":[
-                    {
-                        "name":"EventDate",
-                        "position":0,
-                        "type_name":"DATE",
-                        "type_text":"date",
-                        "nullable":false,
-                        "comment":"event date"
-                    },
-                    {
-                        "name":"UserID",
-                        "position":1,
-                        "type_name":"BIGINT",
-                        "type_text":"bigint",
-                        "nullable":true
-                    },
-                    {
-                        "name":"URL",
-                        "position":2,
-                        "type_name":"STRING",
-                        "type_text":"string",
-                        "nullable":true
-                    }
-                ]
-            }"#
-            .into(),
-        ),
+        "/api/2.1/unity-catalog/tables/workspace.analytics.hits" => {
+            json_response(StatusCode::OK, UNITY_HITS_TABLE_JSON.to_string())
+        }
+        _ => json_response(StatusCode::NOT_FOUND, r#"{"message":"not found"}"#.into()),
+    }
+}
+
+async fn blocking_unity_test_handler(
+    State(state): State<Arc<BlockingUnityState>>,
+    uri: Uri,
+) -> Response {
+    state.requests.fetch_add(1, Ordering::SeqCst);
+    state.received.notify_one();
+    match uri.path() {
+        "/api/2.1/unity-catalog/tables/workspace.analytics.hits" => {
+            state.release.notified().await;
+            json_response(StatusCode::OK, UNITY_HITS_TABLE_JSON.to_string())
+        }
         _ => json_response(StatusCode::NOT_FOUND, r#"{"message":"not found"}"#.into()),
     }
 }

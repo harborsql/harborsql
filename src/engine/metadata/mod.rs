@@ -172,16 +172,9 @@ pub(super) async fn get_columns(
     bearer_token: &str,
     request: GetColumnsRequest,
     default_catalog: &str,
-    default_schema: &str,
+    _default_schema: &str,
 ) -> Result<QueryResult> {
-    execute_get_columns(
-        unity,
-        bearer_token,
-        request,
-        default_catalog,
-        default_schema,
-    )
-    .await
+    execute_get_columns(unity, bearer_token, request, default_catalog).await
 }
 
 async fn execute_metadata_statement<S>(
@@ -302,7 +295,6 @@ async fn execute_get_columns<S>(
     bearer_token: &str,
     request: GetColumnsRequest,
     default_catalog: &str,
-    default_schema: &str,
 ) -> Result<QueryResult>
 where
     S: MetadataSource + ?Sized,
@@ -319,14 +311,9 @@ where
     let mut rows = Vec::new();
 
     for catalog in catalogs {
-        let schemas = resolve_schema_candidates(
-            source,
-            bearer_token,
-            &catalog,
-            request.schema.as_deref(),
-            default_schema,
-        )
-        .await?;
+        let schemas =
+            resolve_schema_candidates(source, bearer_token, &catalog, request.schema.as_deref())
+                .await?;
         for schema in schemas {
             let tables = resolve_table_candidates(
                 source,
@@ -439,19 +426,30 @@ async fn resolve_schema_candidates<S>(
     bearer_token: &str,
     catalog: &str,
     schema: Option<&str>,
-    default_schema: &str,
 ) -> Result<Vec<String>>
 where
     S: MetadataSource + ?Sized,
 {
-    let Some(schema) = schema.filter(|value| !value.is_empty()) else {
-        return Ok(vec![default_schema.to_string()]);
-    };
-    if !contains_metadata_wildcard(schema) {
-        return Ok(vec![strip_metadata_escapes(schema)]);
+    match schema {
+        None => list_schema_candidates(source, bearer_token, catalog, None).await,
+        Some("") => Ok(Vec::new()),
+        Some(schema) if !contains_metadata_wildcard(schema) => {
+            Ok(vec![strip_metadata_escapes(schema)])
+        }
+        Some(schema) => list_schema_candidates(source, bearer_token, catalog, Some(schema)).await,
     }
+}
 
-    let pattern = MetadataPattern::new(Some(schema))?;
+async fn list_schema_candidates<S>(
+    source: &S,
+    bearer_token: &str,
+    catalog: &str,
+    pattern: Option<&str>,
+) -> Result<Vec<String>>
+where
+    S: MetadataSource + ?Sized,
+{
+    let pattern = MetadataPattern::new(pattern)?;
     let mut schemas = source
         .list_schemas(bearer_token, catalog)
         .await?
@@ -501,7 +499,6 @@ where
         .list_tables(bearer_token, catalog, schema)
         .await?
         .into_iter()
-        .filter(is_table_like)
         .filter_map(|table| {
             let name = table_name(&table);
             pattern.matches(&name).then_some(TableRow {
@@ -674,10 +671,10 @@ fn column_metadata_rows(
             let ordinal = column.position.unwrap_or(index as i32) + 1;
             let type_name = column_type_name(column);
             let data_type = jdbc_data_type(&type_name);
-            let nullable = if column.nullable.unwrap_or(true) {
-                1
-            } else {
-                0
+            let (nullable, is_nullable) = match column.nullable {
+                Some(false) => (0, "NO"),
+                Some(true) => (1, "YES"),
+                None => (2, ""),
             };
             ColumnMetadataRow {
                 catalog: table
@@ -701,7 +698,7 @@ fn column_metadata_rows(
                 sql_datetime_sub: sql_datetime_sub(&type_name),
                 char_octet_length: char_octet_length(&type_name),
                 ordinal_position: ordinal,
-                is_nullable: if nullable == 0 { "NO" } else { "YES" }.to_string(),
+                is_nullable: is_nullable.to_string(),
             }
         })
         .collect()
@@ -970,6 +967,8 @@ fn table_information(table: &TableInfo) -> String {
 
 #[cfg(test)]
 mod tests {
+    use crate::unity::{ColumnInfo, TableInfo};
+
     use super::{
         GetColumnsRequest, MetadataPattern, ObjectName, contains_metadata_wildcard,
         normalize_get_columns_request, pattern::ShowPattern, resolve_schema, resolve_table,
@@ -1096,6 +1095,73 @@ mod tests {
         let wildcard = MetadataPattern::new(Some("hits_optim%")).unwrap();
         assert!(wildcard.matches("hits_optimized"));
         assert!(contains_metadata_wildcard("hits_optim%"));
+    }
+
+    #[test]
+    fn column_metadata_maps_nullable_unknown_separately() {
+        let table = TableInfo {
+            table_id: Some("table-id".to_string()),
+            full_name: "workspace.analytics.fact_sales".to_string(),
+            name: Some("fact_sales".to_string()),
+            catalog_name: Some("workspace".to_string()),
+            schema_name: Some("analytics".to_string()),
+            table_type: Some("MANAGED".to_string()),
+            data_source_format: Some("DELTA".to_string()),
+            storage_location: None,
+            comment: None,
+            created_by: None,
+            columns: vec![
+                ColumnInfo {
+                    name: "required".to_string(),
+                    position: Some(0),
+                    type_name: Some("STRING".to_string()),
+                    type_text: Some("string".to_string()),
+                    type_precision: None,
+                    type_scale: None,
+                    nullable: Some(false),
+                    comment: None,
+                },
+                ColumnInfo {
+                    name: "optional".to_string(),
+                    position: Some(1),
+                    type_name: Some("STRING".to_string()),
+                    type_text: Some("string".to_string()),
+                    type_precision: None,
+                    type_scale: None,
+                    nullable: Some(true),
+                    comment: None,
+                },
+                ColumnInfo {
+                    name: "unknown".to_string(),
+                    position: Some(2),
+                    type_name: Some("STRING".to_string()),
+                    type_text: Some("string".to_string()),
+                    type_precision: None,
+                    type_scale: None,
+                    nullable: None,
+                    comment: None,
+                },
+            ],
+        };
+
+        let rows = super::column_metadata_rows(
+            &table,
+            "workspace",
+            "analytics",
+            "fact_sales",
+            &MetadataPattern::new(None).unwrap(),
+        );
+
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.column.as_str(), row.nullable, row.is_nullable.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("required", 0, "NO"),
+                ("optional", 1, "YES"),
+                ("unknown", 2, "")
+            ]
+        );
     }
 
     #[test]
