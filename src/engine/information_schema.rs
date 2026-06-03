@@ -293,7 +293,7 @@ impl SystemTableProvider {
 
     async fn catalog_rows(&self, filters: &MetadataFilters) -> Result<Vec<SystemRow>> {
         let rows = self
-            .catalogs(filters)
+            .catalogs_for_catalog_rows(filters)
             .await?
             .into_iter()
             .map(|catalog| {
@@ -314,6 +314,25 @@ impl SystemTableProvider {
             })
             .collect();
         Ok(rows)
+    }
+
+    async fn catalogs_for_catalog_rows(
+        &self,
+        filters: &MetadataFilters,
+    ) -> Result<Vec<CatalogInfo>> {
+        let catalogs = self.unity.catalogs(&self.bearer_token).await?;
+        if let Some(catalog_scope) = &self.catalog_scope {
+            return Ok(catalogs
+                .into_iter()
+                .filter(|catalog| catalog.name.eq_ignore_ascii_case(catalog_scope))
+                .filter(|catalog| filters.matches_catalog(&catalog.name))
+                .collect());
+        }
+
+        Ok(catalogs
+            .into_iter()
+            .filter(|catalog| filters.matches_catalog(&catalog.name))
+            .collect())
     }
 
     async fn schemata_rows(&self, filters: &MetadataFilters) -> Result<Vec<SystemRow>> {
@@ -497,12 +516,11 @@ impl TableProvider for SystemTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>, DataFusionError> {
-        let rows =
-            if matches!(self.mode, SystemTableMode::DatabricksSystemTable) && limit == Some(0) {
-                Vec::new()
-            } else {
-                self.load_rows(filters).await.map_err(to_datafusion_error)?
-            };
+        let rows = if limit == Some(0) {
+            Vec::new()
+        } else {
+            self.load_rows(filters).await.map_err(to_datafusion_error)?
+        };
         let batch = record_batch_from_rows(self.schema(), rows).map_err(to_datafusion_error)?;
         let table = MemTable::try_new(self.schema(), vec![vec![batch]])?;
         table.scan(state, projection, filters, limit).await

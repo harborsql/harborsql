@@ -2447,6 +2447,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_catalog_information_schema_catalogs_validates_catalog_scope() {
+        let unity = Arc::new(RecordingUnity::new());
+        let calls = unity.calls.clone();
+        let opener = Arc::new(MockTableOpener::ok());
+        let engine = QueryEngine::with_dependencies(test_config(), unity, opener.clone());
+
+        let result = engine
+            .execute(
+                "token-catalog-scope",
+                "SELECT catalog_name FROM bogus.information_schema.catalogs",
+                "workspace",
+                "default",
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.row_count, 0);
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.catalogs, vec!["token-catalog-scope".to_string()]);
+        assert!(calls.schemas.is_empty());
+        assert!(calls.tables.is_empty());
+        assert_eq!(
+            calls.table,
+            vec![(
+                "token-catalog-scope".to_string(),
+                "system.information_schema.catalogs".to_string()
+            )]
+        );
+        assert!(calls.temporary_credentials.is_empty());
+        assert_eq!(opener.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn execute_system_information_schema_columns_uses_unity_table_details() {
         let unity = Arc::new(RecordingUnity::new());
         let calls = unity.calls.clone();
@@ -2486,6 +2519,39 @@ mod tests {
                     "workspace.analytics.fact_sales".to_string()
                 )
             ]
+        );
+        assert!(calls.temporary_credentials.is_empty());
+        assert_eq!(opener.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn execute_system_information_schema_limit_zero_skips_metadata_enumeration() {
+        let unity = Arc::new(RecordingUnity::new());
+        let calls = unity.calls.clone();
+        let opener = Arc::new(MockTableOpener::ok());
+        let engine = QueryEngine::with_dependencies(test_config(), unity, opener.clone());
+
+        let result = engine
+            .execute(
+                "token-info-limit-zero",
+                "SELECT * FROM system.information_schema.columns LIMIT 0",
+                "workspace",
+                "default",
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.row_count, 0);
+        let calls = calls.lock().unwrap();
+        assert!(calls.catalogs.is_empty());
+        assert!(calls.schemas.is_empty());
+        assert!(calls.tables.is_empty());
+        assert_eq!(
+            calls.table,
+            vec![(
+                "token-info-limit-zero".to_string(),
+                "system.information_schema.columns".to_string()
+            )]
         );
         assert!(calls.temporary_credentials.is_empty());
         assert_eq!(opener.calls.load(Ordering::SeqCst), 0);
@@ -3271,11 +3337,24 @@ mod tests {
             updated_at: Some(0),
             updated_by: Some("System user".to_string()),
             columns: match table_name {
+                "catalogs" => information_schema_catalogs_columns(),
                 "tables" => information_schema_tables_columns(),
                 "columns" => information_schema_columns_columns(),
                 _ => Vec::new(),
             },
         }
+    }
+
+    fn information_schema_catalogs_columns() -> Vec<ColumnInfo> {
+        vec![
+            test_column("catalog_name", 0, "string", false),
+            test_column("catalog_owner", 1, "string", false),
+            test_column("comment", 2, "string", true),
+            test_column("created", 3, "timestamp", false),
+            test_column("created_by", 4, "string", false),
+            test_column("last_altered", 5, "timestamp", false),
+            test_column("last_altered_by", 6, "string", false),
+        ]
     }
 
     fn system_access_audit_table_info() -> TableInfo {
