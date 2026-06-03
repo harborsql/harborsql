@@ -42,6 +42,7 @@ use crate::{
 };
 
 mod catalog;
+mod information_schema;
 mod metadata;
 mod results;
 
@@ -289,7 +290,8 @@ impl QueryEngine {
         let stream = dataframe
             .execute_stream()
             .instrument(tracing::info_span!("datafusion_execution"))
-            .await?;
+            .await
+            .map_err(harbor_error_from_datafusion)?;
         observability::get()
             .metrics()
             .observe_duration("datafusion_execute_stream", execution_started.elapsed());
@@ -2329,6 +2331,227 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_system_information_schema_tables_uses_unity_metadata_without_opening_storage()
+    {
+        let unity = Arc::new(RecordingUnity::new());
+        let calls = unity.calls.clone();
+        let opener = Arc::new(MockTableOpener::ok());
+        let engine = QueryEngine::with_dependencies(test_config(), unity, opener.clone());
+
+        let result = engine
+            .execute(
+                "token-info-schema",
+                "SELECT table_catalog, table_schema, table_name, table_type \
+                 FROM system.information_schema.tables \
+                 WHERE table_catalog = 'workspace' AND table_schema = 'analytics' \
+                 ORDER BY table_name",
+                "workspace",
+                "default",
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.row_count, 3);
+        assert_eq!(
+            result_string_column(&result, 0),
+            vec!["workspace", "workspace", "workspace"]
+        );
+        assert_eq!(
+            result_string_column(&result, 1),
+            vec!["analytics", "analytics", "analytics"]
+        );
+        assert_eq!(
+            result_string_column(&result, 2),
+            vec!["daily_sales", "dim_store", "fact_sales"]
+        );
+        assert_eq!(
+            result_string_column(&result, 3),
+            vec!["VIEW", "EXTERNAL", "MANAGED"]
+        );
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.catalogs, vec!["token-info-schema".to_string()]);
+        assert_eq!(
+            calls.schemas,
+            vec![("token-info-schema".to_string(), "workspace".to_string())]
+        );
+        assert_eq!(
+            calls.tables,
+            vec![(
+                "token-info-schema".to_string(),
+                "workspace".to_string(),
+                "analytics".to_string()
+            )]
+        );
+        assert_eq!(
+            calls.table,
+            vec![(
+                "token-info-schema".to_string(),
+                "system.information_schema.tables".to_string()
+            )]
+        );
+        assert!(calls.temporary_credentials.is_empty());
+        assert_eq!(opener.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn execute_catalog_information_schema_tables_scopes_to_that_catalog() {
+        let unity = Arc::new(RecordingUnity::new());
+        let calls = unity.calls.clone();
+        let opener = Arc::new(MockTableOpener::ok());
+        let engine = QueryEngine::with_dependencies(test_config(), unity, opener.clone());
+
+        let result = engine
+            .execute(
+                "token-catalog-info-schema",
+                "SELECT table_name \
+                 FROM workspace.information_schema.tables \
+                 WHERE table_schema = 'default' \
+                 ORDER BY table_name",
+                "workspace",
+                "default",
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.row_count, 3);
+        assert_eq!(
+            result_string_column(&result, 0),
+            vec!["daily_sales", "dim_store", "fact_sales"]
+        );
+        let calls = calls.lock().unwrap();
+        assert!(calls.catalogs.is_empty());
+        assert_eq!(
+            calls.schemas,
+            vec![(
+                "token-catalog-info-schema".to_string(),
+                "workspace".to_string()
+            )]
+        );
+        assert_eq!(
+            calls.tables,
+            vec![(
+                "token-catalog-info-schema".to_string(),
+                "workspace".to_string(),
+                "default".to_string()
+            )]
+        );
+        assert_eq!(
+            calls.table,
+            vec![(
+                "token-catalog-info-schema".to_string(),
+                "system.information_schema.tables".to_string()
+            )]
+        );
+        assert!(calls.temporary_credentials.is_empty());
+        assert_eq!(opener.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn execute_system_information_schema_columns_uses_unity_table_details() {
+        let unity = Arc::new(RecordingUnity::new());
+        let calls = unity.calls.clone();
+        let opener = Arc::new(MockTableOpener::ok());
+        let engine = QueryEngine::with_dependencies(test_config(), unity, opener.clone());
+
+        let result = engine
+            .execute(
+                "token-info-columns",
+                "SELECT table_name, column_name, ordinal_position, full_data_type \
+                 FROM system.information_schema.columns \
+                 WHERE table_catalog = 'workspace' \
+                   AND table_schema = 'analytics' \
+                   AND table_name = 'fact_sales' \
+                   AND column_name = 'cust_cd'",
+                "workspace",
+                "default",
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.row_count, 1);
+        assert_eq!(result_string_column(&result, 0), vec!["fact_sales"]);
+        assert_eq!(result_string_column(&result, 1), vec!["cust_cd"]);
+        assert_eq!(result_i32_column(&result, 2), vec![1]);
+        assert_eq!(result_string_column(&result, 3), vec!["BIGINT"]);
+        let calls = calls.lock().unwrap();
+        assert_eq!(
+            calls.table,
+            vec![
+                (
+                    "token-info-columns".to_string(),
+                    "system.information_schema.columns".to_string()
+                ),
+                (
+                    "token-info-columns".to_string(),
+                    "workspace.analytics.fact_sales".to_string()
+                )
+            ]
+        );
+        assert!(calls.temporary_credentials.is_empty());
+        assert_eq!(opener.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn execute_system_databricks_table_limit_zero_returns_schema_without_opening_storage() {
+        let unity = Arc::new(RecordingUnity::new());
+        let calls = unity.calls.clone();
+        let opener = Arc::new(MockTableOpener::ok());
+        let engine = QueryEngine::with_dependencies(test_config(), unity, opener.clone());
+
+        let result = engine
+            .execute(
+                "token-system-table",
+                "SELECT account_id, event_time FROM system.access.audit LIMIT 0",
+                "workspace",
+                "default",
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.row_count, 0);
+        assert_eq!(
+            result
+                .columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["account_id", "event_time"]
+        );
+        let calls = calls.lock().unwrap();
+        assert_eq!(
+            calls.table,
+            vec![(
+                "token-system-table".to_string(),
+                "system.access.audit".to_string()
+            )]
+        );
+        assert!(calls.temporary_credentials.is_empty());
+        assert_eq!(opener.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn execute_system_databricks_table_reads_are_explicitly_unsupported() {
+        let unity = Arc::new(RecordingUnity::new());
+        let opener = Arc::new(MockTableOpener::ok());
+        let engine = QueryEngine::with_dependencies(test_config(), unity, opener.clone());
+
+        let err = engine
+            .execute(
+                "token-system-table",
+                "SELECT account_id FROM system.access.audit LIMIT 1",
+                "workspace",
+                "default",
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, HarborError::UnsupportedSql(message) if message.contains("DELTASHARING"))
+        );
+        assert_eq!(opener.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn execute_show_columns_resolves_table_and_forwards_token() {
         let unity = Arc::new(RecordingUnity::new());
         let calls = unity.calls.clone();
@@ -2703,9 +2926,11 @@ mod tests {
             Ok(vec![
                 CatalogInfo {
                     name: "main".to_string(),
+                    catalog_type: Some("MANAGED_CATALOG".to_string()),
                 },
                 CatalogInfo {
                     name: "workspace".to_string(),
+                    catalog_type: Some("MANAGED_CATALOG".to_string()),
                 },
             ])
         }
@@ -2764,6 +2989,12 @@ mod tests {
                 .unwrap()
                 .table
                 .push((bearer_token.to_string(), full_name.to_string()));
+            if full_name.starts_with("system.information_schema.") {
+                return Ok(information_schema_table_info(full_name));
+            }
+            if full_name == "system.access.audit" {
+                return Ok(system_access_audit_table_info());
+            }
             Ok(table_info(full_name, Some("DELTA"), true))
         }
 
@@ -2822,9 +3053,11 @@ mod tests {
             Ok(vec![
                 CatalogInfo {
                     name: "workspace".to_string(),
+                    catalog_type: Some("MANAGED_CATALOG".to_string()),
                 },
                 CatalogInfo {
                     name: "main".to_string(),
+                    catalog_type: Some("MANAGED_CATALOG".to_string()),
                 },
             ])
         }
@@ -2868,13 +3101,23 @@ mod tests {
                     data_source_format: None,
                     storage_location: None,
                     comment: Some("daily hits view".to_string()),
+                    owner: Some("owner@example.com".to_string()),
+                    created_at: Some(1_700_000_000_000),
                     created_by: Some("creator@example.com".to_string()),
+                    updated_at: Some(1_700_000_100_000),
+                    updated_by: Some("updater@example.com".to_string()),
                     columns: Vec::new(),
                 },
             ])
         }
 
         async fn table(&self, _bearer_token: &str, full_name: &str) -> Result<TableInfo> {
+            if full_name.starts_with("system.information_schema.") {
+                return Ok(information_schema_table_info(full_name));
+            }
+            if full_name == "system.access.audit" {
+                return Ok(system_access_audit_table_info());
+            }
             match self.table_response {
                 MockTableResponse::Delta => Ok(table_info(full_name, Some("DELTA"), true)),
                 MockTableResponse::NonDelta => Ok(table_info(full_name, Some("PARQUET"), true)),
@@ -2973,7 +3216,11 @@ mod tests {
             data_source_format: data_source_format.map(str::to_string),
             storage_location: has_storage.then(|| "s3://bench-bucket/ssb/sf10/tables/hits".into()),
             comment: Some("test table".to_string()),
+            owner: Some("owner@example.com".to_string()),
+            created_at: Some(1_700_000_000_000),
             created_by: Some("creator@example.com".to_string()),
+            updated_at: Some(1_700_000_100_000),
+            updated_by: Some("updater@example.com".to_string()),
             columns: test_columns(),
         }
     }
@@ -2993,10 +3240,145 @@ mod tests {
             schema_name: Some(schema_name.to_string()),
             table_type: Some(table_type.to_string()),
             data_source_format: data_source_format.map(str::to_string),
+            storage_location: data_source_format
+                .is_some_and(|format| format.eq_ignore_ascii_case("DELTA"))
+                .then(|| format!("s3://bench-bucket/{catalog_name}/{schema_name}/{table_name}")),
+            comment: None,
+            owner: Some("owner@example.com".to_string()),
+            created_at: Some(1_700_000_000_000),
+            created_by: Some("creator@example.com".to_string()),
+            updated_at: Some(1_700_000_100_000),
+            updated_by: Some("updater@example.com".to_string()),
+            columns: Vec::new(),
+        }
+    }
+
+    fn information_schema_table_info(full_name: &str) -> TableInfo {
+        let table_name = full_name.rsplit('.').next().unwrap_or_default();
+        TableInfo {
+            table_id: Some(format!("{table_name}-id")),
+            full_name: full_name.to_string(),
+            name: Some(table_name.to_string()),
+            catalog_name: Some("system".to_string()),
+            schema_name: Some("information_schema".to_string()),
+            table_type: Some("VIEW".to_string()),
+            data_source_format: Some("UNITY_CATALOG".to_string()),
             storage_location: None,
             comment: None,
-            created_by: Some("creator@example.com".to_string()),
-            columns: Vec::new(),
+            owner: Some("System user".to_string()),
+            created_at: Some(0),
+            created_by: Some("System user".to_string()),
+            updated_at: Some(0),
+            updated_by: Some("System user".to_string()),
+            columns: match table_name {
+                "tables" => information_schema_tables_columns(),
+                "columns" => information_schema_columns_columns(),
+                _ => Vec::new(),
+            },
+        }
+    }
+
+    fn system_access_audit_table_info() -> TableInfo {
+        TableInfo {
+            table_id: Some("audit-id".to_string()),
+            full_name: "system.access.audit".to_string(),
+            name: Some("audit".to_string()),
+            catalog_name: Some("system".to_string()),
+            schema_name: Some("access".to_string()),
+            table_type: Some("MANAGED".to_string()),
+            data_source_format: Some("DELTASHARING".to_string()),
+            storage_location: Some(
+                "uc-deltasharing://system.access.audit#system.access.audit".to_string(),
+            ),
+            comment: Some("audit log system table".to_string()),
+            owner: Some("System user".to_string()),
+            created_at: Some(0),
+            created_by: Some("System user".to_string()),
+            updated_at: Some(0),
+            updated_by: Some("System user".to_string()),
+            columns: vec![
+                test_column("account_id", 0, "string", false),
+                test_column("workspace_id", 1, "string", false),
+                test_column("version", 2, "string", false),
+                test_column("event_time", 3, "timestamp", false),
+                test_column("event_id", 4, "string", false),
+            ],
+        }
+    }
+
+    fn information_schema_tables_columns() -> Vec<ColumnInfo> {
+        vec![
+            test_column("table_catalog", 0, "string", false),
+            test_column("table_schema", 1, "string", false),
+            test_column("table_name", 2, "string", false),
+            test_column("table_type", 3, "string", false),
+            test_column("is_insertable_into", 4, "string", false),
+            test_column("commit_action", 5, "string", false),
+            test_column("table_owner", 6, "string", false),
+            test_column("comment", 7, "string", true),
+            test_column("created", 8, "timestamp", false),
+            test_column("created_by", 9, "string", false),
+            test_column("last_altered", 10, "timestamp", false),
+            test_column("last_altered_by", 11, "string", false),
+            test_column("data_source_format", 12, "string", false),
+            test_column("storage_sub_directory", 13, "string", true),
+            test_column("storage_path", 14, "string", true),
+        ]
+    }
+
+    fn information_schema_columns_columns() -> Vec<ColumnInfo> {
+        vec![
+            test_column("table_catalog", 0, "string", false),
+            test_column("table_schema", 1, "string", false),
+            test_column("table_name", 2, "string", false),
+            test_column("column_name", 3, "string", false),
+            test_column("ordinal_position", 4, "int", false),
+            test_column("column_default", 5, "string", true),
+            test_column("is_nullable", 6, "string", false),
+            test_column("full_data_type", 7, "string", false),
+            test_column("data_type", 8, "string", false),
+            test_column("character_maximum_length", 9, "long", true),
+            test_column("character_octet_length", 10, "long", true),
+            test_column("numeric_precision", 11, "int", true),
+            test_column("numeric_precision_radix", 12, "int", true),
+            test_column("numeric_scale", 13, "int", true),
+            test_column("datetime_precision", 14, "int", true),
+            test_column("interval_type", 15, "string", true),
+            test_column("interval_precision", 16, "int", true),
+            test_column("maximum_cardinality", 17, "long", true),
+            test_column("is_identity", 18, "string", false),
+            test_column("identity_generation", 19, "string", true),
+            test_column("identity_start", 20, "string", true),
+            test_column("identity_increment", 21, "string", true),
+            test_column("identity_maximum", 22, "string", true),
+            test_column("identity_minimum", 23, "string", true),
+            test_column("identity_cycle", 24, "string", true),
+            test_column("is_generated", 25, "string", false),
+            test_column("generation_expression", 26, "string", true),
+            test_column("is_system_time_period_start", 27, "string", false),
+            test_column("is_system_time_period_end", 28, "string", false),
+            test_column(
+                "system_time_period_timestamp_generation",
+                29,
+                "string",
+                true,
+            ),
+            test_column("is_updatable", 30, "string", false),
+            test_column("partition_index", 31, "int", true),
+            test_column("comment", 32, "string", true),
+        ]
+    }
+
+    fn test_column(name: &str, position: i32, type_text: &str, nullable: bool) -> ColumnInfo {
+        ColumnInfo {
+            name: name.to_string(),
+            position: Some(position),
+            type_name: Some(type_text.to_ascii_uppercase()),
+            type_text: Some(type_text.to_string()),
+            type_precision: None,
+            type_scale: None,
+            nullable: Some(nullable),
+            comment: None,
         }
     }
 
