@@ -1109,7 +1109,11 @@ mod tests {
             data_source_format: Some("DELTA".to_string()),
             storage_location: None,
             comment: None,
+            owner: None,
+            created_at: None,
             created_by: None,
+            updated_at: None,
+            updated_by: None,
             columns: vec![
                 ColumnInfo {
                     name: "required".to_string(),

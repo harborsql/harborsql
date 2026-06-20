@@ -187,7 +187,11 @@ pub struct TableInfo {
     pub data_source_format: Option<String>,
     pub storage_location: Option<String>,
     pub comment: Option<String>,
+    pub owner: Option<String>,
+    pub created_at: Option<i64>,
     pub created_by: Option<String>,
+    pub updated_at: Option<i64>,
+    pub updated_by: Option<String>,
     #[serde(default)]
     pub columns: Vec<ColumnInfo>,
 }
@@ -207,6 +211,7 @@ pub struct ColumnInfo {
 #[derive(Debug, Deserialize)]
 pub struct CatalogInfo {
     pub name: String,
+    pub catalog_type: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

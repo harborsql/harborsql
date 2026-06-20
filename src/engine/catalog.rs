@@ -24,6 +24,8 @@ use crate::{
     unity::{CatalogInfo, SchemaInfo, TableInfo, TemporaryTableCredentials, UnityCatalogClient},
 };
 
+use super::information_schema::{SystemCatalogProvider, information_schema};
+
 #[async_trait]
 pub(super) trait UnityCatalog: Send + Sync {
     async fn catalogs(&self, bearer_token: &str) -> Result<Vec<CatalogInfo>>;
@@ -188,16 +190,23 @@ impl CatalogProviderList for UnityCatalogProviderList {
             return Some(catalog.clone());
         }
 
-        let catalog = Arc::new(UnityCatalogProvider {
-            catalog_name: name.to_string(),
-            unity: self.unity.clone(),
-            table_opener: self.table_opener.clone(),
-            config: self.config.clone(),
-            bearer_token: self.bearer_token.clone(),
-            table_cache: self.table_cache.clone(),
-            routes: self.routes.clone(),
-            schemas: Mutex::new(HashMap::new()),
-        });
+        let catalog: Arc<dyn CatalogProvider> = if name.eq_ignore_ascii_case("system") {
+            Arc::new(SystemCatalogProvider::new(
+                self.unity.clone(),
+                self.bearer_token.clone(),
+            ))
+        } else {
+            Arc::new(UnityCatalogProvider {
+                catalog_name: name.to_string(),
+                unity: self.unity.clone(),
+                table_opener: self.table_opener.clone(),
+                config: self.config.clone(),
+                bearer_token: self.bearer_token.clone(),
+                table_cache: self.table_cache.clone(),
+                routes: self.routes.clone(),
+                schemas: Mutex::new(HashMap::new()),
+            })
+        };
         catalogs.insert(name.to_string(), catalog.clone());
         Some(catalog)
     }
@@ -234,6 +243,14 @@ impl CatalogProvider for UnityCatalogProvider {
     }
 
     fn schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
+        if name.eq_ignore_ascii_case("information_schema") {
+            return Some(information_schema(
+                self.unity.clone(),
+                self.bearer_token.clone(),
+                Some(self.catalog_name.clone()),
+            ));
+        }
+
         let mut schemas = lock_unchecked(&self.schemas);
         if let Some(schema) = schemas.get(name) {
             return Some(schema.clone());
