@@ -238,6 +238,8 @@ cargo test --locked --all-targets
 ```
 
 Connector smoke-test setup lives in [docs/ci-smoke-tests.md](docs/ci-smoke-tests.md).
+The opt-in one-hour RSS and query stability test is documented in
+[docs/stability-testing.md](docs/stability-testing.md).
 Automation and coding-agent notes live in [AGENTS.md](AGENTS.md).
 
 ## Project Docs
@@ -245,6 +247,7 @@ Automation and coding-agent notes live in [AGENTS.md](AGENTS.md).
 - [Documentation site](https://docs.harborsql.com)
 - [Benchmarks](https://docs.harborsql.com/benchmarks)
 - [Connector smoke tests](docs/ci-smoke-tests.md)
+- [Memory stability test](docs/stability-testing.md)
 - [Release publishing](docs/release.md)
 - [Benchmark policy](docs/benchmarks.md)
 - [Delta types compatibility](docs/delta-types-compatibility.md)
