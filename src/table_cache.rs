@@ -56,6 +56,13 @@ pub struct CachedTable {
 }
 
 impl TableCache {
+    /// Detach every principal's cached snapshot, including in-flight loads.
+    /// A detached load cannot republish its old snapshot into the map.
+    pub fn invalidate_table(&self, full_name: &str) -> Result<()> {
+        lock(&self.inner.entries)?.retain(|key, _| !key.full_name.eq_ignore_ascii_case(full_name));
+        Ok(())
+    }
+
     pub fn new(max_entries: usize, ttl: Duration) -> Self {
         let mut fingerprint_key = [0_u8; 32];
         fingerprint_key[..16].copy_from_slice(Uuid::new_v4().as_bytes());
@@ -368,6 +375,29 @@ mod tests {
         }
 
         assert_eq!(loads.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn invalidation_removes_all_principals_but_preserves_other_tables() {
+        let cache = TableCache::new(16, Duration::from_secs(60));
+        let loads = AtomicUsize::new(0);
+        for pass in 0..2 {
+            for token in ["token-a", "token-b"] {
+                for table in ["c.s.target", "c.s.source"] {
+                    cache
+                        .get_or_load(token, table, "region", || async {
+                            loads.fetch_add(1, Ordering::SeqCst);
+                            Ok(test_cached_table(Instant::now() + Duration::from_secs(60)))
+                        })
+                        .await
+                        .unwrap();
+                }
+            }
+            if pass == 0 {
+                cache.invalidate_table("C.S.TARGET").unwrap();
+            }
+        }
+        assert_eq!(loads.load(Ordering::SeqCst), 6);
     }
 
     #[test]

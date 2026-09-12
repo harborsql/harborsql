@@ -4,12 +4,14 @@ HarborSQL is an external SQL query engine for Unity Catalog Delta tables.
 
 It accepts Databricks SQL connector-style requests, forwards the caller's
 Databricks bearer token to Unity Catalog, vends short-lived table credentials,
-opens Delta data with `delta-rs`, executes read-only SQL with DataFusion, and
+opens Delta data with `delta-rs`, executes SQL with DataFusion, and
 returns Databricks-compatible result sets.
 
 ## Capabilities
 
 - read-only `SELECT` queries
+- opt-in experimental external Delta `CREATE OR REPLACE TABLE ... AS SELECT`
+  ([scope and limitations](docs/external-writes.md)); writes are disabled by default
 - Unity Catalog Delta table discovery and authorization
 - AWS S3-backed temporary table credentials vended by Unity Catalog
 - Databricks SQL connector compatibility for a focused Thrift-over-HTTP surface

@@ -8,10 +8,6 @@ use crate::error::{HarborError, Result};
 use super::{MetadataStatement, ObjectName};
 
 pub(super) fn parse_show_statement(sql: &str) -> Result<Option<MetadataStatement>> {
-    if !starts_with_show(sql) {
-        return Ok(None);
-    }
-
     let dialect = GenericDialect {};
     let tokens = Tokenizer::new(&dialect, sql)
         .tokenize()
@@ -20,24 +16,13 @@ pub(super) fn parse_show_statement(sql: &str) -> Result<Option<MetadataStatement
         .filter(|token| !matches!(token, Token::Whitespace(_)))
         .collect::<Vec<_>>();
 
+    if !matches!(tokens.first(), Some(Token::Word(word)) if word.quote_style.is_none() && word.value.eq_ignore_ascii_case("SHOW"))
+    {
+        return Ok(None);
+    }
+
     let mut parser = ShowParser::new(tokens);
     parser.parse().map(Some)
-}
-
-fn starts_with_show(sql: &str) -> bool {
-    let trimmed = sql.trim_start();
-    let bytes = trimmed.as_bytes();
-    if bytes.len() < 4 || !bytes[..4].eq_ignore_ascii_case(b"show") {
-        return false;
-    }
-    trimmed[4..]
-        .chars()
-        .next()
-        .is_none_or(|ch| !is_identifier_char(ch))
-}
-
-fn is_identifier_char(ch: char) -> bool {
-    ch == '_' || ch == '$' || ch.is_ascii_alphanumeric()
 }
 
 struct ShowParser {
@@ -345,6 +330,11 @@ mod tests {
 
     #[test]
     fn parses_show_schemas_variants() {
+        assert!(matches!(
+            parse_show_statement("/* dbt invocation */ -- adapter\n SHOW SCHEMAS IN `main`")
+                .unwrap(),
+            Some(MetadataStatement::Schemas { .. })
+        ));
         assert_eq!(
             parse_show_statement("show schemas in `main-catalog` like 'sales*';").unwrap(),
             Some(MetadataStatement::Schemas {

@@ -28,6 +28,42 @@ use super::information_schema::{SystemCatalogProvider, information_schema};
 
 #[async_trait]
 pub(super) trait UnityCatalog: Send + Sync {
+    async fn table_details(&self, _token: &str, _name: &str) -> Result<serde_json::Value> {
+        Err(HarborError::UnsupportedSql(
+            "Unity table details unavailable".into(),
+        ))
+    }
+
+    async fn write_credentials(
+        &self,
+        _token: &str,
+        _id: &str,
+    ) -> Result<TemporaryTableCredentials> {
+        Err(HarborError::UnsupportedSql(
+            "Unity writes unavailable".into(),
+        ))
+    }
+
+    async fn create_path_credentials(
+        &self,
+        _token: &str,
+        _location: &str,
+    ) -> Result<TemporaryTableCredentials> {
+        Err(HarborError::UnsupportedSql(
+            "Unity writes unavailable".into(),
+        ))
+    }
+
+    async fn create_external_table(
+        &self,
+        _token: &str,
+        _request: &serde_json::Value,
+    ) -> Result<TableInfo> {
+        Err(HarborError::UnsupportedSql(
+            "Unity writes unavailable".into(),
+        ))
+    }
+
     async fn catalogs(&self, bearer_token: &str) -> Result<Vec<CatalogInfo>>;
 
     async fn schemas(&self, bearer_token: &str, catalog_name: &str) -> Result<Vec<SchemaInfo>>;
@@ -50,6 +86,30 @@ pub(super) trait UnityCatalog: Send + Sync {
 
 #[async_trait]
 impl UnityCatalog for UnityCatalogClient {
+    async fn table_details(&self, token: &str, name: &str) -> Result<serde_json::Value> {
+        UnityCatalogClient::table_details(self, token, name).await
+    }
+
+    async fn write_credentials(&self, token: &str, id: &str) -> Result<TemporaryTableCredentials> {
+        self.table_credentials(token, id, "READ_WRITE").await
+    }
+
+    async fn create_path_credentials(
+        &self,
+        token: &str,
+        location: &str,
+    ) -> Result<TemporaryTableCredentials> {
+        UnityCatalogClient::create_path_credentials(self, token, location).await
+    }
+
+    async fn create_external_table(
+        &self,
+        token: &str,
+        request: &serde_json::Value,
+    ) -> Result<TableInfo> {
+        UnityCatalogClient::create_external_table(self, token, request).await
+    }
+
     async fn catalogs(&self, bearer_token: &str) -> Result<Vec<CatalogInfo>> {
         let started = Instant::now();
         let result = UnityCatalogClient::catalogs(self, bearer_token)
@@ -495,7 +555,7 @@ pub(super) fn ensure_delta_table(table: &TableInfo) -> Result<()> {
     )))
 }
 
-fn storage_options(
+pub(super) fn storage_options(
     credentials: &TemporaryTableCredentials,
     aws_region: &str,
 ) -> HashMap<String, String> {
@@ -561,14 +621,26 @@ type ObjectStoreRoutes = HashMap<String, (Url, Vec<ObjectStoreRoute>)>;
 
 impl ObjectStoreRouteRegistry {
     pub(super) fn record(&self, cached_table: &CachedTable) -> Result<()> {
-        lock_checked(&self.routes)?
-            .entry(cached_table.object_store_url.to_string())
-            .or_insert_with(|| (cached_table.object_store_url.clone(), Vec::new()))
-            .1
-            .push(ObjectStoreRoute {
-                prefix: cached_table.object_prefix.clone(),
-                store: cached_table.object_store.clone(),
-            });
+        self.record_store(
+            cached_table.object_store_url.clone(),
+            cached_table.object_prefix.clone(),
+            cached_table.object_store.clone(),
+        )
+    }
+
+    pub(super) fn record_store(
+        &self,
+        url: Url,
+        prefix: String,
+        store: Arc<dyn ObjectStore>,
+    ) -> Result<()> {
+        let mut registry = lock_checked(&self.routes)?;
+        let routes = &mut registry
+            .entry(url.to_string())
+            .or_insert_with(|| (url, Vec::new()))
+            .1;
+        routes.retain(|route| route.prefix != prefix);
+        routes.push(ObjectStoreRoute { prefix, store });
         Ok(())
     }
 

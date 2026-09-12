@@ -77,7 +77,7 @@ impl HarborError {
                 ClientError::new("UPSTREAM_HTTP_ERROR", "upstream HTTP request failed")
             }
             Self::Url(_) => ClientError::new("INVALID_URL", "invalid URL"),
-            Self::Delta(_) => ClientError::new("DELTA_TABLE_ERROR", "Delta table read failed"),
+            Self::Delta(_) => ClientError::new("DELTA_TABLE_ERROR", "Delta table operation failed"),
             Self::DataFusion(_) => {
                 ClientError::new("DATAFUSION_ERROR", "query planning or execution failed")
             }

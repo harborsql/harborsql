@@ -52,6 +52,7 @@ pub struct Config {
     pub databricks_count_star_alias_rewrite: bool,
     pub databricks_expression_alias_rewrite: bool,
     pub unsafe_log_sql: bool,
+    pub enable_external_writes: bool,
 }
 
 impl Config {
@@ -84,6 +85,7 @@ impl Config {
         let default_target_partitions = default_target_partitions();
 
         Ok(Self {
+            enable_external_writes: parse_bool_env("HARBORSQL_ENABLE_EXTERNAL_WRITES", false)?,
             bind_addr,
             databricks_host: normalize_host(&databricks_host, unsafe_allow_http_databricks_host)?,
             default_catalog: env::var("HARBORSQL_DEFAULT_CATALOG")
