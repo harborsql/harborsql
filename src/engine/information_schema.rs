@@ -180,6 +180,7 @@ impl SchemaProvider for InformationSchemaProvider {
         vec![
             "catalogs".to_string(),
             "columns".to_string(),
+            "row_filters".to_string(),
             "schemata".to_string(),
             "tables".to_string(),
             "views".to_string(),
@@ -227,6 +228,7 @@ enum InformationSchemaRelation {
     Tables,
     Columns,
     Views,
+    RowFilters,
     Empty,
 }
 
@@ -287,6 +289,7 @@ impl SystemTableProvider {
             InformationSchemaRelation::Tables => self.table_rows(filters).await,
             InformationSchemaRelation::Columns => self.column_rows(filters).await,
             InformationSchemaRelation::Views => self.view_rows(filters).await,
+            InformationSchemaRelation::RowFilters => self.row_filter_rows(filters).await,
             InformationSchemaRelation::Empty => Ok(Vec::new()),
         }
     }
@@ -313,6 +316,57 @@ impl SystemTableProvider {
                 ])
             })
             .collect();
+        Ok(rows)
+    }
+
+    async fn row_filter_rows(&self, filters: &MetadataFilters) -> Result<Vec<SystemRow>> {
+        let mut rows = Vec::new();
+        for catalog in self.catalogs(filters).await? {
+            for schema in self.schemas(&catalog.name, filters).await? {
+                let schema_name = schema_name(&schema);
+                for table in self
+                    .unity
+                    .tables(&self.bearer_token, &catalog.name, &schema_name)
+                    .await?
+                {
+                    let name = table_name(&table);
+                    if !filters.matches_table(&name) {
+                        continue;
+                    }
+                    let full_name = table_full_name(&table, &catalog.name, &schema_name, &name);
+                    let details = self
+                        .unity
+                        .table_details(&self.bearer_token, &full_name)
+                        .await?;
+                    if let Some(filter) = details.get("row_filter").filter(|v| !v.is_null()) {
+                        let function = filter["function_name"].as_str().ok_or_else(|| {
+                            HarborError::Unity("row filter missing function_name".into())
+                        })?;
+                        let inputs = filter["input_column_names"].as_array().ok_or_else(|| {
+                            HarborError::UnsupportedSql(
+                                "row filter argument format not supported".into(),
+                            )
+                        })?;
+                        rows.push(row([
+                            ("table_catalog", string(catalog.name.clone())),
+                            ("table_schema", string(schema_name.clone())),
+                            ("table_name", string(name)),
+                            ("filter_name", string(function)),
+                            (
+                                "target_columns",
+                                string(
+                                    inputs
+                                        .iter()
+                                        .map(|v| v.as_str().unwrap_or_default())
+                                        .collect::<Vec<_>>()
+                                        .join(","),
+                                ),
+                            ),
+                        ]));
+                    }
+                }
+            }
+        }
         Ok(rows)
     }
 
@@ -627,6 +681,7 @@ fn information_schema_relation(name: &str) -> InformationSchemaRelation {
         "tables" => InformationSchemaRelation::Tables,
         "columns" => InformationSchemaRelation::Columns,
         "views" => InformationSchemaRelation::Views,
+        "row_filters" => InformationSchemaRelation::RowFilters,
         _ => InformationSchemaRelation::Empty,
     }
 }

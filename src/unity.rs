@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use reqwest::{Client, StatusCode};
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{HarborError, Result, redact_and_truncate};
@@ -82,7 +82,7 @@ impl UnityCatalogClient {
         let mut page_token = None;
         loop {
             let mut url = format!(
-                "{}/api/2.1/unity-catalog/tables?catalog_name={encoded_catalog}&schema_name={encoded_schema}&max_results=0&omit_columns=true&omit_properties=true&omit_username=true",
+                "{}/api/2.1/unity-catalog/tables?catalog_name={encoded_catalog}&schema_name={encoded_schema}&max_results=0&omit_columns=true&omit_properties=true&omit_username=false",
                 self.host
             );
             append_page_token(&mut url, page_token.as_deref());
@@ -102,6 +102,15 @@ impl UnityCatalogClient {
         bearer_token: &str,
         table_id: &str,
     ) -> Result<TemporaryTableCredentials> {
+        self.table_credentials(bearer_token, table_id, "READ").await
+    }
+
+    pub async fn table_credentials(
+        &self,
+        bearer_token: &str,
+        table_id: &str,
+        operation: &str,
+    ) -> Result<TemporaryTableCredentials> {
         let url = format!(
             "{}/api/2.1/unity-catalog/temporary-table-credentials",
             self.host
@@ -111,10 +120,47 @@ impl UnityCatalogClient {
             &url,
             &TemporaryTableCredentialsRequest {
                 table_id,
-                operation: "READ",
+                operation,
             },
         )
         .await
+    }
+
+    pub async fn create_path_credentials(
+        &self,
+        bearer_token: &str,
+        location: &str,
+    ) -> Result<TemporaryTableCredentials> {
+        self.post(
+            bearer_token,
+            &format!(
+                "{}/api/2.1/unity-catalog/temporary-path-credentials",
+                self.host
+            ),
+            &serde_json::json!({"url": location, "operation": "PATH_CREATE_TABLE"}),
+        )
+        .await
+    }
+
+    pub async fn create_external_table(
+        &self,
+        bearer_token: &str,
+        request: &serde_json::Value,
+    ) -> Result<TableInfo> {
+        self.post(
+            bearer_token,
+            &format!("{}/api/2.1/unity-catalog/tables", self.host),
+            request,
+        )
+        .await
+    }
+
+    pub async fn table_details(
+        &self,
+        bearer_token: &str,
+        full_name: &str,
+    ) -> Result<serde_json::Value> {
+        self.get(bearer_token, &format!("{}/api/2.1/unity-catalog/tables/{}?include_delta_metadata=true&include_manifest_capabilities=true", self.host, urlencoding::encode(full_name))).await
     }
 
     async fn get<T>(&self, bearer_token: &str, url: &str) -> Result<T>
@@ -153,7 +199,7 @@ where
     T: for<'de> Deserialize<'de>,
 {
     let status = response.status();
-    if status == StatusCode::OK {
+    if status.is_success() {
         return response.json::<T>().await.map_err(Into::into);
     }
 
@@ -222,18 +268,21 @@ pub struct SchemaInfo {
 
 #[derive(Debug, Deserialize)]
 struct ListCatalogsResponse {
+    #[serde(default)]
     catalogs: Vec<CatalogInfo>,
     next_page_token: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ListSchemasResponse {
+    #[serde(default)]
     schemas: Vec<SchemaInfo>,
     next_page_token: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ListTablesResponse {
+    #[serde(default)]
     tables: Vec<TableInfo>,
     next_page_token: Option<String>,
 }
@@ -276,6 +325,78 @@ mod tests {
     use tokio::{net::TcpListener, task::JoinHandle};
 
     use super::*;
+
+    #[test]
+    fn empty_list_pages_may_omit_the_collection() {
+        assert!(
+            serde_json::from_str::<ListTablesResponse>("{}")
+                .unwrap()
+                .tables
+                .is_empty()
+        );
+        assert!(
+            serde_json::from_str::<ListSchemasResponse>("{}")
+                .unwrap()
+                .schemas
+                .is_empty()
+        );
+        assert!(
+            serde_json::from_str::<ListCatalogsResponse>("{}")
+                .unwrap()
+                .catalogs
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn write_requests_forward_token_and_do_not_downgrade_permissions() {
+        let server = TestUnityServer::new(None).await;
+        let client = UnityCatalogClient::new(server.host.clone(), Duration::from_secs(5));
+        client
+            .create_path_credentials("write-test-token", "s3://bucket/table")
+            .await
+            .unwrap();
+        client
+            .table_credentials("write-test-token", "table-id", "READ_WRITE")
+            .await
+            .unwrap();
+        client
+            .create_external_table(
+                "write-test-token",
+                &serde_json::json!({"name":"t", "table_type":"EXTERNAL"}),
+            )
+            .await
+            .unwrap();
+        let requests = server.requests();
+        assert_eq!(requests.len(), 3);
+        assert!(
+            requests
+                .iter()
+                .all(|r| r.authorization.as_deref() == Some("Bearer write-test-token"))
+        );
+        assert_eq!(
+            requests[0].body.as_ref().unwrap()["operation"],
+            "PATH_CREATE_TABLE"
+        );
+        assert_eq!(
+            requests[1].body.as_ref().unwrap()["operation"],
+            "READ_WRITE"
+        );
+        assert_eq!(requests[2].body.as_ref().unwrap()["table_type"], "EXTERNAL");
+        let denied = TestUnityServer::new(Some((
+            StatusCode::FORBIDDEN,
+            r#"{"error_code":"PERMISSION_DENIED","message":"denied"}"#.into(),
+        )))
+        .await;
+        let client = UnityCatalogClient::new(denied.host.clone(), Duration::from_secs(5));
+        assert!(
+            client
+                .table_credentials("write-test-token", "table-id", "READ_WRITE")
+                .await
+                .is_err()
+        );
+        assert_eq!(denied.requests().len(), 1);
+    }
 
     #[tokio::test]
     async fn list_catalogs_forwards_authorization_across_pages() {
@@ -344,7 +465,7 @@ mod tests {
         );
         assert!(requests[1].query.contains("omit_columns=true"));
         assert!(requests[1].query.contains("omit_properties=true"));
-        assert!(requests[1].query.contains("omit_username=true"));
+        assert!(requests[1].query.contains("omit_username=false"));
 
         assert_eq!(
             requests[2].path,
@@ -385,6 +506,7 @@ mod tests {
 
     #[derive(Clone, Debug, PartialEq, Eq)]
     struct RecordedRequest {
+        body: Option<serde_json::Value>,
         path: String,
         query: String,
         authorization: Option<String>,
@@ -410,7 +532,10 @@ mod tests {
                 error_response,
             });
             let app = Router::new()
-                .route("/{*path}", get(unity_test_handler))
+                .route(
+                    "/{*path}",
+                    get(unity_test_handler).post(unity_write_test_handler),
+                )
                 .with_state(state.clone());
             let task = tokio::spawn(async move {
                 axum::serve(listener, app).await.unwrap();
@@ -445,6 +570,7 @@ mod tests {
             .and_then(|value| value.to_str().ok())
             .map(str::to_string);
         state.requests.lock().unwrap().push(RecordedRequest {
+            body: None,
             path: path.clone(),
             query: query.clone(),
             authorization,
@@ -478,6 +604,34 @@ mod tests {
                 r#"{"table_id":"table-id","full_name":"main.sales.fact_sales","name":"fact_sales","table_type":"MANAGED","data_source_format":"DELTA"}"#.into(),
             ),
             _ => json_response(StatusCode::NOT_FOUND, r#"{"message":"not found"}"#.into()),
+        }
+    }
+
+    async fn unity_write_test_handler(
+        State(state): State<Arc<TestUnityState>>,
+        headers: HeaderMap,
+        uri: Uri,
+        axum::Json(body): axum::Json<serde_json::Value>,
+    ) -> Response {
+        state.requests.lock().unwrap().push(RecordedRequest {
+            path: uri.path().into(),
+            query: String::new(),
+            body: Some(body),
+            authorization: headers
+                .get(header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string),
+        });
+        if let Some((status, body)) = &state.error_response {
+            return json_response(*status, body.clone());
+        }
+        if uri.path().ends_with("/tables") {
+            json_response(
+                StatusCode::CREATED,
+                r#"{"full_name":"c.s.t","name":"t"}"#.into(),
+            )
+        } else {
+            json_response(StatusCode::OK, r#"{"aws_temp_credentials":{"access_key_id":"test-only","secret_access_key":"test-only","session_token":"test-only"},"expiration_time":9999999999999,"url":"s3://bucket/table"}"#.into())
         }
     }
 

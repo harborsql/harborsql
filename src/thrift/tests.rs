@@ -1568,6 +1568,7 @@ fn test_config() -> Config {
         databricks_count_star_alias_rewrite: true,
         databricks_expression_alias_rewrite: true,
         unsafe_log_sql: false,
+        enable_external_writes: false,
     }
 }
 

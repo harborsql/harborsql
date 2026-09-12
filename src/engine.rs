@@ -45,6 +45,7 @@ mod catalog;
 mod information_schema;
 mod metadata;
 mod results;
+mod write;
 
 use catalog::{
     DeltaTableOpener, ObjectStoreRoute, ObjectStoreRouteRegistry, TableOpener, UnityCatalog,
@@ -249,7 +250,12 @@ impl QueryEngine {
                     .skip_partial_aggregation_probe_ratio_threshold
                     .to_string(),
             );
-        let ctx = SessionContext::new_with_config(session_config);
+        let state = datafusion::execution::SessionStateBuilder::new()
+            .with_default_features()
+            .with_config(session_config)
+            .with_query_planner(deltalake::delta_datafusion::planner::DeltaPlanner::new())
+            .build();
+        let ctx = SessionContext::new_with_state(state);
         udf::register_udfs(&ctx);
 
         let object_store_routes = ObjectStoreRouteRegistry::default();
@@ -262,8 +268,15 @@ impl QueryEngine {
             object_store_routes.clone(),
         )));
 
+        let ctas = write::parse(sql, default_catalog, default_schema)?;
+        if ctas.is_some() && !self.config.enable_external_writes {
+            return Err(HarborError::UnsupportedSql(
+                "external writes require HARBORSQL_ENABLE_EXTERNAL_WRITES=true".into(),
+            ));
+        }
         let execution_sql = rewrite_sql_fast_paths_with_options(
-            sql,
+            ctas.as_ref()
+                .map_or(sql, |statement| statement.query.as_str()),
             RewriteOptions {
                 databricks_count_star_alias_rewrite: self
                     .config
@@ -285,6 +298,11 @@ impl QueryEngine {
                 &object_store_url,
                 Arc::new(PrefixRoutingObjectStore::new(routes)),
             );
+        }
+        if let Some(ctas) = ctas {
+            return self
+                .execute_ctas(bearer_token, ctas, &ctx, dataframe, &object_store_routes)
+                .await;
         }
         let execution_started = Instant::now();
         let stream = dataframe
@@ -787,7 +805,10 @@ fn rewrite_leaf_expr_fast_paths(expr: &mut Expr, options: RewriteOptions) -> boo
         }
         Expr::Function(function) => {
             let changed_args = rewrite_function_fast_paths(function, options);
-            if let Some((array, index)) = databricks_get_array_args(function) {
+            if let Some(replacement) = databricks_if_expr(function) {
+                *expr = replacement;
+                true
+            } else if let Some((array, index)) = databricks_get_array_args(function) {
                 *expr = databricks_get_array_expr(array, index);
                 true
             } else if let Some((map, key)) = databricks_element_at_map_args(function) {
@@ -1088,6 +1109,40 @@ fn regexp_replace_capture_fast_path_args(function: &Function) -> Option<(Expr, S
     let replacement = string_literal_value(function_arg_expr(args.get(2)?)?)?;
     let capture_index = capture_replacement_index(replacement)?;
     Some((source, pattern, capture_index))
+}
+
+fn databricks_if_expr(function: &Function) -> Option<Expr> {
+    if !function_name_eq(function, "if")
+        || function.uses_odbc_syntax
+        || !matches!(function.parameters, FunctionArguments::None)
+        || function.filter.is_some()
+        || function.null_treatment.is_some()
+        || function.over.is_some()
+        || !function.within_group.is_empty()
+    {
+        return None;
+    }
+    let FunctionArguments::List(FunctionArgumentList {
+        duplicate_treatment: None,
+        args,
+        clauses,
+    }) = &function.args
+    else {
+        return None;
+    };
+    if args.len() != 3 || !clauses.is_empty() {
+        return None;
+    }
+    Some(Expr::Case {
+        case_token: AttachedToken::empty(),
+        end_token: AttachedToken::empty(),
+        operand: None,
+        conditions: vec![CaseWhen {
+            condition: function_arg_expr(&args[0])?.clone(),
+            result: function_arg_expr(&args[1])?.clone(),
+        }],
+        else_result: Some(Box::new(function_arg_expr(&args[2])?.clone())),
+    })
 }
 
 fn databricks_get_array_args(function: &Function) -> Option<(Expr, Expr)> {
@@ -1942,6 +1997,26 @@ mod tests {
 
         assert_eq!(result.columns[0].name, "count(1)");
         assert_eq!(result.row_count, 1);
+    }
+
+    #[tokio::test]
+    async fn databricks_if_handles_nulls_nested_branches_and_short_circuiting() {
+        let ctx = SessionContext::new();
+        udf::register_udfs(&ctx);
+        let sql = rewrite_sql_fast_paths_with_options(
+            "SELECT if(true, if(NULL, 'wrong', 'right'), raise_error('unselected')) AS value",
+            RewriteOptions::default(),
+        );
+        let batches = plan_sql(&ctx, &sql).await.unwrap().collect().await.unwrap();
+        assert_eq!(
+            batches[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(0),
+            "right"
+        );
     }
 
     #[tokio::test]
@@ -3536,6 +3611,7 @@ mod tests {
             databricks_count_star_alias_rewrite: true,
             databricks_expression_alias_rewrite: true,
             unsafe_log_sql: false,
+            enable_external_writes: false,
         }
     }
 

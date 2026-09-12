@@ -25,9 +25,43 @@ pub const REGEXP_REPLACE_CAPTURE_UDF: &str = "harborsql_regexp_replace_capture";
 pub const EXTRACT_MINUTE_UDF: &str = "harborsql_extract_minute";
 
 pub fn register_udfs(ctx: &SessionContext) {
+    ctx.register_udf(ScalarUDF::new_from_impl(RaiseErrorFunc {
+        signature: Signature::string(1, Volatility::Volatile),
+    }));
     ctx.register_udf(ScalarUDF::new_from_impl(LengthFunc::new()));
     ctx.register_udf(ScalarUDF::new_from_impl(RegexpReplaceCaptureFunc::new()));
     ctx.register_udf(ScalarUDF::new_from_impl(ExtractMinuteFunc::new()));
+}
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct RaiseErrorFunc {
+    signature: Signature,
+}
+
+impl ScalarUDFImpl for RaiseErrorFunc {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "raise_error"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _arg_types: &[DataType]) -> DataFusionResult<DataType> {
+        Ok(DataType::Utf8)
+    }
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DataFusionResult<ColumnarValue> {
+        if args.number_rows == 0 {
+            return Ok(ColumnarValue::Array(
+                datafusion::arrow::array::new_empty_array(&DataType::Utf8),
+            ));
+        }
+        // Do not interpolate user data into server error logs.
+        Err(DataFusionError::Execution(
+            "[USER_RAISED_EXCEPTION] raise_error invoked".into(),
+        ))
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, Hash)]
